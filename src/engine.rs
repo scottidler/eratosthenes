@@ -11,17 +11,28 @@ use crate::gmail::message::GmailThread;
 use crate::gmail::query::compile_query;
 
 pub async fn execute(client: &mut GmailClient, config: &Config, dry_run: bool) -> Result<()> {
+    if dry_run {
+        println!("=== DRY RUN - no changes will be made ===");
+    }
+
     ensure_labels(client, config).await?;
 
     info!("=== Phase 1: Message Filters ===");
+    let mut total_matched = 0usize;
     for filter in &config.message_filters {
-        execute_message_filter(client, filter, dry_run).await?;
+        total_matched += execute_message_filter(client, filter, dry_run).await?;
     }
 
     info!("=== Phase 2: State Filters (Thread Age-Off) ===");
-    execute_state_filters(client, &config.state_filters, dry_run).await?;
+    let total_transitioned = execute_state_filters(client, &config.state_filters, dry_run).await?;
 
-    info!("=== Execution complete ===");
+    println!(
+        "Done: {} messages matched filters, {} threads transitioned{}",
+        total_matched,
+        total_transitioned,
+        if dry_run { " (dry run)" } else { "" }
+    );
+
     Ok(())
 }
 
@@ -59,11 +70,11 @@ async fn ensure_labels(client: &mut GmailClient, config: &Config) -> Result<()> 
     Ok(())
 }
 
-async fn execute_message_filter(client: &GmailClient, filter: &MessageFilter, dry_run: bool) -> Result<()> {
+async fn execute_message_filter(client: &GmailClient, filter: &MessageFilter, dry_run: bool) -> Result<usize> {
     let query = compile_query(filter);
     if query.is_empty() {
         warn!("Filter '{}' compiles to empty query, skipping", filter.name);
-        return Ok(());
+        return Ok(0);
     }
 
     info!("[filter:{}] query: {}", filter.name, query);
@@ -86,14 +97,15 @@ async fn execute_message_filter(client: &GmailClient, filter: &MessageFilter, dr
     );
 
     if matched_ids.is_empty() {
-        return Ok(());
+        return Ok(0);
     }
 
+    let count = matched_ids.len();
     for action in &filter.actions {
         apply_filter_action(client, &matched_ids, action, &filter.name, dry_run).await?;
     }
 
-    Ok(())
+    Ok(count)
 }
 
 async fn apply_filter_action(
@@ -130,11 +142,11 @@ async fn apply_filter_action(
     Ok(())
 }
 
-async fn execute_state_filters(client: &GmailClient, state_filters: &[StateFilter], dry_run: bool) -> Result<()> {
+async fn execute_state_filters(client: &GmailClient, state_filters: &[StateFilter], dry_run: bool) -> Result<usize> {
     let active_query = build_active_threads_query(state_filters);
     if active_query.is_empty() {
         info!("No state filter labels to query, skipping Phase 2");
-        return Ok(());
+        return Ok(0);
     }
 
     info!("[state] query: {}", active_query);
@@ -142,13 +154,16 @@ async fn execute_state_filters(client: &GmailClient, state_filters: &[StateFilte
     info!("[state] {} active threads", thread_ids.len());
 
     let clock = crate::cfg::state::RealClock;
+    let mut transitioned = 0usize;
 
     for thread_id in &thread_ids {
         let thread = client.get_thread(thread_id).await?;
-        evaluate_thread(client, &thread, state_filters, &clock, dry_run).await?;
+        if evaluate_thread(client, &thread, state_filters, &clock, dry_run).await? {
+            transitioned += 1;
+        }
     }
 
-    Ok(())
+    Ok(transitioned)
 }
 
 async fn evaluate_thread<C: Clock>(
@@ -157,7 +172,7 @@ async fn evaluate_thread<C: Clock>(
     state_filters: &[StateFilter],
     clock: &C,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let thread_labels = thread.labels();
 
     for state_filter in state_filters {
@@ -167,7 +182,7 @@ async fn evaluate_thread<C: Clock>(
 
         let Some(last_activity) = thread.last_activity() else {
             warn!("Thread {} has no messages, skipping", thread.id);
-            return Ok(());
+            return Ok(false);
         };
 
         let is_read = thread.is_read();
@@ -175,18 +190,18 @@ async fn evaluate_thread<C: Clock>(
         match state_filter.evaluate_ttl(last_activity, is_read, clock)? {
             Some(action) => {
                 apply_state_action(client, thread, state_filter, &action, dry_run).await?;
-                break;
+                return Ok(true);
             }
             None => {
                 if state_filter.ttl == Ttl::Keep {
                     debug!("[thread:{}] protected by '{}'", thread.id, state_filter.name);
-                    break;
+                    return Ok(false);
                 }
             }
         }
     }
 
-    Ok(())
+    Ok(false)
 }
 
 async fn apply_state_action(

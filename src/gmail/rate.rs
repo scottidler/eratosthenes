@@ -60,6 +60,30 @@ impl RateLimiter {
     }
 }
 
+const MAX_RETRIES: u32 = 5;
+
+pub async fn with_retry<F, Fut, T>(limiter: &RateLimiter, op_name: &str, mut f: F) -> eyre::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = eyre::Result<T>>,
+{
+    for attempt in 0..MAX_RETRIES {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("429") || msg.contains("503") || msg.contains("rate") {
+                    log::warn!("[retry] {} failed (attempt {}): {}", op_name, attempt + 1, msg);
+                    limiter.backoff(attempt).await;
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    eyre::bail!("{} failed after {} retries", op_name, MAX_RETRIES)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
