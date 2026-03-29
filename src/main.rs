@@ -59,16 +59,11 @@ fn resolve_config_path(cli_path: Option<&PathBuf>) -> Option<PathBuf> {
     None
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     setup_logging(&cli.log_level).context("Failed to setup logging")?;
-
-    if cli.logout {
-        info!("Logout requested - token cache clearing will be implemented in Phase 2");
-        println!("Logged out (token cache cleared)");
-        return Ok(());
-    }
 
     let config_path = resolve_config_path(cli.config.as_ref()).ok_or_else(|| {
         eyre::eyre!("No config file found. Provide --config or create ~/.config/eratosthenes/eratosthenes.yml")
@@ -77,28 +72,24 @@ fn main() -> Result<()> {
     info!("Loading config from: {}", config_path.display());
     let config = eratosthenes::load(&config_path)?;
 
+    if cli.logout {
+        eratosthenes::gmail::auth::logout(&config.auth).await?;
+        println!("Logged out (token cache cleared)");
+        return Ok(());
+    }
+
+    if cli.login {
+        let auth = eratosthenes::gmail::auth::build_authenticator(&config.auth).await?;
+        eratosthenes::gmail::auth::get_token(&auth).await?;
+        println!("Login successful");
+        return Ok(());
+    }
+
     info!(
         "Loaded {} message filters, {} state filters",
         config.message_filters.len(),
         config.state_filters.len()
     );
 
-    if cli.dry_run {
-        println!("Dry run mode - no changes will be made");
-    }
-
-    if cli.login {
-        info!("Login requested - OAuth2 flow will be implemented in Phase 2");
-        println!("Login flow will be implemented in Phase 2");
-        return Ok(());
-    }
-
-    info!("Engine execution will be implemented in Phase 3/4");
-    println!(
-        "Config loaded: {} message filters, {} state filters",
-        config.message_filters.len(),
-        config.state_filters.len()
-    );
-
-    Ok(())
+    eratosthenes::run(&config, cli.dry_run).await
 }
