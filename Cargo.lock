@@ -380,7 +380,7 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
 name = "eratosthenes"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -395,6 +395,7 @@ dependencies = [
  "log",
  "rustls",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "yup-oauth2",

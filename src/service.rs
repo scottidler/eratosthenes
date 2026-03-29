@@ -4,6 +4,15 @@ use std::process::Command;
 
 use eratosthenes::cfg::config::{AuthConfig, Config};
 
+fn shellexpand(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).to_string_lossy().to_string();
+    }
+    path.to_string()
+}
+
 const SERVICE_NAME: &str = "eratosthenes";
 
 fn service_dir() -> Result<PathBuf> {
@@ -242,18 +251,71 @@ pub fn stop() -> Result<()> {
 }
 
 pub fn auth_status(auth: &AuthConfig) -> Result<()> {
-    let _ = auth;
-    eyre::bail!("auth status is not yet implemented (Phase 3)")
+    let token_path_str = shellexpand(auth.token_cache_path.to_str().unwrap_or_default());
+    let token_path = Path::new(&token_path_str);
+
+    println!("Token cache: {}", token_path.display());
+
+    if !token_path.exists() {
+        println!("Status: NOT AUTHENTICATED");
+        println!("  No token cache found. Run: eratosthenes auth login");
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(token_path).context("Failed to read token cache")?;
+
+    // yup-oauth2 token cache is JSON; check if it parses and has content
+    let parsed: serde_json::Value = serde_json::from_str(&content).context("Token cache is not valid JSON")?;
+
+    if parsed.as_object().is_some_and(|obj| obj.is_empty()) {
+        println!("Status: EMPTY (no tokens cached)");
+        println!("  Run: eratosthenes auth login");
+        return Ok(());
+    }
+
+    println!("Status: AUTHENTICATED");
+
+    // Try to extract expiry info from the cached tokens
+    if let Some(obj) = parsed.as_object() {
+        for (scope, token_data) in obj {
+            if let Some(expiry) = token_data.get("expiry_date") {
+                println!("  Scope: {}", scope);
+                println!("  Expiry: {}", expiry);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 pub fn config_validate(config: &Config) -> Result<()> {
-    let _ = config;
-    eyre::bail!("config validate is not yet implemented (Phase 3)")
+    println!("Config is valid.");
+    println!();
+    println!("Message filters: {} defined", config.message_filters.len());
+    for filter in &config.message_filters {
+        println!("  - {}", filter.name);
+    }
+    println!();
+    println!("State filters: {} defined", config.state_filters.len());
+    for filter in &config.state_filters {
+        println!("  - {}", filter.name);
+    }
+    println!();
+    println!("Log level: {}", config.log_level);
+
+    Ok(())
 }
 
 pub fn config_show(config_path: &Path) -> Result<()> {
-    let _ = config_path;
-    eyre::bail!("config show is not yet implemented (Phase 3)")
+    let canonical = config_path.canonicalize().unwrap_or_else(|_| config_path.to_path_buf());
+    println!("Config path: {}", canonical.display());
+    println!();
+
+    let content = std::fs::read_to_string(config_path)
+        .context(format!("Failed to read config file: {}", config_path.display()))?;
+    print!("{}", content);
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -334,5 +396,24 @@ mod tests {
         let tmr = tmr.unwrap();
         assert!(svc.to_string_lossy().contains("eratosthenes.service"));
         assert!(tmr.to_string_lossy().contains("eratosthenes.timer"));
+    }
+
+    #[test]
+    fn test_shellexpand_tilde() {
+        let expanded = shellexpand("~/some/path");
+        assert!(!expanded.starts_with("~/"));
+        assert!(expanded.ends_with("/some/path"));
+    }
+
+    #[test]
+    fn test_shellexpand_no_tilde() {
+        let expanded = shellexpand("/absolute/path");
+        assert_eq!(expanded, "/absolute/path");
+    }
+
+    #[test]
+    fn test_config_show_missing_file() {
+        let result = config_show(Path::new("/nonexistent/config.yml"));
+        assert!(result.is_err());
     }
 }
