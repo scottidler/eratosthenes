@@ -1,0 +1,39 @@
+auth:
+  client-secret-path: "~/.config/eratosthenes/client-secret.json"
+  token-cache-path: "~/.config/eratosthenes/tokencache.json"
+  # callback-port: 13131
+
+message-filters:
+  - only-me-star:
+      to: ['scott.idler@tatari.tv']
+      cc: []
+      from: '*@tatari.tv'
+      label: INBOX
+      action: Star
+
+  - only-me:
+      to: ['scott.idler@tatari.tv']
+      from: '*@tatari.tv'
+      label: INBOX
+      action: Flag
+
+state-filters:
+  - Starred:
+      labels: [Important, Starred]
+      ttl: Keep
+
+  - Important:
+      label: Important
+      ttl: Keep
+
+  - Cull:
+      ttl:
+        read: 7d
+        unread: 21d
+      action: Purgatory
+
+  - Purge:
+      label: Purgatory
+      ttl: 3d
+      action:
+        Move: Oblivion
