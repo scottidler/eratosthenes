@@ -3,11 +3,10 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod, read_app
 
 use crate::cfg::config::AuthConfig;
 
-const GMAIL_SCOPES: &[&str] = &[
-    "https://mail.google.com/",
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.addons.current.message.readonly",
-];
+// Full Gmail access scope - covers all API methods the google-gmail1 crate may request.
+// Using a single scope avoids re-auth prompts when the crate requests different scope
+// subsets on different API calls.
+pub const GMAIL_SCOPE: &str = "https://mail.google.com/";
 
 pub async fn build_authenticator(
     config: &AuthConfig,
@@ -41,7 +40,7 @@ pub async fn get_token(
     >,
 ) -> Result<String> {
     let token = auth
-        .token(GMAIL_SCOPES)
+        .token(&[GMAIL_SCOPE])
         .await
         .context("Failed to obtain OAuth2 token")?;
 

@@ -12,6 +12,8 @@ mod cli;
 
 use cli::Cli;
 
+const ENV_LOG_LEVEL: &str = "ERATOSTHENES_LOG_LEVEL";
+
 fn setup_logging(level: &str) -> Result<()> {
     let log_dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -30,12 +32,21 @@ fn setup_logging(level: &str) -> Result<()> {
             .context("Failed to open log file")?,
     );
 
+    // Filter noisy third-party crates to warn, apply user level to eratosthenes
+    let filter = format!("warn,eratosthenes={}", level);
+
     env_logger::Builder::new()
-        .parse_filters(level)
+        .parse_filters(&filter)
         .target(env_logger::Target::Pipe(target))
         .init();
 
-    info!("Logging initialized, writing to: {}", log_file.display());
+    info!("------------------------------------------------------------");
+    info!(
+        "eratosthenes run started at {}",
+        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    info!("------------------------------------------------------------");
+    info!("Log level: {}, writing to: {}", level, log_file.display());
     Ok(())
 }
 
@@ -59,19 +70,32 @@ fn resolve_config_path(cli_path: Option<&PathBuf>) -> Option<PathBuf> {
     None
 }
 
+/// Resolve log level with precedence: CLI flag > env var > config file > default ("info")
+fn resolve_log_level(cli_level: Option<&str>, config_level: &str) -> String {
+    if let Some(level) = cli_level {
+        return level.to_string();
+    }
+    if let Ok(level) = std::env::var(ENV_LOG_LEVEL) {
+        return level;
+    }
+    config_level.to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-
-    setup_logging(&cli.log_level).context("Failed to setup logging")?;
     eratosthenes::init_tls()?;
 
     let config_path = resolve_config_path(cli.config.as_ref()).ok_or_else(|| {
         eyre::eyre!("No config file found. Provide --config or create ~/.config/eratosthenes/eratosthenes.yml")
     })?;
 
-    info!("Loading config from: {}", config_path.display());
     let config = eratosthenes::load(&config_path)?;
+
+    let log_level = resolve_log_level(cli.log_level.as_deref(), &config.log_level);
+    setup_logging(&log_level).context("Failed to setup logging")?;
+
+    info!("Config loaded from: {}", config_path.display());
 
     if cli.logout {
         eratosthenes::gmail::auth::logout(&config.auth).await?;

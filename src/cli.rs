@@ -6,7 +6,12 @@ use std::path::PathBuf;
     name = "eratosthenes",
     about = "Gmail API-native inbox zero engine",
     version = env!("GIT_DESCRIBE"),
-    after_help = "Logs are written to: ~/.local/share/eratosthenes/logs/eratosthenes.log\n\nRequires: Google Cloud OAuth2 client credentials (client-secret.json)"
+    after_help = "\
+REQUIRED CREDENTIALS:
+  Google Cloud OAuth2 client secret (Desktop app type)
+  Default: ~/.config/eratosthenes/client-secret.json
+
+Logs are written to: ~/.local/share/eratosthenes/logs/eratosthenes.log"
 )]
 pub struct Cli {
     /// Path to config file
@@ -14,8 +19,8 @@ pub struct Cli {
     pub config: Option<PathBuf>,
 
     /// Log level (error, warn, info, debug, trace)
-    #[arg(short, long, default_value = "info")]
-    pub log_level: String,
+    #[arg(short, long)]
+    pub log_level: Option<String>,
 
     /// Dry run - show what would be done without making changes
     #[arg(long)]

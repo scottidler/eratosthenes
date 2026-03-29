@@ -31,6 +31,11 @@ pub fn compile_query(filter: &MessageFilter) -> String {
         }
     }
 
+    // Only match unread messages - prevents re-labeling read emails
+    if !parts.is_empty() {
+        parts.push("is:unread".to_string());
+    }
+
     parts.join(" ")
 }
 
@@ -66,6 +71,7 @@ mod tests {
         assert!(query.contains("to:scott@example.com"));
         assert!(query.contains("from:(*@example.com)"));
         assert!(query.contains("label:inbox"));
+        assert!(query.contains("is:unread"));
         // cc: [] cannot be expressed in Gmail query - not present
         assert!(!query.contains("cc"));
     }
@@ -86,7 +92,7 @@ mod tests {
         };
 
         let query = compile_query(&filter);
-        assert_eq!(query, "from:(*@company.com)");
+        assert_eq!(query, "from:(*@company.com) is:unread");
     }
 
     #[test]
@@ -103,7 +109,7 @@ mod tests {
         };
 
         let query = compile_query(&filter);
-        assert_eq!(query, "subject:(urgent)");
+        assert_eq!(query, "subject:(urgent) is:unread");
     }
 
     #[test]

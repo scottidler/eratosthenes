@@ -3,6 +3,7 @@ use google_gmail1::Gmail;
 use google_gmail1::api::{BatchModifyMessagesRequest, ModifyMessageRequest};
 use log::{debug, warn};
 
+use crate::gmail::auth::GMAIL_SCOPE;
 use crate::gmail::label::LabelResolver;
 use crate::gmail::message::{GmailMessage, GmailThread};
 use crate::gmail::rate::RateLimiter;
@@ -19,9 +20,11 @@ impl GmailClient {
     pub async fn new(hub: Hub) -> Result<Self> {
         let limiter = RateLimiter::new();
 
+        println!("Connecting to Gmail...");
         let (_, label_list) = hub
             .users()
             .labels_list("me")
+            .add_scope(GMAIL_SCOPE)
             .doit()
             .await
             .context("Failed to list Gmail labels")?;
@@ -36,12 +39,13 @@ impl GmailClient {
     }
 
     pub async fn search_messages(&self, query: &str) -> Result<Vec<String>> {
+        debug!("search_messages: query={}", query);
         let mut all_ids = Vec::new();
         let mut page_token: Option<String> = None;
 
         loop {
             self.limiter.acquire(5).await;
-            let mut call = self.hub.users().messages_list("me").q(query);
+            let mut call = self.hub.users().messages_list("me").q(query).add_scope(GMAIL_SCOPE);
             if let Some(ref token) = page_token {
                 call = call.page_token(token);
             }
@@ -67,6 +71,7 @@ impl GmailClient {
     }
 
     pub async fn get_message(&self, id: &str) -> Result<GmailMessage> {
+        log::trace!("get_message: id={}", id);
         self.limiter.acquire(5).await;
         let (_, msg) = self
             .hub
@@ -78,6 +83,7 @@ impl GmailClient {
             .add_metadata_headers("From")
             .add_metadata_headers("Subject")
             .add_metadata_headers("List-Id")
+            .add_scope(GMAIL_SCOPE)
             .doit()
             .await
             .context(format!("messages.get({}) failed", id))?;
@@ -86,12 +92,13 @@ impl GmailClient {
     }
 
     pub async fn list_threads(&self, query: &str) -> Result<Vec<String>> {
+        debug!("list_threads: query={}", query);
         let mut all_ids = Vec::new();
         let mut page_token: Option<String> = None;
 
         loop {
             self.limiter.acquire(10).await;
-            let mut call = self.hub.users().threads_list("me").q(query);
+            let mut call = self.hub.users().threads_list("me").q(query).add_scope(GMAIL_SCOPE);
             if let Some(ref token) = page_token {
                 call = call.page_token(token);
             }
@@ -117,6 +124,7 @@ impl GmailClient {
     }
 
     pub async fn get_thread(&self, id: &str) -> Result<GmailThread> {
+        log::trace!("get_thread: id={}", id);
         self.limiter.acquire(10).await;
         let (_, thread) = self
             .hub
@@ -128,6 +136,7 @@ impl GmailClient {
             .add_metadata_headers("From")
             .add_metadata_headers("Subject")
             .add_metadata_headers("List-Id")
+            .add_scope(GMAIL_SCOPE)
             .doit()
             .await
             .context(format!("threads.get({}) failed", id))?;
@@ -152,6 +161,7 @@ impl GmailClient {
     }
 
     pub async fn modify_message(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {
+        debug!("modify_message: id={}, add={:?}, remove={:?}", id, add, remove);
         self.limiter.acquire(5).await;
         let req = ModifyMessageRequest {
             add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
@@ -161,6 +171,7 @@ impl GmailClient {
         self.hub
             .users()
             .messages_modify(req, "me", id)
+            .add_scope(GMAIL_SCOPE)
             .doit()
             .await
             .context(format!("messages.modify({}) failed", id))?;
@@ -169,6 +180,7 @@ impl GmailClient {
     }
 
     pub async fn batch_modify(&self, ids: &[String], add: &[String], remove: &[String]) -> Result<()> {
+        debug!("batch_modify: count={}, add={:?}, remove={:?}", ids.len(), add, remove);
         if ids.is_empty() {
             return Ok(());
         }
@@ -184,6 +196,7 @@ impl GmailClient {
             self.hub
                 .users()
                 .messages_batch_modify(req, "me")
+                .add_scope(GMAIL_SCOPE)
                 .doit()
                 .await
                 .context("messages.batchModify failed")?;
@@ -193,10 +206,12 @@ impl GmailClient {
     }
 
     pub async fn trash_thread(&self, id: &str) -> Result<()> {
+        debug!("trash_thread: id={}", id);
         self.limiter.acquire(10).await;
         self.hub
             .users()
             .threads_trash("me", id)
+            .add_scope(GMAIL_SCOPE)
             .doit()
             .await
             .context(format!("threads.trash({}) failed", id))?;

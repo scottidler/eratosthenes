@@ -76,6 +76,7 @@ pub async fn create_label_if_missing(
     let (_, created) = hub
         .users()
         .labels_create(label, "me")
+        .add_scope(crate::gmail::auth::GMAIL_SCOPE)
         .doit()
         .await
         .context(format!("Failed to create label '{}'", name))?;

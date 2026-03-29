@@ -27,11 +27,18 @@ fn default_callback_port() -> u16 {
 pub struct Config {
     pub auth: AuthConfig,
 
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+
     #[serde(rename = "message-filters", default, deserialize_with = "deserialize_named_filters")]
     pub message_filters: Vec<MessageFilter>,
 
     #[serde(rename = "state-filters", default, deserialize_with = "deserialize_named_states")]
     pub state_filters: Vec<StateFilter>,
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 pub fn load_config(config_path: &Path) -> Result<Config> {
@@ -161,6 +168,7 @@ state-filters:
         let config: Config = serde_yaml::from_str(yaml).unwrap();
 
         assert_eq!(config.auth.callback_port, 13131);
+        assert_eq!(config.log_level, "info"); // default
         assert_eq!(config.message_filters.len(), 2);
         assert_eq!(config.message_filters[0].name, "only-me-star");
         assert_eq!(config.message_filters[0].actions, vec![FilterAction::Star]);
@@ -209,5 +217,30 @@ auth:
 
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.auth.callback_port, 9999);
+    }
+
+    #[test]
+    fn test_log_level_from_config() {
+        let yaml = r#"
+log-level: debug
+auth:
+  client-secret-path: "/tmp/secret.json"
+  token-cache-path: "/tmp/tokens.json"
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.log_level, "debug");
+    }
+
+    #[test]
+    fn test_log_level_default() {
+        let yaml = r#"
+auth:
+  client-secret-path: "/tmp/secret.json"
+  token-cache-path: "/tmp/tokens.json"
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.log_level, "info");
     }
 }
