@@ -140,9 +140,9 @@ pub fn install(config_path: &Path, interval: &str) -> Result<()> {
     }
 
     // Check if token cache exists (warn, don't block)
-    if let Some(config_dir) = dirs::config_dir() {
-        let token_path = config_dir.join("eratosthenes").join("tokens.json");
-        if !token_path.exists() {
+    if let Ok(config) = eratosthenes::load(&config_path) {
+        let token_path_str = shellexpand(config.auth.token_cache_path.to_str().unwrap_or_default());
+        if !Path::new(&token_path_str).exists() {
             eprintln!("Warning: no token cache found. Run `eratosthenes auth login` first.");
             eprintln!("  The browser OAuth flow cannot work inside a systemd timer context.");
         }
