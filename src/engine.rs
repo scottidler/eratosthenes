@@ -12,34 +12,39 @@ use crate::gmail::label::create_label_if_missing;
 use crate::gmail::message::{GmailMessage, GmailThread};
 use crate::gmail::query::compile_query;
 
-pub async fn execute(client: &mut GmailClient, config: &Config, dry_run: bool) -> Result<()> {
+pub async fn execute(client: &mut GmailClient, config: &Config, prefix: &str, dry_run: bool) -> Result<()> {
     debug!(
-        "execute: dry_run={}, message_filters={}, state_filters={}",
+        "{}execute: dry_run={}, message_filters={}, state_filters={}",
+        prefix,
         dry_run,
         config.message_filters.len(),
         config.state_filters.len()
     );
 
     if dry_run {
-        println!("=== DRY RUN - no changes will be made ===");
+        println!("{}=== DRY RUN - no changes will be made ===", prefix);
     }
 
     ensure_labels(client, config).await?;
 
-    info!("=== Phase 0: Stage Sanitization ===");
-    let sanitized = sanitize_stages(client, &config.state_filters, dry_run).await?;
+    info!("{}=== Phase 0: Stage Sanitization ===", prefix);
+    let sanitized = sanitize_stages(client, &config.state_filters, prefix, dry_run).await?;
     if sanitized > 0 {
-        println!("[sanitize] cleaned {} threads with conflicting stage labels", sanitized);
+        println!(
+            "{}[sanitize] cleaned {} threads with conflicting stage labels",
+            prefix, sanitized
+        );
     }
 
-    info!("=== Phase 1: Message Filters ===");
-    let total_matched = execute_message_filters(client, &config.message_filters, dry_run).await?;
+    info!("{}=== Phase 1: Message Filters ===", prefix);
+    let total_matched = execute_message_filters(client, &config.message_filters, prefix, dry_run).await?;
 
-    info!("=== Phase 2: State Filters (Thread Age-Off) ===");
-    let total_transitioned = execute_state_filters(client, &config.state_filters, dry_run).await?;
+    info!("{}=== Phase 2: State Filters (Thread Age-Off) ===", prefix);
+    let total_transitioned = execute_state_filters(client, &config.state_filters, prefix, dry_run).await?;
 
     println!(
-        "Done: {} messages matched filters, {} threads transitioned{}",
+        "{}Done: {} messages matched filters, {} threads transitioned{}",
+        prefix,
         total_matched,
         total_transitioned,
         if dry_run { " (dry run)" } else { "" }
@@ -102,7 +107,12 @@ fn derive_stages(state_filters: &[StateFilter]) -> Vec<String> {
 /// Phase 0: Sanitize conflicting stage labels on threads.
 /// If a thread has labels from multiple stages (e.g., INBOX + Purgatory),
 /// keep only the earliest stage and remove later ones.
-async fn sanitize_stages(client: &GmailClient, state_filters: &[StateFilter], dry_run: bool) -> Result<usize> {
+async fn sanitize_stages(
+    client: &GmailClient,
+    state_filters: &[StateFilter],
+    prefix: &str,
+    dry_run: bool,
+) -> Result<usize> {
     let stages = derive_stages(state_filters);
     debug!("sanitize_stages: stages={:?}", stages);
 
@@ -126,7 +136,10 @@ async fn sanitize_stages(client: &GmailClient, state_filters: &[StateFilter], dr
             let late_query = format!("label:{}", late.to_lowercase());
             let query = format!("{} {}", early_query, late_query);
 
-            debug!("[sanitize] checking conflict: {} + {} -> query: {}", early, late, query);
+            debug!(
+                "{}[sanitize] checking conflict: {} + {} -> query: {}",
+                prefix, early, late, query
+            );
             let thread_ids = client.list_threads(&query).await?;
 
             if thread_ids.is_empty() {
@@ -134,7 +147,8 @@ async fn sanitize_stages(client: &GmailClient, state_filters: &[StateFilter], dr
             }
 
             println!(
-                "[sanitize] {} threads have both {} and {} - removing {}",
+                "{}[sanitize] {} threads have both {} and {} - removing {}",
+                prefix,
                 thread_ids.len(),
                 early,
                 late,
@@ -164,8 +178,18 @@ async fn sanitize_stages(client: &GmailClient, state_filters: &[StateFilter], dr
 /// Phase 1: ACL-style message filter execution.
 /// Fetches all candidate messages once, then evaluates filters in order.
 /// First matching filter claims the message - it is excluded from further filters.
-async fn execute_message_filters(client: &GmailClient, filters: &[MessageFilter], dry_run: bool) -> Result<usize> {
-    debug!("execute_message_filters: count={}, dry_run={}", filters.len(), dry_run);
+async fn execute_message_filters(
+    client: &GmailClient,
+    filters: &[MessageFilter],
+    prefix: &str,
+    dry_run: bool,
+) -> Result<usize> {
+    debug!(
+        "{}execute_message_filters: count={}, dry_run={}",
+        prefix,
+        filters.len(),
+        dry_run
+    );
 
     // Collect unique candidate IDs across all filters
     let mut all_ids: Vec<String> = Vec::new();
@@ -177,9 +201,14 @@ async fn execute_message_filters(client: &GmailClient, filters: &[MessageFilter]
             warn!("Filter '{}' compiles to empty query, skipping", filter.name);
             continue;
         }
-        println!("[filter:{}] searching: {}", filter.name, query);
+        println!("{}[filter:{}] searching: {}", prefix, filter.name, query);
         let ids = client.search_messages(&query).await?;
-        debug!("[filter:{}] query returned {} candidates", filter.name, ids.len());
+        debug!(
+            "{}[filter:{}] query returned {} candidates",
+            prefix,
+            filter.name,
+            ids.len()
+        );
         for id in ids {
             if seen_ids.insert(id.clone()) {
                 all_ids.push(id);
@@ -187,16 +216,20 @@ async fn execute_message_filters(client: &GmailClient, filters: &[MessageFilter]
         }
     }
 
-    println!("[phase1] {} unique candidates, fetching metadata...", all_ids.len());
+    println!(
+        "{}[phase1] {} unique candidates, fetching metadata...",
+        prefix,
+        all_ids.len()
+    );
 
     // Fetch all messages once
     let total = all_ids.len();
     let mut messages: HashMap<String, GmailMessage> = HashMap::new();
     for (i, id) in all_ids.iter().enumerate() {
-        trace!("[phase1] [{}/{}] fetching {}", i + 1, total, id);
+        trace!("{}[phase1] [{}/{}] fetching {}", prefix, i + 1, total, id);
         let msg = client.get_message(id).await?;
         if (i + 1) % 50 == 0 {
-            println!("[phase1] [{}/{}] fetching...", i + 1, total);
+            println!("{}[phase1] [{}/{}] fetching...", prefix, i + 1, total);
         }
         messages.insert(id.clone(), msg);
     }
@@ -217,23 +250,25 @@ async fn execute_message_filters(client: &GmailClient, filters: &[MessageFilter]
             };
             // Only match unread messages (belt and suspenders with is:unread in query)
             if msg.is_read() {
-                trace!("[filter:{}] skipping {} (read)", filter.name, id);
+                trace!("{}[filter:{}] skipping {} (read)", prefix, filter.name, id);
                 continue;
             }
             let labels = msg.labels();
             trace!(
-                "[filter:{}] checking {} to={:?} cc={:?} from={:?}",
-                filter.name, id, msg.to, msg.cc, msg.from
+                "{}[filter:{}] checking {} to={:?} cc={:?} from={:?}",
+                prefix, filter.name, id, msg.to, msg.cc, msg.from
             );
             if filter.matches(&msg.to, &msg.cc, &msg.from, &msg.subject, &labels, &msg.headers) {
                 debug!(
-                    "[filter:{}] MATCH: {} (from: {})",
+                    "{}[filter:{}] MATCH: {} (from: {})",
+                    prefix,
                     filter.name,
                     msg.subject,
                     msg.from.first().map(|s| s.as_str()).unwrap_or("?")
                 );
                 println!(
-                    "[filter:{}] MATCH: {} (from: {})",
+                    "{}[filter:{}] MATCH: {} (from: {})",
+                    prefix,
                     filter.name,
                     msg.subject,
                     msg.from.first().map(|s| s.as_str()).unwrap_or("?")
@@ -248,7 +283,8 @@ async fn execute_message_filters(client: &GmailClient, filters: &[MessageFilter]
         }
 
         println!(
-            "[filter:{}] {} matched (total claimed: {})",
+            "{}[filter:{}] {} matched (total claimed: {})",
+            prefix,
             filter.name,
             matched_ids.len(),
             claimed.len()
@@ -257,7 +293,7 @@ async fn execute_message_filters(client: &GmailClient, filters: &[MessageFilter]
         if !matched_ids.is_empty() {
             total_matched += matched_ids.len();
             for action in &filter.actions {
-                apply_filter_action(client, &matched_ids, action, &filter.name, dry_run).await?;
+                apply_filter_action(client, &matched_ids, action, &filter.name, prefix, dry_run).await?;
             }
         }
     }
@@ -270,10 +306,12 @@ async fn apply_filter_action(
     ids: &[String],
     action: &FilterAction,
     filter_name: &str,
+    prefix: &str,
     dry_run: bool,
 ) -> Result<()> {
     debug!(
-        "apply_filter_action: filter={}, action={:?}, count={}, dry_run={}",
+        "{}apply_filter_action: filter={}, action={:?}, count={}, dry_run={}",
+        prefix,
         filter_name,
         action,
         ids.len(),
@@ -282,14 +320,19 @@ async fn apply_filter_action(
 
     match action {
         FilterAction::Star => {
-            println!("[filter:{}] starring {} messages", filter_name, ids.len());
+            println!("{}[filter:{}] starring {} messages", prefix, filter_name, ids.len());
             if !dry_run {
                 let add = vec!["STARRED".to_string()];
                 client.batch_modify(ids, &add, &[]).await?;
             }
         }
         FilterAction::Flag => {
-            println!("[filter:{}] flagging {} messages as important", filter_name, ids.len());
+            println!(
+                "{}[filter:{}] flagging {} messages as important",
+                prefix,
+                filter_name,
+                ids.len()
+            );
             if !dry_run {
                 let add = vec!["IMPORTANT".to_string()];
                 client.batch_modify(ids, &add, &[]).await?;
@@ -297,7 +340,13 @@ async fn apply_filter_action(
         }
         FilterAction::Move(dest) => {
             let dest_id = client.resolver.resolve_name(dest).unwrap_or(dest.as_str()).to_string();
-            println!("[filter:{}] moving {} messages to {}", filter_name, ids.len(), dest);
+            println!(
+                "{}[filter:{}] moving {} messages to {}",
+                prefix,
+                filter_name,
+                ids.len(),
+                dest
+            );
             if !dry_run {
                 let add = vec![dest_id];
                 client.batch_modify(ids, &add, &[]).await?;
@@ -307,23 +356,29 @@ async fn apply_filter_action(
     Ok(())
 }
 
-async fn execute_state_filters(client: &GmailClient, state_filters: &[StateFilter], dry_run: bool) -> Result<usize> {
+async fn execute_state_filters(
+    client: &GmailClient,
+    state_filters: &[StateFilter],
+    prefix: &str,
+    dry_run: bool,
+) -> Result<usize> {
     debug!(
-        "execute_state_filters: count={}, dry_run={}",
+        "{}execute_state_filters: count={}, dry_run={}",
+        prefix,
         state_filters.len(),
         dry_run
     );
 
     let active_query = build_active_threads_query(state_filters);
     if active_query.is_empty() {
-        info!("No state filter labels to query, skipping Phase 2");
+        info!("{}No state filter labels to query, skipping Phase 2", prefix);
         return Ok(0);
     }
 
-    println!("[state] searching active threads...");
-    debug!("[state] query: {}", active_query);
+    println!("{}[state] searching active threads...", prefix);
+    debug!("{}[state] query: {}", prefix, active_query);
     let thread_ids = client.list_threads(&active_query).await?;
-    println!("[state] {} active threads to evaluate", thread_ids.len());
+    println!("{}[state] {} active threads to evaluate", prefix, thread_ids.len());
 
     let clock = crate::cfg::state::RealClock;
     let total = thread_ids.len();
@@ -331,11 +386,11 @@ async fn execute_state_filters(client: &GmailClient, state_filters: &[StateFilte
 
     for (i, thread_id) in thread_ids.iter().enumerate() {
         if (i + 1) % 50 == 0 {
-            println!("[state] [{}/{}] evaluating...", i + 1, total);
+            println!("{}[state] [{}/{}] evaluating...", prefix, i + 1, total);
         }
-        trace!("[state] [{}/{}] fetching thread {}", i + 1, total, thread_id);
+        trace!("{}[state] [{}/{}] fetching thread {}", prefix, i + 1, total, thread_id);
         let thread = client.get_thread(thread_id).await?;
-        if evaluate_thread(client, &thread, state_filters, &clock, dry_run).await? {
+        if evaluate_thread(client, &thread, state_filters, prefix, &clock, dry_run).await? {
             transitioned += 1;
         }
     }
@@ -347,12 +402,14 @@ async fn evaluate_thread<C: Clock>(
     client: &GmailClient,
     thread: &GmailThread,
     state_filters: &[StateFilter],
+    prefix: &str,
     clock: &C,
     dry_run: bool,
 ) -> Result<bool> {
     let thread_labels = thread.labels();
     debug!(
-        "evaluate_thread: id={}, msgs={}, labels={:?}, is_read={}",
+        "{}evaluate_thread: id={}, msgs={}, labels={:?}, is_read={}",
+        prefix,
         thread.id,
         thread.messages.len(),
         thread_labels,
@@ -362,31 +419,31 @@ async fn evaluate_thread<C: Clock>(
     for state_filter in state_filters {
         if !state_filter.matches_labels(&thread_labels) {
             trace!(
-                "[thread:{}] filter '{}' labels don't match, skipping",
-                thread.id, state_filter.name
+                "{}[thread:{}] filter '{}' labels don't match, skipping",
+                prefix, thread.id, state_filter.name
             );
             continue;
         }
 
         let Some(last_activity) = thread.last_activity() else {
-            warn!("Thread {} has no messages, skipping", thread.id);
+            warn!("{}Thread {} has no messages, skipping", prefix, thread.id);
             return Ok(false);
         };
 
         let is_read = thread.is_read();
         debug!(
-            "[thread:{}] matched filter '{}': last_activity={}, is_read={}",
-            thread.id, state_filter.name, last_activity, is_read
+            "{}[thread:{}] matched filter '{}': last_activity={}, is_read={}",
+            prefix, thread.id, state_filter.name, last_activity, is_read
         );
 
         match state_filter.evaluate_ttl(last_activity, is_read, clock)? {
             Some(action) => {
-                apply_state_action(client, thread, state_filter, &action, dry_run).await?;
+                apply_state_action(client, thread, state_filter, &action, prefix, dry_run).await?;
                 return Ok(true);
             }
             None => {
                 if state_filter.ttl == Ttl::Keep {
-                    debug!("[thread:{}] protected by '{}'", thread.id, state_filter.name);
+                    debug!("{}[thread:{}] protected by '{}'", prefix, thread.id, state_filter.name);
                     return Ok(false);
                 }
             }
@@ -401,11 +458,13 @@ async fn apply_state_action(
     thread: &GmailThread,
     state_filter: &StateFilter,
     action: &StateAction,
+    prefix: &str,
     dry_run: bool,
 ) -> Result<()> {
     let msg_ids = thread.all_message_ids();
     debug!(
-        "apply_state_action: filter={}, thread={}, action={:?}, msgs={}, dry_run={}",
+        "{}apply_state_action: filter={}, thread={}, action={:?}, msgs={}, dry_run={}",
+        prefix,
         state_filter.name,
         thread.id,
         action,
@@ -432,7 +491,8 @@ async fn apply_state_action(
             let dest_id = client.resolver.resolve_name(dest).unwrap_or(dest.as_str()).to_string();
 
             println!(
-                "[state:{}] thread {} -> {} ({} msgs)",
+                "{}[state:{}] thread {} -> {} ({} msgs)",
+                prefix,
                 state_filter.name,
                 thread.id,
                 dest,
@@ -446,7 +506,8 @@ async fn apply_state_action(
         }
         StateAction::Delete => {
             println!(
-                "[state:{}] trashing thread {} ({} msgs)",
+                "{}[state:{}] trashing thread {} ({} msgs)",
+                prefix,
                 state_filter.name,
                 thread.id,
                 msg_ids.len()

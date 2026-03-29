@@ -20,7 +20,9 @@ pub fn init_tls() -> Result<()> {
         .map_err(|_| eyre::eyre!("Failed to install rustls crypto provider"))
 }
 
-pub async fn run(config: &Config, dry_run: bool) -> Result<()> {
+pub async fn run(account: &str, config: &Config, dry_run: bool, multi: bool) -> Result<()> {
+    let prefix = if multi { format!("[{}] ", account) } else { String::new() };
+
     let auth = gmail::auth::build_authenticator(&config.auth)
         .await
         .context("OAuth2 authentication failed")?;
@@ -37,9 +39,9 @@ pub async fn run(config: &Config, dry_run: bool) -> Result<()> {
         auth,
     );
 
-    let mut client = gmail::client::GmailClient::new(hub)
+    let mut client = gmail::client::GmailClient::new(hub, &prefix)
         .await
         .context("Failed to initialize Gmail client")?;
 
-    engine::execute(&mut client, config, dry_run).await
+    engine::execute(&mut client, config, &prefix, dry_run).await
 }

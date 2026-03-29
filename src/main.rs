@@ -12,6 +12,7 @@ mod cli;
 mod service;
 
 use cli::{AuthCommand, Cli, Command, ConfigCommand, ServiceCommand};
+use eratosthenes::cfg::account::{Account, resolve_accounts};
 
 const ENV_LOG_LEVEL: &str = "ERATOSTHENES_LOG_LEVEL";
 
@@ -51,39 +52,6 @@ fn setup_logging(level: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_config_path(cli_path: Option<&PathBuf>) -> Option<PathBuf> {
-    if let Some(path) = cli_path {
-        return Some(path.clone());
-    }
-
-    if let Some(config_dir) = dirs::config_dir() {
-        let primary = config_dir.join("eratosthenes").join("eratosthenes.yml");
-        if primary.exists() {
-            return Some(primary);
-        }
-    }
-
-    let fallback = PathBuf::from("eratosthenes.yml");
-    if fallback.exists() {
-        return Some(fallback);
-    }
-
-    None
-}
-
-fn require_config_path(cli: &Cli) -> Result<PathBuf> {
-    resolve_config_path(cli.config.as_ref()).ok_or_else(|| {
-        eyre::eyre!("No config file found. Provide --config or create ~/.config/eratosthenes/eratosthenes.yml")
-    })
-}
-
-fn load_config_or_exit(cli: &Cli) -> Result<eratosthenes::cfg::config::Config> {
-    let config_path = require_config_path(cli)?;
-    let config = eratosthenes::load(&config_path)?;
-    info!("Config loaded from: {}", config_path.display());
-    Ok(config)
-}
-
 /// Resolve log level with precedence: CLI flag > env var > config file > default ("info")
 fn resolve_log_level(cli_level: Option<&str>, config_level: &str) -> String {
     if let Some(level) = cli_level {
@@ -95,63 +63,165 @@ fn resolve_log_level(cli_level: Option<&str>, config_level: &str) -> String {
     config_level.to_string()
 }
 
+/// Resolve log level from accounts - use the first account's level as a reasonable default.
+fn log_level_from_accounts(cli_level: Option<&str>, accounts: &[Account]) -> String {
+    let config_level = accounts.first().map(|a| a.config.log_level.as_str()).unwrap_or("info");
+    resolve_log_level(cli_level, config_level)
+}
+
+/// Determine if we're running in multi-account mode (for output prefixing).
+fn account_prefix(name: &str, multi: bool) -> String {
+    if multi { format!("[{}] ", name) } else { String::new() }
+}
+
+async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts))?;
+
+    let multi = accounts.len() > 1;
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for account in accounts {
+        let dry_run = cli.dry_run;
+        join_set.spawn(async move {
+            let prefix = account_prefix(&account.name, multi);
+            info!("{}Starting account '{}'", prefix, account.name);
+            let result = eratosthenes::run(&account.name, &account.config, dry_run, multi).await;
+            (account.name, result)
+        });
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok((name, Ok(()))) => {
+                let prefix = account_prefix(&name, multi);
+                println!("{}Completed successfully", prefix);
+            }
+            Ok((name, Err(e))) => {
+                let prefix = account_prefix(&name, multi);
+                eprintln!("{}FAILED: {:#}", prefix, e);
+                errors.push(format!("{}: {:#}", name, e));
+            }
+            Err(e) => {
+                eprintln!("Task panicked: {:#}", e);
+                errors.push(format!("task panic: {:#}", e));
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        eyre::bail!("{} account(s) failed:\n  {}", errors.len(), errors.join("\n  "));
+    }
+    Ok(())
+}
+
+async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
+    let names = account.as_ref().map(|a| vec![a.clone()]).unwrap_or_default();
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts))?;
+
+    if accounts.len() > 1 {
+        let available: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+        eyre::bail!(
+            "auth login requires a single account when multiple exist.\nAvailable accounts: {:?}",
+            available
+        );
+    }
+
+    let account = accounts
+        .into_iter()
+        .next()
+        .ok_or_else(|| eyre::eyre!("No accounts found"))?;
+    let auth = eratosthenes::gmail::auth::build_authenticator(&account.config.auth).await?;
+    eratosthenes::gmail::auth::get_token(&auth).await?;
+    println!("Login successful for '{}'", account.name);
+    Ok(())
+}
+
+async fn cmd_auth_logout(cli: &Cli, names: Vec<String>) -> Result<()> {
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts))?;
+
+    for account in &accounts {
+        eratosthenes::gmail::auth::logout(&account.config.auth).await?;
+        println!("Logged out '{}' (token cache cleared)", account.name);
+    }
+    Ok(())
+}
+
+fn cmd_auth_status(cli: &Cli, names: Vec<String>) -> Result<()> {
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    let multi = accounts.len() > 1;
+
+    for account in &accounts {
+        if multi {
+            println!("=== {} ===", account.name);
+        }
+        service::auth_status(&account.name, &account.config.auth)?;
+        if multi {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn cmd_config_validate(cli: &Cli, names: Vec<String>) -> Result<()> {
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    let multi = accounts.len() > 1;
+
+    for account in &accounts {
+        if multi {
+            println!("=== {} ===", account.name);
+        }
+        service::config_validate(&account.name, &account.config)?;
+        if multi {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+fn cmd_config_show(cli: &Cli, names: Vec<String>) -> Result<()> {
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    let multi = accounts.len() > 1;
+
+    for account in &accounts {
+        if multi {
+            println!("=== {} ===", account.name);
+        }
+        service::config_show(&account.name, &account.config)?;
+        if multi {
+            println!();
+        }
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     eratosthenes::init_tls()?;
 
     match &cli.command {
-        None | Some(Command::Run) => {
-            let config = load_config_or_exit(&cli)?;
-            setup_logging(&resolve_log_level(cli.log_level.as_deref(), &config.log_level))?;
-            info!(
-                "Loaded {} message filters, {} state filters",
-                config.message_filters.len(),
-                config.state_filters.len()
-            );
-            eratosthenes::run(&config, cli.dry_run).await
-        }
-        Some(Command::Auth(opts)) => {
-            let config = load_config_or_exit(&cli)?;
-            setup_logging(&resolve_log_level(cli.log_level.as_deref(), &config.log_level))?;
-            match &opts.command {
-                AuthCommand::Login => {
-                    let auth = eratosthenes::gmail::auth::build_authenticator(&config.auth).await?;
-                    eratosthenes::gmail::auth::get_token(&auth).await?;
-                    println!("Login successful");
-                    Ok(())
-                }
-                AuthCommand::Logout => {
-                    eratosthenes::gmail::auth::logout(&config.auth).await?;
-                    println!("Logged out (token cache cleared)");
-                    Ok(())
-                }
-                AuthCommand::Status => service::auth_status(&config.auth),
-            }
-        }
+        None => cmd_run(&cli, Vec::new()).await,
+        Some(Command::Run { accounts }) => cmd_run(&cli, accounts.clone()).await,
+        Some(Command::Auth(opts)) => match &opts.command {
+            AuthCommand::Login { account } => cmd_auth_login(&cli, account.clone()).await,
+            AuthCommand::Logout { accounts } => cmd_auth_logout(&cli, accounts.clone()).await,
+            AuthCommand::Status { accounts } => cmd_auth_status(&cli, accounts.clone()),
+        },
         Some(Command::Service(opts)) => match &opts.command {
-            ServiceCommand::Install { interval } => {
-                let config_path = require_config_path(&cli)?;
-                service::install(&config_path, interval)
-            }
+            ServiceCommand::Install { interval } => service::install(interval),
             ServiceCommand::Uninstall => service::uninstall(),
-            ServiceCommand::Reinstall { interval } => {
-                let config_path = require_config_path(&cli)?;
-                service::reinstall(&config_path, interval)
-            }
+            ServiceCommand::Reinstall { interval } => service::reinstall(interval),
             ServiceCommand::Status => service::status(),
             ServiceCommand::Start => service::start(),
             ServiceCommand::Stop => service::stop(),
         },
         Some(Command::Config(opts)) => match &opts.command {
-            ConfigCommand::Validate => {
-                let config = load_config_or_exit(&cli)?;
-                service::config_validate(&config)
-            }
-            ConfigCommand::Show => {
-                let config_path = require_config_path(&cli)?;
-                service::config_show(&config_path)
-            }
+            ConfigCommand::Validate { accounts } => cmd_config_validate(&cli, accounts.clone()),
+            ConfigCommand::Show { accounts } => cmd_config_show(&cli, accounts.clone()),
         },
     }
 }

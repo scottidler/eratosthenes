@@ -9,7 +9,7 @@ use std::path::PathBuf;
     after_help = "\
 REQUIRED CREDENTIALS:
   Google Cloud OAuth2 client secret (Desktop app type)
-  Default: ~/.config/eratosthenes/client-secret.json
+  Default: ~/.config/eratosthenes/<account>/client-secret.json
 
 Logs are written to: ~/.local/share/eratosthenes/logs/eratosthenes.log"
 )]
@@ -17,7 +17,7 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    /// Path to config file
+    /// Path to config file (bypass account discovery)
     #[arg(short, long, global = true)]
     pub config: Option<PathBuf>,
 
@@ -33,7 +33,11 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Run the inbox zero engine (default when no subcommand given)
-    Run,
+    Run {
+        /// Account(s) to run (default: all discovered)
+        #[arg(num_args = 0..)]
+        accounts: Vec<String>,
+    },
 
     /// Manage OAuth2 authentication
     Auth(AuthOpts),
@@ -54,11 +58,22 @@ pub struct AuthOpts {
 #[derive(Subcommand)]
 pub enum AuthCommand {
     /// Force re-authentication (clear token cache, open browser)
-    Login,
+    Login {
+        /// Account to login (required when multiple exist)
+        account: Option<String>,
+    },
     /// Clear cached OAuth2 tokens
-    Logout,
+    Logout {
+        /// Account(s) to logout (default: all)
+        #[arg(num_args = 0..)]
+        accounts: Vec<String>,
+    },
     /// Show current authentication status
-    Status,
+    Status {
+        /// Account(s) to show status for (default: all)
+        #[arg(num_args = 0..)]
+        accounts: Vec<String>,
+    },
 }
 
 #[derive(Args)]
@@ -100,7 +115,15 @@ pub struct ConfigOpts {
 #[derive(Subcommand)]
 pub enum ConfigCommand {
     /// Validate config file and show resolved filters
-    Validate,
+    Validate {
+        /// Account(s) to validate (default: all)
+        #[arg(num_args = 0..)]
+        accounts: Vec<String>,
+    },
     /// Show resolved config path
-    Show,
+    Show {
+        /// Account(s) to show (default: all)
+        #[arg(num_args = 0..)]
+        accounts: Vec<String>,
+    },
 }

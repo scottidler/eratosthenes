@@ -2,6 +2,7 @@ use eyre::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use eratosthenes::cfg::account::discover_accounts;
 use eratosthenes::cfg::config::{AuthConfig, Config};
 
 fn shellexpand(path: &str) -> String {
@@ -74,7 +75,7 @@ fn validate_interval(interval: &str) -> Result<()> {
     Ok(())
 }
 
-fn generate_service(binary: &Path, config_path: &Path) -> String {
+fn generate_service(binary: &Path) -> String {
     format!(
         "\
 [Unit]
@@ -82,11 +83,10 @@ Description=Eratosthenes Gmail Inbox Zero Engine
 
 [Service]
 Type=oneshot
-ExecStart={binary} run --config {config}
+ExecStart={binary} run
 Environment=PATH={cargo_bin}:/usr/local/bin:/usr/bin:/bin
 ",
         binary = binary.display(),
-        config = config_path.display(),
         cargo_bin = cargo_bin_dir(),
     )
 }
@@ -126,11 +126,10 @@ fn systemctl_ignore_errors(args: &[&str]) {
     let _ = Command::new("systemctl").arg("--user").args(args).output();
 }
 
-pub fn install(config_path: &Path, interval: &str) -> Result<()> {
+pub fn install(interval: &str) -> Result<()> {
     validate_interval(interval)?;
 
     let binary = std::env::current_exe().context("Failed to get current executable path")?;
-    let config_path = config_path.canonicalize().context("Failed to resolve config path")?;
 
     // Warn about non-standard binary paths
     let binary_str = binary.display().to_string();
@@ -139,19 +138,30 @@ pub fn install(config_path: &Path, interval: &str) -> Result<()> {
         eprintln!("  Consider running `cargo install --path .` first for a stable path.");
     }
 
-    // Check if token cache exists (warn, don't block)
-    if let Ok(config) = eratosthenes::load(&config_path) {
-        let token_path_str = shellexpand(config.auth.token_cache_path.to_str().unwrap_or_default());
-        if !Path::new(&token_path_str).exists() {
-            eprintln!("Warning: no token cache found. Run `eratosthenes auth login` first.");
-            eprintln!("  The browser OAuth flow cannot work inside a systemd timer context.");
+    // Scan and validate all accounts
+    let accounts = discover_accounts()?;
+    if accounts.is_empty() {
+        eprintln!("Warning: no account configs found in ~/.config/eratosthenes/");
+        eprintln!("  Create *.yml config files before the timer fires.");
+    } else {
+        let names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+        println!("Found accounts: {}", names.join(", "));
+
+        for account in &accounts {
+            let token_path_str = shellexpand(account.config.auth.token_cache_path.to_str().unwrap_or_default());
+            if !Path::new(&token_path_str).exists() {
+                eprintln!(
+                    "Warning: no token cache for '{}'. Run `eratosthenes auth login {}` first.",
+                    account.name, account.name
+                );
+            }
         }
     }
 
     let dir = service_dir()?;
     std::fs::create_dir_all(&dir).context("Failed to create systemd user directory")?;
 
-    let svc = generate_service(&binary, &config_path);
+    let svc = generate_service(&binary);
     let tmr = generate_timer(interval);
 
     let svc_path = service_path()?;
@@ -200,7 +210,7 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-pub fn reinstall(config_path: &Path, interval: &str) -> Result<()> {
+pub fn reinstall(interval: &str) -> Result<()> {
     // Suppress errors from uninstall (may not be installed)
     systemctl_ignore_errors(&["stop", &format!("{SERVICE_NAME}.timer")]);
     systemctl_ignore_errors(&["disable", &format!("{SERVICE_NAME}.timer")]);
@@ -214,7 +224,7 @@ pub fn reinstall(config_path: &Path, interval: &str) -> Result<()> {
         let _ = std::fs::remove_file(&tmr_path);
     }
 
-    install(config_path, interval)
+    install(interval)
 }
 
 pub fn status() -> Result<()> {
@@ -250,15 +260,16 @@ pub fn stop() -> Result<()> {
     systemctl(&["stop", &format!("{SERVICE_NAME}.timer")])
 }
 
-pub fn auth_status(auth: &AuthConfig) -> Result<()> {
+pub fn auth_status(account_name: &str, auth: &AuthConfig) -> Result<()> {
     let token_path_str = shellexpand(auth.token_cache_path.to_str().unwrap_or_default());
     let token_path = Path::new(&token_path_str);
 
+    println!("Account: {}", account_name);
     println!("Token cache: {}", token_path.display());
 
     if !token_path.exists() {
         println!("Status: NOT AUTHENTICATED");
-        println!("  No token cache found. Run: eratosthenes auth login");
+        println!("  No token cache found. Run: eratosthenes auth login {}", account_name);
         return Ok(());
     }
 
@@ -269,7 +280,7 @@ pub fn auth_status(auth: &AuthConfig) -> Result<()> {
 
     if parsed.as_object().is_some_and(|obj| obj.is_empty()) {
         println!("Status: EMPTY (no tokens cached)");
-        println!("  Run: eratosthenes auth login");
+        println!("  Run: eratosthenes auth login {}", account_name);
         return Ok(());
     }
 
@@ -288,8 +299,8 @@ pub fn auth_status(auth: &AuthConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn config_validate(config: &Config) -> Result<()> {
-    println!("Config is valid.");
+pub fn config_validate(account_name: &str, config: &Config) -> Result<()> {
+    println!("Account '{}' config is valid.", account_name);
     println!();
     println!("Message filters: {} defined", config.message_filters.len());
     for filter in &config.message_filters {
@@ -306,14 +317,22 @@ pub fn config_validate(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn config_show(config_path: &Path) -> Result<()> {
-    let canonical = config_path.canonicalize().unwrap_or_else(|_| config_path.to_path_buf());
-    println!("Config path: {}", canonical.display());
+pub fn config_show(account_name: &str, config: &Config) -> Result<()> {
+    println!("Account: {}", account_name);
+    println!("Client secret: {}", config.auth.client_secret_path.display());
+    println!("Token cache: {}", config.auth.token_cache_path.display());
+    println!("Callback port: {}", config.auth.callback_port);
+    println!("Log level: {}", config.log_level);
     println!();
-
-    let content = std::fs::read_to_string(config_path)
-        .context(format!("Failed to read config file: {}", config_path.display()))?;
-    print!("{}", content);
+    println!("Message filters: {}", config.message_filters.len());
+    for filter in &config.message_filters {
+        println!("  - {}", filter.name);
+    }
+    println!();
+    println!("State filters: {}", config.state_filters.len());
+    for filter in &config.state_filters {
+        println!("  - {}", filter.name);
+    }
 
     Ok(())
 }
@@ -326,13 +345,11 @@ mod tests {
     #[test]
     fn test_generate_service() {
         let binary = PathBuf::from("/home/user/.cargo/bin/eratosthenes");
-        let config = PathBuf::from("/home/user/.config/eratosthenes/eratosthenes.yml");
-        let output = generate_service(&binary, &config);
+        let output = generate_service(&binary);
 
         assert!(output.contains("Type=oneshot"));
-        assert!(output.contains(
-            "ExecStart=/home/user/.cargo/bin/eratosthenes run --config /home/user/.config/eratosthenes/eratosthenes.yml"
-        ));
+        assert!(output.contains("ExecStart=/home/user/.cargo/bin/eratosthenes run"));
+        assert!(!output.contains("--config"));
         assert!(output.contains("Environment=PATH="));
         assert!(output.contains("Description=Eratosthenes Gmail Inbox Zero Engine"));
     }
@@ -409,11 +426,5 @@ mod tests {
     fn test_shellexpand_no_tilde() {
         let expanded = shellexpand("/absolute/path");
         assert_eq!(expanded, "/absolute/path");
-    }
-
-    #[test]
-    fn test_config_show_missing_file() {
-        let result = config_show(Path::new("/nonexistent/config.yml"));
-        assert!(result.is_err());
     }
 }

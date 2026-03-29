@@ -17,10 +17,10 @@ pub struct GmailClient {
 }
 
 impl GmailClient {
-    pub async fn new(hub: Hub) -> Result<Self> {
+    pub async fn new(hub: Hub, prefix: &str) -> Result<Self> {
         let limiter = RateLimiter::new();
 
-        println!("Connecting to Gmail...");
+        println!("{}Connecting to Gmail...", prefix);
         let (_, label_list) = hub
             .users()
             .labels_list("me")

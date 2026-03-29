@@ -27,4 +27,7 @@ yup-oauth2 = "12.1.2"
 # Dependencies will be added via cargo add
 
 [build-dependencies]
+
+[dev-dependencies]
+tempfile = "3.27.0"
 # For build.rs if needed
