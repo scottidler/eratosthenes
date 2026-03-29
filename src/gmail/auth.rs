@@ -3,7 +3,11 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod, read_app
 
 use crate::cfg::config::AuthConfig;
 
-const GMAIL_MODIFY_SCOPE: &str = "https://www.googleapis.com/auth/gmail.modify";
+const GMAIL_SCOPES: &[&str] = &[
+    "https://mail.google.com/",
+    "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.addons.current.message.readonly",
+];
 
 pub async fn build_authenticator(
     config: &AuthConfig,
@@ -37,7 +41,7 @@ pub async fn get_token(
     >,
 ) -> Result<String> {
     let token = auth
-        .token(&[GMAIL_MODIFY_SCOPE])
+        .token(GMAIL_SCOPES)
         .await
         .context("Failed to obtain OAuth2 token")?;
 
