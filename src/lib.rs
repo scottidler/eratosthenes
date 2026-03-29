@@ -14,6 +14,12 @@ pub fn load(config_path: &Path) -> Result<Config> {
     load_config(config_path).context("Failed to load configuration")
 }
 
+pub fn init_tls() -> Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| eyre::eyre!("Failed to install rustls crypto provider"))
+}
+
 pub async fn run(config: &Config, dry_run: bool) -> Result<()> {
     let auth = gmail::auth::build_authenticator(&config.auth)
         .await

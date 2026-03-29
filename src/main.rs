@@ -64,6 +64,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     setup_logging(&cli.log_level).context("Failed to setup logging")?;
+    eratosthenes::init_tls()?;
 
     let config_path = resolve_config_path(cli.config.as_ref()).ok_or_else(|| {
         eyre::eyre!("No config file found. Provide --config or create ~/.config/eratosthenes/eratosthenes.yml")
