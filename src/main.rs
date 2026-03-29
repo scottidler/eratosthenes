@@ -9,8 +9,9 @@ use std::fs;
 use std::path::PathBuf;
 
 mod cli;
+mod service;
 
-use cli::Cli;
+use cli::{AuthCommand, Cli, Command, ConfigCommand, ServiceCommand};
 
 const ENV_LOG_LEVEL: &str = "ERATOSTHENES_LOG_LEVEL";
 
@@ -70,6 +71,19 @@ fn resolve_config_path(cli_path: Option<&PathBuf>) -> Option<PathBuf> {
     None
 }
 
+fn require_config_path(cli: &Cli) -> Result<PathBuf> {
+    resolve_config_path(cli.config.as_ref()).ok_or_else(|| {
+        eyre::eyre!("No config file found. Provide --config or create ~/.config/eratosthenes/eratosthenes.yml")
+    })
+}
+
+fn load_config_or_exit(cli: &Cli) -> Result<eratosthenes::cfg::config::Config> {
+    let config_path = require_config_path(cli)?;
+    let config = eratosthenes::load(&config_path)?;
+    info!("Config loaded from: {}", config_path.display());
+    Ok(config)
+}
+
 /// Resolve log level with precedence: CLI flag > env var > config file > default ("info")
 fn resolve_log_level(cli_level: Option<&str>, config_level: &str) -> String {
     if let Some(level) = cli_level {
@@ -86,35 +100,58 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     eratosthenes::init_tls()?;
 
-    let config_path = resolve_config_path(cli.config.as_ref()).ok_or_else(|| {
-        eyre::eyre!("No config file found. Provide --config or create ~/.config/eratosthenes/eratosthenes.yml")
-    })?;
-
-    let config = eratosthenes::load(&config_path)?;
-
-    let log_level = resolve_log_level(cli.log_level.as_deref(), &config.log_level);
-    setup_logging(&log_level).context("Failed to setup logging")?;
-
-    info!("Config loaded from: {}", config_path.display());
-
-    if cli.logout {
-        eratosthenes::gmail::auth::logout(&config.auth).await?;
-        println!("Logged out (token cache cleared)");
-        return Ok(());
+    match &cli.command {
+        None | Some(Command::Run) => {
+            let config = load_config_or_exit(&cli)?;
+            setup_logging(&resolve_log_level(cli.log_level.as_deref(), &config.log_level))?;
+            info!(
+                "Loaded {} message filters, {} state filters",
+                config.message_filters.len(),
+                config.state_filters.len()
+            );
+            eratosthenes::run(&config, cli.dry_run).await
+        }
+        Some(Command::Auth(opts)) => {
+            let config = load_config_or_exit(&cli)?;
+            setup_logging(&resolve_log_level(cli.log_level.as_deref(), &config.log_level))?;
+            match &opts.command {
+                AuthCommand::Login => {
+                    let auth = eratosthenes::gmail::auth::build_authenticator(&config.auth).await?;
+                    eratosthenes::gmail::auth::get_token(&auth).await?;
+                    println!("Login successful");
+                    Ok(())
+                }
+                AuthCommand::Logout => {
+                    eratosthenes::gmail::auth::logout(&config.auth).await?;
+                    println!("Logged out (token cache cleared)");
+                    Ok(())
+                }
+                AuthCommand::Status => service::auth_status(&config.auth),
+            }
+        }
+        Some(Command::Service(opts)) => match &opts.command {
+            ServiceCommand::Install { interval } => {
+                let config_path = require_config_path(&cli)?;
+                service::install(&config_path, interval)
+            }
+            ServiceCommand::Uninstall => service::uninstall(),
+            ServiceCommand::Reinstall { interval } => {
+                let config_path = require_config_path(&cli)?;
+                service::reinstall(&config_path, interval)
+            }
+            ServiceCommand::Status => service::status(),
+            ServiceCommand::Start => service::start(),
+            ServiceCommand::Stop => service::stop(),
+        },
+        Some(Command::Config(opts)) => match &opts.command {
+            ConfigCommand::Validate => {
+                let config = load_config_or_exit(&cli)?;
+                service::config_validate(&config)
+            }
+            ConfigCommand::Show => {
+                let config_path = require_config_path(&cli)?;
+                service::config_show(&config_path)
+            }
+        },
     }
-
-    if cli.login {
-        let auth = eratosthenes::gmail::auth::build_authenticator(&config.auth).await?;
-        eratosthenes::gmail::auth::get_token(&auth).await?;
-        println!("Login successful");
-        return Ok(());
-    }
-
-    info!(
-        "Loaded {} message filters, {} state filters",
-        config.message_filters.len(),
-        config.state_filters.len()
-    );
-
-    eratosthenes::run(&config, cli.dry_run).await
 }
