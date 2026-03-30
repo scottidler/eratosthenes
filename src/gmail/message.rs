@@ -3,6 +3,7 @@ use eyre::{Result, eyre};
 use std::collections::{HashMap, HashSet};
 
 use crate::cfg::label::Label;
+use crate::gmail::label::LabelResolver;
 
 pub struct GmailMessage {
     pub id: String,
@@ -67,6 +68,13 @@ impl GmailThread {
 
     pub fn labels(&self) -> Vec<Label> {
         self.label_ids().into_iter().map(|id| Label::new(&id)).collect()
+    }
+
+    pub fn labels_resolved(&self, resolver: &LabelResolver) -> Vec<Label> {
+        self.label_ids()
+            .into_iter()
+            .map(|id| Label::new(resolver.resolve_id(&id).unwrap_or(id.as_str())))
+            .collect()
     }
 
     pub fn is_read(&self) -> bool {

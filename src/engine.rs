@@ -406,7 +406,7 @@ async fn evaluate_thread<C: Clock>(
     clock: &C,
     dry_run: bool,
 ) -> Result<bool> {
-    let thread_labels = thread.labels();
+    let thread_labels = thread.labels_resolved(&client.resolver);
     debug!(
         "{}evaluate_thread: id={}, msgs={}, labels={:?}, is_read={}",
         prefix,
