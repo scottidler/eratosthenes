@@ -148,7 +148,7 @@ pub fn install(interval: &str) -> Result<()> {
         println!("Found accounts: {}", names.join(", "));
 
         for account in &accounts {
-            let token_path_str = shellexpand(account.config.auth.token_cache_path.to_str().unwrap_or_default());
+            let token_path_str = shellexpand(account.config.auth.token_cache_path().to_str().unwrap_or_default());
             if !Path::new(&token_path_str).exists() {
                 eprintln!(
                     "Warning: no token cache for '{}'. Run `eratosthenes auth login {}` first.",
@@ -261,7 +261,7 @@ pub fn stop() -> Result<()> {
 }
 
 pub fn auth_status(account_name: &str, auth: &AuthConfig) -> Result<()> {
-    let token_path_str = shellexpand(auth.token_cache_path.to_str().unwrap_or_default());
+    let token_path_str = shellexpand(auth.token_cache_path().to_str().unwrap_or_default());
     let token_path = Path::new(&token_path_str);
 
     println!("Account: {}", account_name);
@@ -319,8 +319,9 @@ pub fn config_validate(account_name: &str, config: &Config) -> Result<()> {
 
 pub fn config_show(account_name: &str, config: &Config) -> Result<()> {
     println!("Account: {}", account_name);
-    println!("Client secret: {}", config.auth.client_secret_path.display());
-    println!("Token cache: {}", config.auth.token_cache_path.display());
+    println!("Creds path: {}", config.auth.creds_path.display());
+    println!("Client secret: {}", config.auth.client_secret_path().display());
+    println!("Token cache: {}", config.auth.token_cache_path().display());
     println!("Callback port: {}", config.auth.callback_port);
     println!("Log level: {}", config.log_level);
     println!();

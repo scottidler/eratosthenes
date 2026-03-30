@@ -185,8 +185,7 @@ mod tests {
         let content = format!(
             r#"
 auth:
-  client-secret-path: "/tmp/secret.json"
-  token-cache-path: "/tmp/tokens.json"
+  creds-path: /tmp/creds
   callback-port: {}
 "#,
             port

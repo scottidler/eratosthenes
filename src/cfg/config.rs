@@ -12,10 +12,19 @@ use crate::cfg::state::StateFilter;
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct AuthConfig {
-    pub client_secret_path: PathBuf,
-    pub token_cache_path: PathBuf,
+    pub creds_path: PathBuf,
     #[serde(default = "default_callback_port")]
     pub callback_port: u16,
+}
+
+impl AuthConfig {
+    pub fn client_secret_path(&self) -> PathBuf {
+        self.creds_path.join("client-secret.json")
+    }
+
+    pub fn token_cache_path(&self) -> PathBuf {
+        self.creds_path.join("tokencache.json")
+    }
 }
 
 fn default_callback_port() -> u16 {
@@ -49,10 +58,17 @@ pub fn load_config(config_path: &Path) -> Result<Config> {
         eyre!("Failed to read config file {}: {}", config_path.display(), e)
     })?;
 
-    let cfg: Config = serde_yaml::from_str(&content).map_err(|e| {
+    let mut cfg: Config = serde_yaml::from_str(&content).map_err(|e| {
         error!("Failed to parse YAML: {}", e);
         eyre!("Failed to parse YAML: {}", e)
     })?;
+
+    // Resolve relative creds-path against the config file's directory
+    let creds_str = cfg.auth.creds_path.to_str().unwrap_or_default();
+    if !cfg.auth.creds_path.is_absolute() && !creds_str.starts_with("~/") {
+        let config_dir = config_path.parent().unwrap_or(Path::new("."));
+        cfg.auth.creds_path = config_dir.join(&cfg.auth.creds_path);
+    }
 
     debug!("Successfully loaded configuration");
     Ok(cfg)
@@ -130,8 +146,7 @@ mod tests {
     fn test_load_full_config() {
         let yaml = r#"
 auth:
-  client-secret-path: "/tmp/secret.json"
-  token-cache-path: "/tmp/tokens.json"
+  creds-path: /tmp/creds
 
 message-filters:
   - only-me-star:
@@ -198,8 +213,7 @@ state-filters:
     fn test_default_callback_port() {
         let yaml = r#"
 auth:
-  client-secret-path: "/tmp/secret.json"
-  token-cache-path: "/tmp/tokens.json"
+  creds-path: /tmp/creds
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).unwrap();
@@ -210,8 +224,7 @@ auth:
     fn test_custom_callback_port() {
         let yaml = r#"
 auth:
-  client-secret-path: "/tmp/secret.json"
-  token-cache-path: "/tmp/tokens.json"
+  creds-path: /tmp/creds
   callback-port: 9999
 "#;
 
@@ -224,8 +237,7 @@ auth:
         let yaml = r#"
 log-level: debug
 auth:
-  client-secret-path: "/tmp/secret.json"
-  token-cache-path: "/tmp/tokens.json"
+  creds-path: /tmp/creds
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).unwrap();
@@ -236,8 +248,7 @@ auth:
     fn test_log_level_default() {
         let yaml = r#"
 auth:
-  client-secret-path: "/tmp/secret.json"
-  token-cache-path: "/tmp/tokens.json"
+  creds-path: /tmp/creds
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).unwrap();

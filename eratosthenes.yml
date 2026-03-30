@@ -1,6 +1,5 @@
 auth:
-  client-secret-path: "~/.config/eratosthenes/client-secret.json"
-  token-cache-path: "~/.config/eratosthenes/tokencache.json"
+  creds-path: "~/.config/eratosthenes"
   # callback-port: 13131
 
 message-filters:
