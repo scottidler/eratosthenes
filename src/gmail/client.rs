@@ -1,6 +1,6 @@
 use eyre::{Context, Result, eyre};
 use google_gmail1::Gmail;
-use google_gmail1::api::{BatchModifyMessagesRequest, ModifyMessageRequest};
+use google_gmail1::api::{BatchModifyMessagesRequest, ModifyMessageRequest, ModifyThreadRequest};
 use log::{debug, warn};
 
 use crate::gmail::auth::GMAIL_SCOPE;
@@ -123,6 +123,45 @@ impl GmailClient {
         Ok(all_ids)
     }
 
+    /// List threads that have ALL of the given label IDs present across any of their messages.
+    /// Unlike `list_threads` (which uses a text query requiring a single message to match all
+    /// conditions), `labelIds` is evaluated at the thread level: a thread matches if any message
+    /// carries label A and any message carries label B.
+    pub async fn list_threads_by_label_ids(&self, label_ids: &[&str]) -> Result<Vec<String>> {
+        debug!("list_threads_by_label_ids: label_ids={:?}", label_ids);
+        let mut all_ids = Vec::new();
+        let mut page_token: Option<String> = None;
+
+        loop {
+            self.limiter.acquire(10).await;
+            let mut call = self.hub.users().threads_list("me").add_scope(GMAIL_SCOPE);
+            for &id in label_ids {
+                call = call.add_label_ids(id);
+            }
+            if let Some(ref token) = page_token {
+                call = call.page_token(token);
+            }
+
+            let (_, result) = call.doit().await.context("threads.list (by label IDs) failed")?;
+
+            if let Some(threads) = result.threads {
+                for thread in threads {
+                    if let Some(id) = thread.id {
+                        all_ids.push(id);
+                    }
+                }
+            }
+
+            page_token = result.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        debug!("list_threads_by_label_ids({:?}) -> {} results", label_ids, all_ids.len());
+        Ok(all_ids)
+    }
+
     pub async fn get_thread(&self, id: &str) -> Result<GmailThread> {
         log::trace!("get_thread: id={}", id);
         self.limiter.acquire(10).await;
@@ -202,6 +241,23 @@ impl GmailClient {
                 .context("messages.batchModify failed")?;
         }
 
+        Ok(())
+    }
+
+    pub async fn modify_thread(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {
+        debug!("modify_thread: id={}, add={:?}, remove={:?}", id, add, remove);
+        self.limiter.acquire(10).await;
+        let req = ModifyThreadRequest {
+            add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
+            remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
+        };
+        self.hub
+            .users()
+            .threads_modify(req, "me", id)
+            .add_scope(GMAIL_SCOPE)
+            .doit()
+            .await
+            .context(format!("threads.modify({}) failed", id))?;
         Ok(())
     }
 

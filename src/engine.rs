@@ -127,20 +127,18 @@ async fn sanitize_stages(
             let early = &stages[i];
             let late = &stages[j];
 
-            // Gmail search: "in:inbox" for INBOX, "label:x" for custom
-            let early_query = if early == "INBOX" {
-                "in:inbox".to_string()
-            } else {
-                format!("label:{}", early.to_lowercase())
-            };
-            let late_query = format!("label:{}", late.to_lowercase());
-            let query = format!("{} {}", early_query, late_query);
+            // Resolve stage names to Gmail label IDs.
+            // labelIds in threads.list is evaluated at thread level: a thread matches if any
+            // message has label A AND any message has label B (even across different messages).
+            // This correctly finds threads where a reply arrived (new msg = INBOX, old msgs = Purgatory).
+            let early_id = client.resolver.resolve_name(early).unwrap_or(early.as_str()).to_string();
+            let late_id = client.resolver.resolve_name(late).unwrap_or(late.as_str()).to_string();
 
             debug!(
-                "{}[sanitize] checking conflict: {} + {} -> query: {}",
-                prefix, early, late, query
+                "{}[sanitize] checking conflict: {} ({}) + {} ({})",
+                prefix, early, early_id, late, late_id
             );
-            let thread_ids = client.list_threads(&query).await?;
+            let thread_ids = client.list_threads_by_label_ids(&[&early_id, &late_id]).await?;
 
             if thread_ids.is_empty() {
                 continue;
@@ -156,16 +154,9 @@ async fn sanitize_stages(
             );
 
             if !dry_run {
-                // Collect all message IDs from conflicting threads
-                let mut all_msg_ids = Vec::new();
                 for tid in &thread_ids {
-                    let thread = client.get_thread(tid).await?;
-                    all_msg_ids.extend(thread.all_message_ids());
+                    client.modify_thread(tid, &[], &[late_id.clone()]).await?;
                 }
-
-                let late_label_id = client.resolver.resolve_name(late).unwrap_or(late.as_str()).to_string();
-
-                client.batch_modify(&all_msg_ids, &[], &[late_label_id]).await?;
             }
 
             total_cleaned += thread_ids.len();
@@ -461,14 +452,12 @@ async fn apply_state_action(
     prefix: &str,
     dry_run: bool,
 ) -> Result<()> {
-    let msg_ids = thread.all_message_ids();
     debug!(
-        "{}apply_state_action: filter={}, thread={}, action={:?}, msgs={}, dry_run={}",
+        "{}apply_state_action: filter={}, thread={}, action={:?}, dry_run={}",
         prefix,
         state_filter.name,
         thread.id,
         action,
-        msg_ids.len(),
         dry_run
     );
 
@@ -491,26 +480,24 @@ async fn apply_state_action(
             let dest_id = client.resolver.resolve_name(dest).unwrap_or(dest.as_str()).to_string();
 
             println!(
-                "{}[state:{}] thread {} -> {} ({} msgs)",
+                "{}[state:{}] thread {} -> {}",
                 prefix,
                 state_filter.name,
                 thread.id,
                 dest,
-                msg_ids.len()
             );
 
             if !dry_run {
                 let add = vec![dest_id];
-                client.batch_modify(&msg_ids, &add, &remove).await?;
+                client.modify_thread(&thread.id, &add, &remove).await?;
             }
         }
         StateAction::Delete => {
             println!(
-                "{}[state:{}] trashing thread {} ({} msgs)",
+                "{}[state:{}] trashing thread {}",
                 prefix,
                 state_filter.name,
                 thread.id,
-                msg_ids.len()
             );
             if !dry_run {
                 client.trash_thread(&thread.id).await?;
