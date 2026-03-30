@@ -3,55 +3,17 @@
 #![deny(unused_variables)]
 
 use clap::{CommandFactory, FromArgMatches};
-use eyre::{Context, Result};
+use eyre::Result;
 use log::info;
-use std::fs;
-use std::path::PathBuf;
 
 mod cli;
+mod logging;
 mod service;
 
 use cli::{AuthCommand, Cli, Command, ConfigCommand, ServiceCommand};
 use eratosthenes::cfg::account::{Account, discovered_account_names, resolve_accounts};
 
 const ENV_LOG_LEVEL: &str = "ERATOSTHENES_LOG_LEVEL";
-
-fn setup_logging(level: &str, account: Option<&str>) -> Result<()> {
-    let log_dir = dirs::data_local_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("eratosthenes")
-        .join("logs");
-
-    fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
-
-    let filename = account.map(|a| format!("{}.log", a)).unwrap_or_else(|| "eratosthenes.log".to_string());
-    let log_file = log_dir.join(filename);
-
-    let target = Box::new(
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_file)
-            .context("Failed to open log file")?,
-    );
-
-    // Filter noisy third-party crates to warn, apply user level to eratosthenes
-    let filter = format!("warn,eratosthenes={}", level);
-
-    env_logger::Builder::new()
-        .parse_filters(&filter)
-        .target(env_logger::Target::Pipe(target))
-        .init();
-
-    info!("------------------------------------------------------------");
-    info!(
-        "eratosthenes run started at {}",
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC")
-    );
-    info!("------------------------------------------------------------");
-    info!("Log level: {}, writing to: {}", level, log_file.display());
-    Ok(())
-}
 
 /// Resolve log level with precedence: CLI flag > env var > config file > default ("info")
 fn resolve_log_level(cli_level: Option<&str>, config_level: &str) -> String {
@@ -77,8 +39,9 @@ fn account_prefix(name: &str, multi: bool) -> String {
 
 async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
-    let log_account = if accounts.len() == 1 { accounts.first().map(|a| a.name.as_str()) } else { None };
-    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts), log_account)?;
+    let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
+    let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+    logging::setup(&level, &account_names)?;
 
     let multi = accounts.len() > 1;
     let mut join_set = tokio::task::JoinSet::new();
@@ -86,10 +49,14 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
     for account in accounts {
         let dry_run = cli.dry_run;
         join_set.spawn(async move {
-            let prefix = account_prefix(&account.name, multi);
-            info!("{}Starting account '{}'", prefix, account.name);
-            let result = eratosthenes::run(&account.name, &account.config, dry_run, multi).await;
-            (account.name, result)
+            let name = account.name;
+            let config = account.config;
+            logging::ACCOUNT.scope(name.clone(), async move {
+                let prefix = account_prefix(&name, multi);
+                info!("{}Starting account '{}'", prefix, &name);
+                let result = eratosthenes::run(&name, &config, dry_run, multi).await;
+                (name, result)
+            }).await
         });
     }
 
@@ -121,8 +88,9 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
 async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
     let names = account.as_ref().map(|a| vec![a.clone()]).unwrap_or_default();
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
-    let log_account = accounts.first().map(|a| a.name.as_str());
-    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts), log_account)?;
+    let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
+    let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+    logging::setup(&level, &account_names)?;
 
     if accounts.len() > 1 {
         let available: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
@@ -136,20 +104,30 @@ async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
         .into_iter()
         .next()
         .ok_or_else(|| eyre::eyre!("No accounts found"))?;
-    let auth = eratosthenes::gmail::auth::build_authenticator(&account.config.auth).await?;
-    eratosthenes::gmail::auth::get_token(&auth).await?;
-    println!("Login successful for '{}'", account.name);
-    Ok(())
+    let name = account.name;
+    let config = account.config;
+    logging::ACCOUNT.scope(name.clone(), async move {
+        let auth = eratosthenes::gmail::auth::build_authenticator(&config.auth).await?;
+        eratosthenes::gmail::auth::get_token(&auth).await?;
+        println!("Login successful for '{}'", name);
+        Ok(())
+    }).await
 }
 
 async fn cmd_auth_logout(cli: &Cli, names: Vec<String>) -> Result<()> {
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
-    let log_account = if accounts.len() == 1 { accounts.first().map(|a| a.name.as_str()) } else { None };
-    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts), log_account)?;
+    let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
+    let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+    logging::setup(&level, &account_names)?;
 
-    for account in &accounts {
-        eratosthenes::gmail::auth::logout(&account.config.auth).await?;
-        println!("Logged out '{}' (token cache cleared)", account.name);
+    for account in accounts {
+        let name = account.name;
+        let config = account.config;
+        logging::ACCOUNT.scope(name.clone(), async move {
+            eratosthenes::gmail::auth::logout(&config.auth).await?;
+            println!("Logged out '{}' (token cache cleared)", name);
+            Ok::<(), eyre::Error>(())
+        }).await?;
     }
     Ok(())
 }
