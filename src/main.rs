@@ -16,7 +16,7 @@ use eratosthenes::cfg::account::{Account, discovered_account_names, resolve_acco
 
 const ENV_LOG_LEVEL: &str = "ERATOSTHENES_LOG_LEVEL";
 
-fn setup_logging(level: &str) -> Result<()> {
+fn setup_logging(level: &str, account: Option<&str>) -> Result<()> {
     let log_dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("eratosthenes")
@@ -24,7 +24,8 @@ fn setup_logging(level: &str) -> Result<()> {
 
     fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
 
-    let log_file = log_dir.join("eratosthenes.log");
+    let filename = account.map(|a| format!("{}.log", a)).unwrap_or_else(|| "eratosthenes.log".to_string());
+    let log_file = log_dir.join(filename);
 
     let target = Box::new(
         fs::OpenOptions::new()
@@ -76,7 +77,8 @@ fn account_prefix(name: &str, multi: bool) -> String {
 
 async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
-    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts))?;
+    let log_account = if accounts.len() == 1 { accounts.first().map(|a| a.name.as_str()) } else { None };
+    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts), log_account)?;
 
     let multi = accounts.len() > 1;
     let mut join_set = tokio::task::JoinSet::new();
@@ -119,7 +121,8 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
 async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
     let names = account.as_ref().map(|a| vec![a.clone()]).unwrap_or_default();
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
-    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts))?;
+    let log_account = accounts.first().map(|a| a.name.as_str());
+    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts), log_account)?;
 
     if accounts.len() > 1 {
         let available: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
@@ -141,7 +144,8 @@ async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
 
 async fn cmd_auth_logout(cli: &Cli, names: Vec<String>) -> Result<()> {
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
-    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts))?;
+    let log_account = if accounts.len() == 1 { accounts.first().map(|a| a.name.as_str()) } else { None };
+    setup_logging(&log_level_from_accounts(cli.log_level.as_deref(), &accounts), log_account)?;
 
     for account in &accounts {
         eratosthenes::gmail::auth::logout(&account.config.auth).await?;

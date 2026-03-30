@@ -11,7 +11,7 @@ REQUIRED CREDENTIALS:
   Google Cloud OAuth2 client secret (Desktop app type)
   Default: ~/.config/eratosthenes/<account>/client-secret.json
 
-Logs are written to: ~/.local/share/eratosthenes/logs/eratosthenes.log"
+Logs are written to: ~/.local/share/eratosthenes/logs/<account>.log"
 )]
 pub struct Cli {
     #[command(subcommand)]
