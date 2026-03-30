@@ -2,7 +2,7 @@
 #![deny(dead_code)]
 #![deny(unused_variables)]
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use eyre::{Context, Result};
 use log::info;
 use std::fs;
@@ -12,7 +12,7 @@ mod cli;
 mod service;
 
 use cli::{AuthCommand, Cli, Command, ConfigCommand, ServiceCommand};
-use eratosthenes::cfg::account::{Account, resolve_accounts};
+use eratosthenes::cfg::account::{Account, discovered_account_names, resolve_accounts};
 
 const ENV_LOG_LEVEL: &str = "ERATOSTHENES_LOG_LEVEL";
 
@@ -200,7 +200,27 @@ fn cmd_config_show(cli: &Cli, names: Vec<String>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let discovered = discovered_account_names();
+    let account_help = if discovered.is_empty() {
+        "Discovered accounts: (none)".to_string()
+    } else {
+        format!("Discovered accounts: {}", discovered.join(", "))
+    };
+
+    let cmd = Cli::command()
+        .mut_subcommand("run", |cmd| cmd.after_help(&account_help))
+        .mut_subcommand("auth", |cmd| {
+            cmd.mut_subcommand("login", |cmd| cmd.after_help(&account_help))
+                .mut_subcommand("logout", |cmd| cmd.after_help(&account_help))
+                .mut_subcommand("status", |cmd| cmd.after_help(&account_help))
+        })
+        .mut_subcommand("config", |cmd| {
+            cmd.mut_subcommand("validate", |cmd| cmd.after_help(&account_help))
+                .mut_subcommand("show", |cmd| cmd.after_help(&account_help))
+        });
+
+    let matches = cmd.get_matches();
+    let cli = Cli::from_arg_matches(&matches).map_err(|e| eyre::eyre!(e))?;
     eratosthenes::init_tls()?;
 
     match &cli.command {
