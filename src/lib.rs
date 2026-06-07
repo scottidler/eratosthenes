@@ -5,6 +5,7 @@
 pub mod cfg;
 pub mod engine;
 pub mod gmail;
+pub mod slack;
 
 use crate::cfg::config::{Config, load_config};
 use eyre::{Context, Result};

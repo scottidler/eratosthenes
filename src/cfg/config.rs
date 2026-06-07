@@ -33,6 +33,30 @@ fn default_callback_port() -> u16 {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+pub struct SlackConfig {
+    /// Env var NAME holding the Slack token, never the token itself.
+    #[serde(default = "default_token_env")]
+    pub token_env: String,
+    /// Self-DM Dxxxx (user token) or Uxxxx/Cxxxx destination.
+    pub channel: String,
+    /// Gmail multi-login slot for deep links (/u/N), default 0.
+    #[serde(default)]
+    pub browser_index: u8,
+    /// systemd OnCalendar string that drives the digest timer.
+    #[serde(default = "default_schedule")]
+    pub schedule: String,
+}
+
+fn default_token_env() -> String {
+    "SLACK_XOXP_TOKEN".to_string()
+}
+
+fn default_schedule() -> String {
+    "Mon-Fri 08,13:00:00".to_string()
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub struct Config {
     pub auth: AuthConfig,
 
@@ -44,6 +68,10 @@ pub struct Config {
 
     #[serde(rename = "state-filters", default, deserialize_with = "deserialize_named_states")]
     pub state_filters: Vec<StateFilter>,
+
+    /// Optional per-account Slack digest config. `digest` is a no-op if absent.
+    #[serde(default)]
+    pub slack: Option<SlackConfig>,
 }
 
 fn default_log_level() -> String {
@@ -253,5 +281,53 @@ auth:
 
         let config: Config = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.log_level, "info");
+    }
+
+    #[test]
+    fn test_slack_absent_is_none() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.slack.is_none());
+    }
+
+    #[test]
+    fn test_slack_block_with_defaults() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+slack:
+  channel: D01G4Q7AWLV
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let slack = config.slack.expect("slack block present");
+        assert_eq!(slack.channel, "D01G4Q7AWLV");
+        assert_eq!(slack.token_env, "SLACK_XOXP_TOKEN");
+        assert_eq!(slack.browser_index, 0);
+        assert_eq!(slack.schedule, "Mon-Fri 08,13:00:00");
+    }
+
+    #[test]
+    fn test_slack_block_overrides() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+slack:
+  token-env: MY_TOKEN
+  channel: C12345
+  browser-index: 2
+  schedule: "Mon-Fri 09:00:00"
+"#;
+
+        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let slack = config.slack.expect("slack block present");
+        assert_eq!(slack.token_env, "MY_TOKEN");
+        assert_eq!(slack.channel, "C12345");
+        assert_eq!(slack.browser_index, 2);
+        assert_eq!(slack.schedule, "Mon-Fri 09:00:00");
     }
 }
