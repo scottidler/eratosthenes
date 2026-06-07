@@ -87,6 +87,44 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+async fn cmd_digest(cli: &Cli, names: Vec<String>) -> Result<()> {
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
+    let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+    logging::setup(&level, &account_names)?;
+
+    // Accounts are processed sequentially and independently: a failure on one is
+    // logged and collected, the loop continues, and we exit non-zero only at the
+    // end if any account failed (mirrors cmd_run's aggregation).
+    let mut errors: Vec<String> = Vec::new();
+    for account in accounts {
+        let name = account.name;
+        let config = account.config;
+
+        let result: Result<()> = logging::ACCOUNT
+            .scope(name.clone(), async {
+                let Some(slack) = config.slack.as_ref() else {
+                    println!("[{}] no slack config; skipping digest", name);
+                    info!("[{}] skipping digest (no slack block)", name);
+                    return Ok(());
+                };
+                let poster = eratosthenes::slack::HttpSlackPoster::from_env(&slack.token_env)?;
+                eratosthenes::digest(&name, &config, &poster).await
+            })
+            .await;
+
+        if let Err(e) = result {
+            eprintln!("[{}] FAILED: {:#}", name, e);
+            errors.push(format!("{}: {:#}", name, e));
+        }
+    }
+
+    if !errors.is_empty() {
+        eyre::bail!("{} account(s) failed:\n  {}", errors.len(), errors.join("\n  "));
+    }
+    Ok(())
+}
+
 async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
     let names = account.as_ref().map(|a| vec![a.clone()]).unwrap_or_default();
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
@@ -197,6 +235,7 @@ async fn main() -> Result<()> {
 
     let cmd = Cli::command()
         .mut_subcommand("run", |cmd| cmd.after_help(&account_help))
+        .mut_subcommand("digest", |cmd| cmd.after_help(&account_help))
         .mut_subcommand("auth", |cmd| {
             cmd.mut_subcommand("login", |cmd| cmd.after_help(&account_help))
                 .mut_subcommand("logout", |cmd| cmd.after_help(&account_help))
@@ -214,6 +253,7 @@ async fn main() -> Result<()> {
     match &cli.command {
         None => cmd_run(&cli, Vec::new()).await,
         Some(Command::Run { accounts }) => cmd_run(&cli, accounts.clone()).await,
+        Some(Command::Digest { accounts }) => cmd_digest(&cli, accounts.clone()).await,
         Some(Command::Auth(opts)) => match &opts.command {
             AuthCommand::Login { account } => cmd_auth_login(&cli, account.clone()).await,
             AuthCommand::Logout { accounts } => cmd_auth_logout(&cli, accounts.clone()).await,

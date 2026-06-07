@@ -39,6 +39,13 @@ pub enum Command {
         accounts: Vec<String>,
     },
 
+    /// Post the pinned-inbox (Starred + Important) digest to Slack
+    Digest {
+        /// Account(s) to post a digest for (default: all discovered)
+        #[arg(num_args = 0..)]
+        accounts: Vec<String>,
+    },
+
     /// Manage OAuth2 authentication
     Auth(AuthOpts),
 
