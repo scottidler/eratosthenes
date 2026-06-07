@@ -2,6 +2,16 @@ auth:
   creds-path: "~/.config/eratosthenes"
   # callback-port: 13131
 
+# Optional. When present, `eratosthenes digest` posts a Slack summary of the
+# pinned (Starred + Important) inbox, and `service install` lays down a digest
+# timer on this schedule. Omit the whole block to disable the digest for an
+# account.
+slack:
+  token-env: SLACK_XOXP_TOKEN    # NAME of the env var holding the user token (xoxp); posts as you
+  channel: D01G4Q7AWLV           # self-DM channel (note-to-self), or Uxxxx/Cxxxx
+  browser-index: 0               # Gmail multi-login slot (/u/N) for deep links
+  schedule: Mon-Fri 08,13:00:00  # systemd OnCalendar; controls the digest timer
+
 message-filters:
   - only-me-star:
       to: ['scott.idler@tatari.tv']
