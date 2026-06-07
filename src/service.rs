@@ -1,8 +1,9 @@
 use eyre::{Context, Result};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use eratosthenes::cfg::account::discover_accounts;
+use eratosthenes::cfg::account::{Account, discover_accounts};
 use eratosthenes::cfg::config::{AuthConfig, Config};
 
 fn shellexpand(path: &str) -> String {
@@ -30,6 +31,24 @@ fn service_path() -> Result<PathBuf> {
 
 fn timer_path() -> Result<PathBuf> {
     Ok(service_dir()?.join(format!("{SERVICE_NAME}.timer")))
+}
+
+const DIGEST_NAME: &str = "eratosthenes-digest";
+
+fn digest_service_path() -> Result<PathBuf> {
+    Ok(service_dir()?.join(format!("{DIGEST_NAME}.service")))
+}
+
+fn digest_timer_path() -> Result<PathBuf> {
+    Ok(service_dir()?.join(format!("{DIGEST_NAME}.timer")))
+}
+
+/// Path to the EnvironmentFile holding the Slack token(s) for the digest service.
+fn digest_env_path() -> Result<PathBuf> {
+    let dir = dirs::config_dir()
+        .ok_or_else(|| eyre::eyre!("Cannot determine XDG config directory"))?
+        .join("eratosthenes");
+    Ok(dir.join("digest.env"))
 }
 
 fn cargo_bin_dir() -> String {
@@ -108,6 +127,114 @@ WantedBy=timers.target
     )
 }
 
+fn generate_digest_service(binary: &Path) -> String {
+    format!(
+        "\
+[Unit]
+Description=Eratosthenes Slack Pinned-Inbox Digest
+
+[Service]
+Type=oneshot
+ExecStart={binary} digest
+Environment=PATH={cargo_bin}:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-%h/.config/eratosthenes/digest.env
+",
+        binary = binary.display(),
+        cargo_bin = cargo_bin_dir(),
+    )
+}
+
+fn generate_digest_timer(schedule: &str) -> String {
+    format!(
+        "\
+[Unit]
+Description=Eratosthenes Digest Timer
+
+[Timer]
+OnCalendar={schedule}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"
+    )
+}
+
+/// Validate a systemd `OnCalendar` schedule using `systemd-analyze calendar`.
+fn validate_schedule(schedule: &str) -> Result<()> {
+    let output = Command::new("systemd-analyze")
+        .arg("calendar")
+        .arg(schedule)
+        .output()
+        .context("Failed to run `systemd-analyze calendar` to validate the schedule")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        eyre::bail!("Invalid OnCalendar schedule '{}': {}", schedule, stderr.trim());
+    }
+    Ok(())
+}
+
+/// Resolve the single digest schedule from the slack-enabled accounts. The digest
+/// is one timer running one `eratosthenes digest`; if accounts disagree, use the
+/// first and warn.
+fn resolve_digest_schedule(slack_accounts: &[&Account]) -> String {
+    let first = slack_accounts
+        .first()
+        .and_then(|a| a.config.slack.as_ref())
+        .map(|s| s.schedule.clone())
+        .unwrap_or_default();
+
+    for account in slack_accounts.iter().skip(1) {
+        if let Some(slack) = account.config.slack.as_ref()
+            && slack.schedule != first
+        {
+            eprintln!(
+                "Warning: account '{}' requests digest schedule '{}' but the single digest timer uses '{}' (from the first slack-enabled account)",
+                account.name, slack.schedule, first
+            );
+        }
+    }
+    first
+}
+
+/// Write the digest EnvironmentFile (mode 600) containing one line per DISTINCT
+/// `token-env` name across slack-enabled accounts that is set in the current
+/// environment. Warns for any referenced env var that is unset.
+fn write_digest_env(slack_accounts: &[&Account]) -> Result<()> {
+    let mut seen: Vec<String> = Vec::new();
+    for account in slack_accounts {
+        if let Some(slack) = account.config.slack.as_ref()
+            && !seen.contains(&slack.token_env)
+        {
+            seen.push(slack.token_env.clone());
+        }
+    }
+
+    let mut lines = String::new();
+    for name in &seen {
+        match std::env::var(name) {
+            Ok(value) => lines.push_str(&format!("{}={}\n", name, value)),
+            Err(_) => eprintln!(
+                "Warning: Slack token env var '{}' is not set; the digest service will fail until it is provided in {}",
+                name,
+                digest_env_path()?.display()
+            ),
+        }
+    }
+
+    let path = digest_env_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).context("Failed to create config directory for digest.env")?;
+    }
+    std::fs::write(&path, lines).context("Failed to write digest.env")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        .context("Failed to set 600 permissions on digest.env")?;
+
+    println!("Wrote digest token env file (600): {}", path.display());
+    Ok(())
+}
+
 fn systemctl(args: &[&str]) -> Result<()> {
     let output = Command::new("systemctl")
         .arg("--user")
@@ -176,8 +303,68 @@ pub fn install(interval: &str) -> Result<()> {
     println!("Installed: {}", svc_path.display());
     println!("Installed: {}", tmr_path.display());
     println!("Timer enabled and started (interval: {})", interval);
+
+    // The digest units are installed ONLY if at least one account opts in via a
+    // `slack` block, so the timer never fires a no-op binary. The run units above
+    // install unconditionally.
+    install_digest_units(&binary, &accounts)?;
+
     println!("Hint: run `loginctl enable-linger $USER` for timer to run when not logged in");
 
+    Ok(())
+}
+
+/// Install (or, if no account opts in, remove) the digest service + timer.
+fn install_digest_units(binary: &Path, accounts: &[Account]) -> Result<()> {
+    let slack_accounts: Vec<&Account> = accounts.iter().filter(|a| a.config.slack.is_some()).collect();
+
+    if slack_accounts.is_empty() {
+        remove_digest_units()?;
+        println!("No slack-enabled accounts; digest timer not installed.");
+        return Ok(());
+    }
+
+    let schedule = resolve_digest_schedule(&slack_accounts);
+    validate_schedule(&schedule)?;
+    write_digest_env(&slack_accounts)?;
+
+    let svc_path = digest_service_path()?;
+    let tmr_path = digest_timer_path()?;
+    std::fs::write(&svc_path, generate_digest_service(binary)).context("Failed to write digest service file")?;
+    std::fs::write(&tmr_path, generate_digest_timer(&schedule)).context("Failed to write digest timer file")?;
+
+    systemctl(&["daemon-reload"])?;
+    systemctl(&["enable", "--now", &format!("{DIGEST_NAME}.timer")])?;
+
+    println!("Installed: {}", svc_path.display());
+    println!("Installed: {}", tmr_path.display());
+    println!("Digest timer enabled and started (schedule: {})", schedule);
+    Ok(())
+}
+
+/// Stop, disable, and remove the digest unit files. The digest.env (a
+/// user-provided secret) is intentionally left in place.
+fn remove_digest_units() -> Result<()> {
+    systemctl_ignore_errors(&["stop", &format!("{DIGEST_NAME}.timer")]);
+    systemctl_ignore_errors(&["disable", &format!("{DIGEST_NAME}.timer")]);
+
+    let svc_path = digest_service_path()?;
+    let tmr_path = digest_timer_path()?;
+
+    let mut removed = false;
+    if svc_path.exists() {
+        std::fs::remove_file(&svc_path).context("Failed to remove digest service file")?;
+        println!("Removed: {}", svc_path.display());
+        removed = true;
+    }
+    if tmr_path.exists() {
+        std::fs::remove_file(&tmr_path).context("Failed to remove digest timer file")?;
+        println!("Removed: {}", tmr_path.display());
+        removed = true;
+    }
+    if removed {
+        systemctl(&["daemon-reload"])?;
+    }
     Ok(())
 }
 
@@ -199,6 +386,9 @@ pub fn uninstall() -> Result<()> {
         println!("Removed: {}", tmr_path.display());
         removed = true;
     }
+
+    // Tear down the digest units too (run + digest are managed together).
+    remove_digest_units()?;
 
     if removed {
         systemctl(&["daemon-reload"])?;
@@ -224,6 +414,20 @@ pub fn reinstall(interval: &str) -> Result<()> {
         let _ = std::fs::remove_file(&tmr_path);
     }
 
+    // Clear stale digest units too; install() re-lays them based on current config.
+    systemctl_ignore_errors(&["stop", &format!("{DIGEST_NAME}.timer")]);
+    systemctl_ignore_errors(&["disable", &format!("{DIGEST_NAME}.timer")]);
+    if let Ok(p) = digest_service_path()
+        && p.exists()
+    {
+        let _ = std::fs::remove_file(&p);
+    }
+    if let Ok(p) = digest_timer_path()
+        && p.exists()
+    {
+        let _ = std::fs::remove_file(&p);
+    }
+
     install(interval)
 }
 
@@ -236,10 +440,22 @@ pub fn status() -> Result<()> {
         return Ok(());
     }
 
+    print_timer_status(&format!("{SERVICE_NAME}.timer"))?;
+
+    // Show the digest timer too, when it is installed.
+    if digest_service_path()?.exists() && digest_timer_path()?.exists() {
+        println!();
+        print_timer_status(&format!("{DIGEST_NAME}.timer"))?;
+    }
+
+    Ok(())
+}
+
+fn print_timer_status(unit: &str) -> Result<()> {
     let output = Command::new("systemctl")
         .arg("--user")
         .arg("status")
-        .arg(format!("{SERVICE_NAME}.timer"))
+        .arg(unit)
         .output()
         .context("Failed to run systemctl")?;
 
@@ -248,7 +464,6 @@ pub fn status() -> Result<()> {
     if !output.stderr.is_empty() {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
     }
-
     Ok(())
 }
 
@@ -363,6 +578,28 @@ mod tests {
         assert!(output.contains("OnBootSec=2min"));
         assert!(output.contains("Persistent=true"));
         assert!(output.contains("WantedBy=timers.target"));
+    }
+
+    #[test]
+    fn test_generate_digest_service() {
+        let binary = PathBuf::from("/home/user/.cargo/bin/eratosthenes");
+        let output = generate_digest_service(&binary);
+
+        assert!(output.contains("Type=oneshot"));
+        assert!(output.contains("ExecStart=/home/user/.cargo/bin/eratosthenes digest"));
+        assert!(output.contains("EnvironmentFile=-%h/.config/eratosthenes/digest.env"));
+        assert!(output.contains("Description=Eratosthenes Slack Pinned-Inbox Digest"));
+    }
+
+    #[test]
+    fn test_generate_digest_timer() {
+        let output = generate_digest_timer("Mon-Fri 08,13:00:00");
+
+        assert!(output.contains("OnCalendar=Mon-Fri 08,13:00:00"));
+        assert!(output.contains("Persistent=true"));
+        assert!(output.contains("WantedBy=timers.target"));
+        // The digest is a fixed-schedule timer, not an interval timer.
+        assert!(!output.contains("OnUnitActiveSec"));
     }
 
     #[test]
