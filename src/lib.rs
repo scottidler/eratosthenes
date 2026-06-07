@@ -3,6 +3,7 @@
 #![deny(unused_variables)]
 
 pub mod cfg;
+pub mod digest;
 pub mod engine;
 pub mod gmail;
 pub mod slack;
