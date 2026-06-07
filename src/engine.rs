@@ -131,7 +131,11 @@ async fn sanitize_stages(
             // labelIds in threads.list is evaluated at thread level: a thread matches if any
             // message has label A AND any message has label B (even across different messages).
             // This correctly finds threads where a reply arrived (new msg = INBOX, old msgs = Purgatory).
-            let early_id = client.resolver.resolve_name(early).unwrap_or(early.as_str()).to_string();
+            let early_id = client
+                .resolver
+                .resolve_name(early)
+                .unwrap_or(early.as_str())
+                .to_string();
             let late_id = client.resolver.resolve_name(late).unwrap_or(late.as_str()).to_string();
 
             debug!(
@@ -155,7 +159,7 @@ async fn sanitize_stages(
 
             if !dry_run {
                 for tid in &thread_ids {
-                    client.modify_thread(tid, &[], &[late_id.clone()]).await?;
+                    client.modify_thread(tid, &[], std::slice::from_ref(&late_id)).await?;
                 }
             }
 
@@ -454,11 +458,7 @@ async fn apply_state_action(
 ) -> Result<()> {
     debug!(
         "{}apply_state_action: filter={}, thread={}, action={:?}, dry_run={}",
-        prefix,
-        state_filter.name,
-        thread.id,
-        action,
-        dry_run
+        prefix, state_filter.name, thread.id, action, dry_run
     );
 
     match action {
@@ -481,10 +481,7 @@ async fn apply_state_action(
 
             println!(
                 "{}[state:{}] thread {} -> {}",
-                prefix,
-                state_filter.name,
-                thread.id,
-                dest,
+                prefix, state_filter.name, thread.id, dest,
             );
 
             if !dry_run {
@@ -493,12 +490,7 @@ async fn apply_state_action(
             }
         }
         StateAction::Delete => {
-            println!(
-                "{}[state:{}] trashing thread {}",
-                prefix,
-                state_filter.name,
-                thread.id,
-            );
+            println!("{}[state:{}] trashing thread {}", prefix, state_filter.name, thread.id,);
             if !dry_run {
                 client.trash_thread(&thread.id).await?;
             }

@@ -51,12 +51,14 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
         join_set.spawn(async move {
             let name = account.name;
             let config = account.config;
-            logging::ACCOUNT.scope(name.clone(), async move {
-                let prefix = account_prefix(&name, multi);
-                info!("{}Starting account '{}'", prefix, &name);
-                let result = eratosthenes::run(&name, &config, dry_run, multi).await;
-                (name, result)
-            }).await
+            logging::ACCOUNT
+                .scope(name.clone(), async move {
+                    let prefix = account_prefix(&name, multi);
+                    info!("{}Starting account '{}'", prefix, &name);
+                    let result = eratosthenes::run(&name, &config, dry_run, multi).await;
+                    (name, result)
+                })
+                .await
         });
     }
 
@@ -106,12 +108,14 @@ async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
         .ok_or_else(|| eyre::eyre!("No accounts found"))?;
     let name = account.name;
     let config = account.config;
-    logging::ACCOUNT.scope(name.clone(), async move {
-        let auth = eratosthenes::gmail::auth::build_authenticator(&config.auth).await?;
-        eratosthenes::gmail::auth::get_token(&auth).await?;
-        println!("Login successful for '{}'", name);
-        Ok(())
-    }).await
+    logging::ACCOUNT
+        .scope(name.clone(), async move {
+            let auth = eratosthenes::gmail::auth::build_authenticator(&config.auth).await?;
+            eratosthenes::gmail::auth::get_token(&auth).await?;
+            println!("Login successful for '{}'", name);
+            Ok(())
+        })
+        .await
 }
 
 async fn cmd_auth_logout(cli: &Cli, names: Vec<String>) -> Result<()> {
@@ -123,11 +127,13 @@ async fn cmd_auth_logout(cli: &Cli, names: Vec<String>) -> Result<()> {
     for account in accounts {
         let name = account.name;
         let config = account.config;
-        logging::ACCOUNT.scope(name.clone(), async move {
-            eratosthenes::gmail::auth::logout(&config.auth).await?;
-            println!("Logged out '{}' (token cache cleared)", name);
-            Ok::<(), eyre::Error>(())
-        }).await?;
+        logging::ACCOUNT
+            .scope(name.clone(), async move {
+                eratosthenes::gmail::auth::logout(&config.auth).await?;
+                println!("Logged out '{}' (token cache cleared)", name);
+                Ok::<(), eyre::Error>(())
+            })
+            .await?;
     }
     Ok(())
 }

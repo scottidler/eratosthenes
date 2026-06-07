@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use eyre::{Context, Result};
@@ -17,7 +17,7 @@ struct AccountLogger {
 }
 
 impl AccountLogger {
-    fn new(app_level: LevelFilter, log_dir: &PathBuf, accounts: &[&str]) -> Result<Self> {
+    fn new(app_level: LevelFilter, log_dir: &Path, accounts: &[&str]) -> Result<Self> {
         let mut files = HashMap::new();
         for &name in accounts {
             let path = log_dir.join(format!("{}.log", name));
@@ -28,7 +28,10 @@ impl AccountLogger {
                 .with_context(|| format!("Failed to open log file {}", path.display()))?;
             files.insert(name.to_string(), Mutex::new(file));
         }
-        Ok(Self { app_level, files: Mutex::new(files) })
+        Ok(Self {
+            app_level,
+            files: Mutex::new(files),
+        })
     }
 }
 
@@ -82,16 +85,15 @@ pub fn setup(level: &str, accounts: &[&str]) -> Result<()> {
 
     let app_level = match level.to_lowercase().as_str() {
         "error" => LevelFilter::Error,
-        "warn"  => LevelFilter::Warn,
-        "info"  => LevelFilter::Info,
+        "warn" => LevelFilter::Warn,
+        "info" => LevelFilter::Info,
         "debug" => LevelFilter::Debug,
         "trace" => LevelFilter::Trace,
-        _       => LevelFilter::Info,
+        _ => LevelFilter::Info,
     };
 
     let logger = AccountLogger::new(app_level, &log_dir, accounts)?;
-    log::set_boxed_logger(Box::new(logger))
-        .map_err(|e| eyre::eyre!("Failed to initialize logger: {}", e))?;
+    log::set_boxed_logger(Box::new(logger)).map_err(|e| eyre::eyre!("Failed to initialize logger: {}", e))?;
     log::set_max_level(LevelFilter::Trace);
 
     Ok(())
