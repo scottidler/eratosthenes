@@ -14,6 +14,14 @@ pub struct GmailClient {
     hub: Hub,
     limiter: RateLimiter,
     pub resolver: LabelResolver,
+    metadata_headers: Vec<String>,
+}
+
+/// Headers always needed to parse a message (recipients, sender, subject).
+/// Header-based filter guards (e.g. List-Id, Precedence) are added on top of
+/// these via `set_metadata_headers`, derived from the active config.
+fn default_metadata_headers() -> Vec<String> {
+    ["To", "Cc", "From", "Subject"].iter().map(|s| s.to_string()).collect()
 }
 
 impl GmailClient {
@@ -31,11 +39,24 @@ impl GmailClient {
 
         let resolver = LabelResolver::from_api_labels(label_list.labels.unwrap_or_default());
 
-        Ok(Self { hub, limiter, resolver })
+        Ok(Self {
+            hub,
+            limiter,
+            resolver,
+            metadata_headers: default_metadata_headers(),
+        })
     }
 
     pub fn hub(&self) -> &Hub {
         &self.hub
+    }
+
+    /// Set the full list of message headers to request from the Gmail API.
+    /// A header-based filter guard only works if the header is actually fetched;
+    /// the caller derives this set from the config's filter `headers` keys.
+    pub fn set_metadata_headers(&mut self, headers: Vec<String>) {
+        debug!("set_metadata_headers: headers={:?}", headers);
+        self.metadata_headers = headers;
     }
 
     pub async fn search_messages(&self, query: &str) -> Result<Vec<String>> {
@@ -73,20 +94,16 @@ impl GmailClient {
     pub async fn get_message(&self, id: &str) -> Result<GmailMessage> {
         log::trace!("get_message: id={}", id);
         self.limiter.acquire(5).await;
-        let (_, msg) = self
+        let mut call = self
             .hub
             .users()
             .messages_get("me", id)
             .format("metadata")
-            .add_metadata_headers("To")
-            .add_metadata_headers("Cc")
-            .add_metadata_headers("From")
-            .add_metadata_headers("Subject")
-            .add_metadata_headers("List-Id")
-            .add_scope(GMAIL_SCOPE)
-            .doit()
-            .await
-            .context(format!("messages.get({}) failed", id))?;
+            .add_scope(GMAIL_SCOPE);
+        for header in &self.metadata_headers {
+            call = call.add_metadata_headers(header.as_str());
+        }
+        let (_, msg) = call.doit().await.context(format!("messages.get({}) failed", id))?;
 
         GmailMessage::from_api(msg)
     }
@@ -158,27 +175,27 @@ impl GmailClient {
             }
         }
 
-        debug!("list_threads_by_label_ids({:?}) -> {} results", label_ids, all_ids.len());
+        debug!(
+            "list_threads_by_label_ids({:?}) -> {} results",
+            label_ids,
+            all_ids.len()
+        );
         Ok(all_ids)
     }
 
     pub async fn get_thread(&self, id: &str) -> Result<GmailThread> {
         log::trace!("get_thread: id={}", id);
         self.limiter.acquire(10).await;
-        let (_, thread) = self
+        let mut call = self
             .hub
             .users()
             .threads_get("me", id)
             .format("metadata")
-            .add_metadata_headers("To")
-            .add_metadata_headers("Cc")
-            .add_metadata_headers("From")
-            .add_metadata_headers("Subject")
-            .add_metadata_headers("List-Id")
-            .add_scope(GMAIL_SCOPE)
-            .doit()
-            .await
-            .context(format!("threads.get({}) failed", id))?;
+            .add_scope(GMAIL_SCOPE);
+        for header in &self.metadata_headers {
+            call = call.add_metadata_headers(header.as_str());
+        }
+        let (_, thread) = call.doit().await.context(format!("threads.get({}) failed", id))?;
 
         let messages = thread
             .messages

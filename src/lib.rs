@@ -43,5 +43,17 @@ pub async fn run(account: &str, config: &Config, dry_run: bool, multi: bool) -> 
         .await
         .context("Failed to initialize Gmail client")?;
 
+    // A header-based filter guard only works if the header is actually fetched.
+    // Request the standard parsing headers plus every header any filter references.
+    let mut metadata_headers: Vec<String> = ["To", "Cc", "From", "Subject"].iter().map(|s| s.to_string()).collect();
+    for filter in &config.message_filters {
+        for header_name in filter.headers.keys() {
+            if !metadata_headers.contains(header_name) {
+                metadata_headers.push(header_name.clone());
+            }
+        }
+    }
+    client.set_metadata_headers(metadata_headers);
+
     engine::execute(&mut client, config, &prefix, dry_run).await
 }
