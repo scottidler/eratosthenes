@@ -8,9 +8,24 @@ auth:
 # account.
 slack:
   token-env: SLACK_XOXP_TOKEN    # NAME of the env var holding the user token (xoxp); posts as you
-  channel: D01G4Q7AWLV           # self-DM channel (note-to-self), or Uxxxx/Cxxxx
+
+  # REQUIRED. Where the digest is posted. Use the Slack *ID*, not a #name:
+  #   Dxxxx - your self-DM ("note to self"); only your own xoxp token can post here
+  #   Uxxxx - a DM to another user
+  #   Cxxxx - a public/private channel the token can write to
+  # Find an ID via the Slack URL or "Copy link" on the conversation.
+  channel: D01G4Q7AWLV
+
   browser-index: 0               # Gmail multi-login slot (/u/N) for deep links
-  schedule: Mon-Fri 08,13:00:00  # systemd OnCalendar; controls the digest timer
+
+  # REQUIRED. systemd OnCalendar string driving the digest timer (system local
+  # time). No default - omit it and the config fails to parse, by design, so a
+  # silent fallback can never clobber the installed timer. Validated at
+  # `service install` via `systemd-analyze calendar`. Examples:
+  #   Mon,Thu 07:00:00       - Mon & Thu at 7am
+  #   Mon-Fri 08,13:00:00    - weekdays at 8am and 1pm
+  #   *-*-* 09:00:00         - every day at 9am
+  schedule: Mon,Thu 07:00:00
 
 message-filters:
   - only-me-star:

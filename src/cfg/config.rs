@@ -42,17 +42,14 @@ pub struct SlackConfig {
     /// Gmail multi-login slot for deep links (/u/N), default 0.
     #[serde(default)]
     pub browser_index: u8,
-    /// systemd OnCalendar string that drives the digest timer.
-    #[serde(default = "default_schedule")]
+    /// systemd OnCalendar string that drives the digest timer. Required, like
+    /// `channel`: a digest with no cadence is meaningless, and a silent default
+    /// would clobber the live timer on every `service` regenerate.
     pub schedule: String,
 }
 
 fn default_token_env() -> String {
     "SLACK_XOXP_TOKEN".to_string()
-}
-
-fn default_schedule() -> String {
-    "Mon-Fri 08,13:00:00".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,6 +298,7 @@ auth:
   creds-path: /tmp/creds
 slack:
   channel: D01G4Q7AWLV
+  schedule: "Mon,Thu 07:00:00"
 "#;
 
         let config: Config = serde_yaml::from_str(yaml).unwrap();
@@ -308,7 +306,22 @@ slack:
         assert_eq!(slack.channel, "D01G4Q7AWLV");
         assert_eq!(slack.token_env, "SLACK_XOXP_TOKEN");
         assert_eq!(slack.browser_index, 0);
-        assert_eq!(slack.schedule, "Mon-Fri 08,13:00:00");
+        assert_eq!(slack.schedule, "Mon,Thu 07:00:00");
+    }
+
+    #[test]
+    fn test_slack_block_requires_schedule() {
+        // schedule has no serde default: omitting it must fail to parse rather
+        // than silently fall back to a cadence that would clobber the timer.
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+slack:
+  channel: D01G4Q7AWLV
+"#;
+
+        let result: Result<Config, _> = serde_yaml::from_str(yaml);
+        assert!(result.is_err(), "missing schedule must be a hard error");
     }
 
     #[test]

@@ -30,7 +30,7 @@ slack:
   token-env: SLACK_XOXP_TOKEN    # NAME of the env var holding the user token (xoxp)
   channel: D01G4Q7AWLV           # self-DM channel (note-to-self), or Uxxxx/Cxxxx
   browser-index: 0               # Gmail multi-login slot (/u/N) for deep links
-  schedule: Mon-Fri 08,13:00:00  # systemd OnCalendar; controls the digest timer
+  schedule: Mon,Thu 07:00:00     # REQUIRED systemd OnCalendar; controls the digest timer
 ```
 
 - The digest is a no-op for any account without a `slack` block.
@@ -47,7 +47,8 @@ slack:
 
 `eratosthenes service install` lays down the digest service + timer **only if at
 least one account has a `slack` block**. The timer fires on `slack.schedule`
-(default Mon-Fri at 08:00 and 13:00, system local time). The Slack token is read
+(a required `OnCalendar` string, system local time; there is no default - omit it
+and the config fails to parse). The Slack token is read
 from `~/.config/eratosthenes/digest.env` (mode 600), which `service install`
 populates from your environment for each distinct `token-env` referenced.
 
