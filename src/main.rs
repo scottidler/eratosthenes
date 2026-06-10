@@ -148,6 +148,10 @@ async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
     let config = account.config;
     logging::ACCOUNT
         .scope(name.clone(), async move {
+            // Force re-authentication: clear any cached tokens first so the
+            // InstalledFlow re-runs (opens the browser) instead of silently
+            // reusing a still-valid token. This is what `auth login` advertises.
+            eratosthenes::gmail::auth::logout(&config.auth).await?;
             let auth = eratosthenes::gmail::auth::build_authenticator(&config.auth).await?;
             eratosthenes::gmail::auth::get_token(&auth).await?;
             println!("Login successful for '{}'", name);
