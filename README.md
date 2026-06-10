@@ -19,7 +19,7 @@ Starred and Important threads with `ttl: Keep` so they stay put.
 ## Configuration
 
 Per-account YAML lives at `~/.config/eratosthenes/<account>.yml`. See
-[`eratosthenes.yml`](eratosthenes.yml) for a full example.
+[`eratosthenes.example.yml`](eratosthenes.example.yml) for a full annotated example.
 
 ### Slack digest
 

@@ -1,0 +1,111 @@
+# ============================================================================
+# eratosthenes - example configuration
+# ============================================================================
+# Copy this file to ~/.config/eratosthenes/<account>.yml and edit it. The
+# account name is the filename stem (e.g. ~/.config/eratosthenes/work.yml ->
+# account "work"). Discovery picks up every *.yml in that directory that has an
+# `auth:` block, so multiple accounts can run side by side.
+#
+# Secrets are NEVER stored in this file: the OAuth client secret and token cache
+# live next to it as separate files (see `creds-path`), and the Slack token is
+# referenced by env-var NAME only (see `token-env`).
+# ============================================================================
+
+# ---- auth (REQUIRED) -------------------------------------------------------
+auth:
+  # Directory holding this account's OAuth2 `client-secret.json` (a Google Cloud
+  # "Desktop app" client) and the generated `tokencache.json`. Relative paths
+  # resolve under ~/.config/eratosthenes/. Give each account its own directory.
+  creds-path: "~/.config/eratosthenes"
+  # callback-port: 13131         # localhost port for the OAuth redirect (default)
+
+# ---- slack (OPTIONAL) ------------------------------------------------------
+# Present -> `eratosthenes digest` posts a Slack summary of the pinned
+# (Starred + Important) inbox, and `service install` lays down a systemd timer
+# driven by `schedule` below. Omit the whole block to disable the digest.
+slack:
+  # NAME of the env var holding your Slack USER token (xoxp-...), never the token
+  # itself. `service install` copies the value into
+  # ~/.config/eratosthenes/digest.env (mode 600) for the timer to read. A user
+  # token (not a bot token) is required to post into your own self-DM.
+  token-env: SLACK_XOXP_TOKEN
+
+  # REQUIRED (when this block is present). Where the digest is posted. Use the
+  # Slack *ID*, not a #name:
+  #   Dxxxx - your self-DM ("note to self"); only your own xoxp token posts here
+  #   Uxxxx - a DM to another user
+  #   Cxxxx - a public/private channel the token can write to
+  # Grab an ID from the conversation's "Copy link" in Slack.
+  channel: D0XXXXXXXXX
+
+  # Gmail multi-login slot (the /u/N in mail.google.com/mail/u/N) used to build
+  # the digest's deep links. 0 = your first signed-in account.
+  browser-index: 0
+
+  # REQUIRED. systemd OnCalendar string driving the digest timer (system local
+  # time). There is NO default: omit it and the config fails to parse, by design,
+  # so a silent fallback can never clobber the installed timer. Validated at
+  # `service install` via `systemd-analyze calendar`. Examples:
+  #   Mon,Thu 07:00:00     - Mon & Thu at 7am
+  #   Mon-Fri 08,13:00:00  - weekdays at 8am and 1pm
+  #   *-*-* 09:00:00       - every day at 9am
+  schedule: Mon,Thu 07:00:00
+
+# ---- message-filters -------------------------------------------------------
+# Applied to INCOMING messages as they are classified. Each entry is keyed by a
+# unique name; ALL of its conditions must match (logical AND); first match wins.
+# Address fields accept a single glob, a list of globs, or an empty list `[]`
+# meaning "this field must be empty". Glob syntax: '*' matches anything.
+#   to / cc / from : match recipients/senders   (cc: []  ==  "no CC at all")
+#   subject        : list of globs matched against the subject line
+#   label          : Gmail label(s) the message must already carry
+#   headers        : map of header -> globs;  `[]`  ==  "this header must be ABSENT"
+#   action         : Star | Flag | <LabelName> (moves to that label); list ok
+message-filters:
+  # VIP: sent only to me, no CC, by someone at my company -> Star it.
+  - only-me-star:
+      to: ['you@example.com']
+      cc: []                     # must have no CC
+      from: '*@example.com'
+      headers:
+        List-Id: []              # skip mailing-list mail (List-Id header absent)
+      label: INBOX
+      action: Star
+
+  # Anything else sent directly to me by a colleague -> Flag (mark Important).
+  - only-me:
+      to: ['you@example.com']
+      from: '*@example.com'
+      label: INBOX
+      action: Flag
+
+# ---- state-filters ---------------------------------------------------------
+# Applied to EXISTING messages on every run, in the order listed, to age the
+# inbox toward zero. Each entry is keyed by a unique name.
+#   label : Gmail label(s) this rule applies to; omit/empty = all messages
+#   ttl   : "Keep" (never expire)  |  "<n>d" (e.g. 7d)  |
+#           { read: <n>d, unread: <n>d }  (separate ages for read vs unread)
+#   action: <LabelName> or { Move: <LabelName> } to relabel; { Delete } to trash
+state-filters:
+  # Protect anything Starred or Important - never age it off.
+  - Starred:
+      labels: [Important, Starred]
+      ttl: Keep
+
+  - Important:
+      label: Important
+      ttl: Keep
+
+  # Cull the inbox: read mail after 7d, unread after 21d -> move to Purgatory.
+  - Cull:
+      ttl:
+        read: 7d
+        unread: 21d
+      action: Purgatory
+
+  # Purgatory drains to Oblivion (trash) after 3 more days.
+  - Purge:
+      label: Purgatory
+      ttl: 3d
+      action:
+        Move: Oblivion
