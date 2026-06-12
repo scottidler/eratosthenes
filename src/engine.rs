@@ -344,7 +344,11 @@ async fn apply_filter_action(
             );
             if !dry_run {
                 let add = vec![dest_id];
-                client.batch_modify(ids, &add, &[]).await?;
+                // A "move" must actually leave the inbox: add the destination
+                // label AND remove INBOX (+ mark read). Without the removes this
+                // only tags the message, leaving it sitting in the inbox.
+                let remove = vec!["INBOX".to_string(), "UNREAD".to_string()];
+                client.batch_modify(ids, &add, &remove).await?;
             }
         }
     }

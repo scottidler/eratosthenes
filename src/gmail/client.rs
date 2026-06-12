@@ -6,7 +6,7 @@ use log::{debug, warn};
 use crate::gmail::auth::GMAIL_SCOPE;
 use crate::gmail::label::LabelResolver;
 use crate::gmail::message::{GmailMessage, GmailThread};
-use crate::gmail::rate::RateLimiter;
+use crate::gmail::rate::{RateLimiter, with_retry};
 
 type Hub = Gmail<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>>;
 
@@ -29,13 +29,17 @@ impl GmailClient {
         let limiter = RateLimiter::new();
 
         println!("{}Connecting to Gmail...", prefix);
-        let (_, label_list) = hub
-            .users()
-            .labels_list("me")
-            .add_scope(GMAIL_SCOPE)
-            .doit()
-            .await
-            .context("Failed to list Gmail labels")?;
+        let label_list = with_retry(&limiter, "labels.list", || async {
+            limiter.acquire(1).await;
+            hub.users()
+                .labels_list("me")
+                .add_scope(GMAIL_SCOPE)
+                .doit()
+                .await
+                .map(|(_, l)| l)
+                .context("Failed to list Gmail labels")
+        })
+        .await?;
 
         let resolver = LabelResolver::from_api_labels(label_list.labels.unwrap_or_default());
 
@@ -65,13 +69,15 @@ impl GmailClient {
         let mut page_token: Option<String> = None;
 
         loop {
-            self.limiter.acquire(5).await;
-            let mut call = self.hub.users().messages_list("me").q(query).add_scope(GMAIL_SCOPE);
-            if let Some(ref token) = page_token {
-                call = call.page_token(token);
-            }
-
-            let (_, result) = call.doit().await.context("messages.list failed")?;
+            let result = with_retry(&self.limiter, "messages.list", || async {
+                self.limiter.acquire(5).await;
+                let mut call = self.hub.users().messages_list("me").q(query).add_scope(GMAIL_SCOPE);
+                if let Some(ref token) = page_token {
+                    call = call.page_token(token);
+                }
+                call.doit().await.map(|(_, r)| r).context("messages.list failed")
+            })
+            .await?;
 
             if let Some(messages) = result.messages {
                 for msg in messages {
@@ -93,17 +99,23 @@ impl GmailClient {
 
     pub async fn get_message(&self, id: &str) -> Result<GmailMessage> {
         log::trace!("get_message: id={}", id);
-        self.limiter.acquire(5).await;
-        let mut call = self
-            .hub
-            .users()
-            .messages_get("me", id)
-            .format("metadata")
-            .add_scope(GMAIL_SCOPE);
-        for header in &self.metadata_headers {
-            call = call.add_metadata_headers(header.as_str());
-        }
-        let (_, msg) = call.doit().await.context(format!("messages.get({}) failed", id))?;
+        let msg = with_retry(&self.limiter, "messages.get", || async {
+            self.limiter.acquire(5).await;
+            let mut call = self
+                .hub
+                .users()
+                .messages_get("me", id)
+                .format("metadata")
+                .add_scope(GMAIL_SCOPE);
+            for header in &self.metadata_headers {
+                call = call.add_metadata_headers(header.as_str());
+            }
+            call.doit()
+                .await
+                .map(|(_, m)| m)
+                .context(format!("messages.get({}) failed", id))
+        })
+        .await?;
 
         GmailMessage::from_api(msg)
     }
@@ -114,13 +126,15 @@ impl GmailClient {
         let mut page_token: Option<String> = None;
 
         loop {
-            self.limiter.acquire(10).await;
-            let mut call = self.hub.users().threads_list("me").q(query).add_scope(GMAIL_SCOPE);
-            if let Some(ref token) = page_token {
-                call = call.page_token(token);
-            }
-
-            let (_, result) = call.doit().await.context("threads.list failed")?;
+            let result = with_retry(&self.limiter, "threads.list", || async {
+                self.limiter.acquire(10).await;
+                let mut call = self.hub.users().threads_list("me").q(query).add_scope(GMAIL_SCOPE);
+                if let Some(ref token) = page_token {
+                    call = call.page_token(token);
+                }
+                call.doit().await.map(|(_, r)| r).context("threads.list failed")
+            })
+            .await?;
 
             if let Some(threads) = result.threads {
                 for thread in threads {
@@ -150,16 +164,21 @@ impl GmailClient {
         let mut page_token: Option<String> = None;
 
         loop {
-            self.limiter.acquire(10).await;
-            let mut call = self.hub.users().threads_list("me").add_scope(GMAIL_SCOPE);
-            for &id in label_ids {
-                call = call.add_label_ids(id);
-            }
-            if let Some(ref token) = page_token {
-                call = call.page_token(token);
-            }
-
-            let (_, result) = call.doit().await.context("threads.list (by label IDs) failed")?;
+            let result = with_retry(&self.limiter, "threads.list (by label IDs)", || async {
+                self.limiter.acquire(10).await;
+                let mut call = self.hub.users().threads_list("me").add_scope(GMAIL_SCOPE);
+                for &id in label_ids {
+                    call = call.add_label_ids(id);
+                }
+                if let Some(ref token) = page_token {
+                    call = call.page_token(token);
+                }
+                call.doit()
+                    .await
+                    .map(|(_, r)| r)
+                    .context("threads.list (by label IDs) failed")
+            })
+            .await?;
 
             if let Some(threads) = result.threads {
                 for thread in threads {
@@ -185,17 +204,23 @@ impl GmailClient {
 
     pub async fn get_thread(&self, id: &str) -> Result<GmailThread> {
         log::trace!("get_thread: id={}", id);
-        self.limiter.acquire(10).await;
-        let mut call = self
-            .hub
-            .users()
-            .threads_get("me", id)
-            .format("metadata")
-            .add_scope(GMAIL_SCOPE);
-        for header in &self.metadata_headers {
-            call = call.add_metadata_headers(header.as_str());
-        }
-        let (_, thread) = call.doit().await.context(format!("threads.get({}) failed", id))?;
+        let thread = with_retry(&self.limiter, "threads.get", || async {
+            self.limiter.acquire(10).await;
+            let mut call = self
+                .hub
+                .users()
+                .threads_get("me", id)
+                .format("metadata")
+                .add_scope(GMAIL_SCOPE);
+            for header in &self.metadata_headers {
+                call = call.add_metadata_headers(header.as_str());
+            }
+            call.doit()
+                .await
+                .map(|(_, t)| t)
+                .context(format!("threads.get({}) failed", id))
+        })
+        .await?;
 
         let messages = thread
             .messages
@@ -218,21 +243,22 @@ impl GmailClient {
 
     pub async fn modify_message(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {
         debug!("modify_message: id={}, add={:?}, remove={:?}", id, add, remove);
-        self.limiter.acquire(5).await;
-        let req = ModifyMessageRequest {
-            add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
-            remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
-        };
-
-        self.hub
-            .users()
-            .messages_modify(req, "me", id)
-            .add_scope(GMAIL_SCOPE)
-            .doit()
-            .await
-            .context(format!("messages.modify({}) failed", id))?;
-
-        Ok(())
+        with_retry(&self.limiter, "messages.modify", || async {
+            self.limiter.acquire(5).await;
+            let req = ModifyMessageRequest {
+                add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
+                remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
+            };
+            self.hub
+                .users()
+                .messages_modify(req, "me", id)
+                .add_scope(GMAIL_SCOPE)
+                .doit()
+                .await
+                .map(|_| ())
+                .context(format!("messages.modify({}) failed", id))
+        })
+        .await
     }
 
     pub async fn batch_modify(&self, ids: &[String], add: &[String], remove: &[String]) -> Result<()> {
@@ -242,20 +268,23 @@ impl GmailClient {
         }
 
         for chunk in ids.chunks(1000) {
-            self.limiter.acquire(50).await;
-            let req = BatchModifyMessagesRequest {
-                add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
-                ids: Some(chunk.to_vec()),
-                remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
-            };
-
-            self.hub
-                .users()
-                .messages_batch_modify(req, "me")
-                .add_scope(GMAIL_SCOPE)
-                .doit()
-                .await
-                .context("messages.batchModify failed")?;
+            with_retry(&self.limiter, "messages.batchModify", || async {
+                self.limiter.acquire(50).await;
+                let req = BatchModifyMessagesRequest {
+                    add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
+                    ids: Some(chunk.to_vec()),
+                    remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
+                };
+                self.hub
+                    .users()
+                    .messages_batch_modify(req, "me")
+                    .add_scope(GMAIL_SCOPE)
+                    .doit()
+                    .await
+                    .map(|_| ())
+                    .context("messages.batchModify failed")
+            })
+            .await?;
         }
 
         Ok(())
@@ -263,31 +292,37 @@ impl GmailClient {
 
     pub async fn modify_thread(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {
         debug!("modify_thread: id={}, add={:?}, remove={:?}", id, add, remove);
-        self.limiter.acquire(10).await;
-        let req = ModifyThreadRequest {
-            add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
-            remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
-        };
-        self.hub
-            .users()
-            .threads_modify(req, "me", id)
-            .add_scope(GMAIL_SCOPE)
-            .doit()
-            .await
-            .context(format!("threads.modify({}) failed", id))?;
-        Ok(())
+        with_retry(&self.limiter, "threads.modify", || async {
+            self.limiter.acquire(10).await;
+            let req = ModifyThreadRequest {
+                add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
+                remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
+            };
+            self.hub
+                .users()
+                .threads_modify(req, "me", id)
+                .add_scope(GMAIL_SCOPE)
+                .doit()
+                .await
+                .map(|_| ())
+                .context(format!("threads.modify({}) failed", id))
+        })
+        .await
     }
 
     pub async fn trash_thread(&self, id: &str) -> Result<()> {
         debug!("trash_thread: id={}", id);
-        self.limiter.acquire(10).await;
-        self.hub
-            .users()
-            .threads_trash("me", id)
-            .add_scope(GMAIL_SCOPE)
-            .doit()
-            .await
-            .context(format!("threads.trash({}) failed", id))?;
-        Ok(())
+        with_retry(&self.limiter, "threads.trash", || async {
+            self.limiter.acquire(10).await;
+            self.hub
+                .users()
+                .threads_trash("me", id)
+                .add_scope(GMAIL_SCOPE)
+                .doit()
+                .await
+                .map(|_| ())
+                .context(format!("threads.trash({}) failed", id))
+        })
+        .await
     }
 }

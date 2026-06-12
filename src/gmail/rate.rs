@@ -62,6 +62,19 @@ impl RateLimiter {
 
 const MAX_RETRIES: u32 = 5;
 
+/// Classify an error as a transient Gmail rate/availability failure worth
+/// retrying. The 429/503 details live in the SOURCE of a `.context()`-wrapped
+/// error, so the whole chain must be inspected (`{:#}`), not just `to_string()`
+/// which renders only the top context and would never see the code or reason.
+pub fn is_retryable(report: &eyre::Report) -> bool {
+    let chain = format!("{report:#}");
+    chain.contains("429")
+        || chain.contains("503")
+        || chain.contains("rate")
+        || chain.contains("RESOURCE_EXHAUSTED")
+        || chain.contains("concurrent")
+}
+
 pub async fn with_retry<F, Fut, T>(limiter: &RateLimiter, op_name: &str, mut f: F) -> eyre::Result<T>
 where
     F: FnMut() -> Fut,
@@ -71,9 +84,8 @@ where
         match f().await {
             Ok(val) => return Ok(val),
             Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("429") || msg.contains("503") || msg.contains("rate") {
-                    log::warn!("[retry] {} failed (attempt {}): {}", op_name, attempt + 1, msg);
+                if is_retryable(&e) {
+                    log::warn!("[retry] {} failed (attempt {}): {:#}", op_name, attempt + 1, e);
                     limiter.backoff(attempt).await;
                 } else {
                     return Err(e);
@@ -104,5 +116,29 @@ mod tests {
         limiter.acquire(100).await;
         let remaining = limiter.tokens.load(Ordering::Relaxed);
         assert!(remaining <= MAX_TOKENS - 200);
+    }
+
+    #[test]
+    fn test_is_retryable_finds_429_in_source_not_top_context() {
+        use eyre::Context;
+        // The Gmail 429 lives in the SOURCE; the top context is generic. This is
+        // exactly the case the old `to_string()` check missed.
+        let source = eyre::eyre!(
+            "Bad Request: {{\"error\":{{\"code\":429,\"reason\":\"rateLimitExceeded\",\"status\":\"RESOURCE_EXHAUSTED\"}}}}"
+        );
+        let report = Err::<(), _>(source).context("threads.get(abc123) failed").unwrap_err();
+
+        // to_string() shows only the top context -> would NOT catch the 429.
+        assert!(!report.to_string().contains("429"));
+        // is_retryable inspects the full chain -> catches it.
+        assert!(is_retryable(&report));
+    }
+
+    #[test]
+    fn test_is_retryable_ignores_non_transient_errors() {
+        use eyre::Context;
+        let source = eyre::eyre!("thread missing id");
+        let report = Err::<(), _>(source).context("threads.get(abc123) failed").unwrap_err();
+        assert!(!is_retryable(&report));
     }
 }
