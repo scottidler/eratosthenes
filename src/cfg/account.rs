@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use eyre::{Context, Result};
 use log::{debug, warn};
 
-use crate::cfg::config::{Config, load_config};
+use crate::cfg::config::{Config, load_config, xdg_config_dir};
 
 /// An account is a named config - name derived from the config filename stem.
 #[derive(Debug)]
@@ -17,7 +17,7 @@ pub struct Account {
 /// Each file is validated as an eratosthenes config (must have an `auth:` section).
 /// Files that fail validation are skipped with a warning.
 pub fn discover_accounts() -> Result<Vec<Account>> {
-    let config_dir = dirs::config_dir()
+    let config_dir = xdg_config_dir()
         .ok_or_else(|| eyre::eyre!("Cannot determine XDG config directory"))?
         .join("eratosthenes");
 
@@ -135,7 +135,7 @@ pub fn resolve_config_path(cli_path: Option<&PathBuf>) -> Option<PathBuf> {
         return Some(path.clone());
     }
 
-    if let Some(config_dir) = dirs::config_dir() {
+    if let Some(config_dir) = xdg_config_dir() {
         let primary = config_dir.join("eratosthenes").join("eratosthenes.yml");
         if primary.exists() {
             return Some(primary);

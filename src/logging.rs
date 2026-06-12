@@ -7,6 +7,8 @@ use std::sync::Mutex;
 use eyre::{Context, Result};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
+use eratosthenes::cfg::config::xdg_data_dir;
+
 tokio::task_local! {
     pub static ACCOUNT: String;
 }
@@ -76,7 +78,7 @@ impl Log for AccountLogger {
 }
 
 pub fn setup(level: &str, accounts: &[&str]) -> Result<()> {
-    let log_dir = dirs::data_local_dir()
+    let log_dir = xdg_data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("eratosthenes")
         .join("logs");

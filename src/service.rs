@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use eratosthenes::cfg::account::{Account, discover_accounts};
-use eratosthenes::cfg::config::{AuthConfig, Config};
+use eratosthenes::cfg::config::{AuthConfig, Config, xdg_config_dir};
 
 fn shellexpand(path: &str) -> String {
     if let Some(rest) = path.strip_prefix("~/")
@@ -18,7 +18,7 @@ fn shellexpand(path: &str) -> String {
 const SERVICE_NAME: &str = "eratosthenes";
 
 fn service_dir() -> Result<PathBuf> {
-    let dir = dirs::config_dir()
+    let dir = xdg_config_dir()
         .ok_or_else(|| eyre::eyre!("Cannot determine XDG config directory"))?
         .join("systemd")
         .join("user");
@@ -45,7 +45,7 @@ fn digest_timer_path() -> Result<PathBuf> {
 
 /// Path to the EnvironmentFile holding the Slack token(s) for the digest service.
 fn digest_env_path() -> Result<PathBuf> {
-    let dir = dirs::config_dir()
+    let dir = xdg_config_dir()
         .ok_or_else(|| eyre::eyre!("Cannot determine XDG config directory"))?
         .join("eratosthenes");
     Ok(dir.join("digest.env"))
