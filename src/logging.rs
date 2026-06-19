@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -15,11 +15,16 @@ tokio::task_local! {
 
 struct AccountLogger {
     app_level: LevelFilter,
+    // When stderr is a TTY (interactive run), mirror records to the console so a
+    // human running `eratosthenes run` sees live progress. A headless timer run
+    // has no TTY, so nothing reaches the journal/syslog -- this is what stopped
+    // the per-message `println!` flood (see docs/syslog-flooding.md).
+    interactive: bool,
     files: Mutex<HashMap<String, Mutex<File>>>,
 }
 
 impl AccountLogger {
-    fn new(app_level: LevelFilter, log_dir: &Path, accounts: &[&str]) -> Result<Self> {
+    fn new(app_level: LevelFilter, interactive: bool, log_dir: &Path, accounts: &[&str]) -> Result<Self> {
         let mut files = HashMap::new();
         for &name in accounts {
             let path = log_dir.join(format!("{}.log", name));
@@ -32,6 +37,7 @@ impl AccountLogger {
         }
         Ok(Self {
             app_level,
+            interactive,
             files: Mutex::new(files),
         })
     }
@@ -57,6 +63,9 @@ impl Log for AccountLogger {
             record.target(),
             record.args()
         );
+        if self.interactive {
+            eprint!("{}", msg);
+        }
         let account = ACCOUNT.try_with(|n| n.clone()).ok();
         let files = self.files.lock().expect("logger mutex poisoned");
         match account.and_then(|n| files.get(&n).map(|_| n)) {
@@ -94,7 +103,8 @@ pub fn setup(level: &str, accounts: &[&str]) -> Result<()> {
         _ => LevelFilter::Info,
     };
 
-    let logger = AccountLogger::new(app_level, &log_dir, accounts)?;
+    let interactive = std::io::stderr().is_terminal();
+    let logger = AccountLogger::new(app_level, interactive, &log_dir, accounts)?;
     log::set_boxed_logger(Box::new(logger)).map_err(|e| eyre::eyre!("Failed to initialize logger: {}", e))?;
     log::set_max_level(LevelFilter::Trace);
 

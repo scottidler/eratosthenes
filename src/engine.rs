@@ -22,7 +22,7 @@ pub async fn execute(client: &mut GmailClient, config: &Config, prefix: &str, dr
     );
 
     if dry_run {
-        println!("{}=== DRY RUN - no changes will be made ===", prefix);
+        info!("{}=== DRY RUN - no changes will be made ===", prefix);
     }
 
     ensure_labels(client, config).await?;
@@ -30,7 +30,7 @@ pub async fn execute(client: &mut GmailClient, config: &Config, prefix: &str, dr
     info!("{}=== Phase 0: Stage Sanitization ===", prefix);
     let sanitized = sanitize_stages(client, &config.state_filters, prefix, dry_run).await?;
     if sanitized > 0 {
-        println!(
+        info!(
             "{}[sanitize] cleaned {} threads with conflicting stage labels",
             prefix, sanitized
         );
@@ -42,7 +42,7 @@ pub async fn execute(client: &mut GmailClient, config: &Config, prefix: &str, dr
     info!("{}=== Phase 2: State Filters (Thread Age-Off) ===", prefix);
     let total_transitioned = execute_state_filters(client, &config.state_filters, prefix, dry_run).await?;
 
-    println!(
+    info!(
         "{}Done: {} messages matched filters, {} threads transitioned{}",
         prefix,
         total_matched,
@@ -148,7 +148,7 @@ async fn sanitize_stages(
                 continue;
             }
 
-            println!(
+            debug!(
                 "{}[sanitize] {} threads have both {} and {} - removing {}",
                 prefix,
                 thread_ids.len(),
@@ -196,7 +196,7 @@ async fn execute_message_filters(
             warn!("Filter '{}' compiles to empty query, skipping", filter.name);
             continue;
         }
-        println!("{}[filter:{}] searching: {}", prefix, filter.name, query);
+        debug!("{}[filter:{}] searching: {}", prefix, filter.name, query);
         let ids = client.search_messages(&query).await?;
         debug!(
             "{}[filter:{}] query returned {} candidates",
@@ -211,7 +211,7 @@ async fn execute_message_filters(
         }
     }
 
-    println!(
+    debug!(
         "{}[phase1] {} unique candidates, fetching metadata...",
         prefix,
         all_ids.len()
@@ -224,7 +224,7 @@ async fn execute_message_filters(
         trace!("{}[phase1] [{}/{}] fetching {}", prefix, i + 1, total, id);
         let msg = client.get_message(id).await?;
         if (i + 1) % 50 == 0 {
-            println!("{}[phase1] [{}/{}] fetching...", prefix, i + 1, total);
+            trace!("{}[phase1] [{}/{}] fetching...", prefix, i + 1, total);
         }
         messages.insert(id.clone(), msg);
     }
@@ -254,14 +254,9 @@ async fn execute_message_filters(
                 prefix, filter.name, id, msg.to, msg.cc, msg.from
             );
             if filter.matches(&msg.to, &msg.cc, &msg.from, &msg.subject, &labels, &msg.headers) {
-                debug!(
-                    "{}[filter:{}] MATCH: {} (from: {})",
-                    prefix,
-                    filter.name,
-                    msg.subject,
-                    msg.from.first().map(|s| s.as_str()).unwrap_or("?")
-                );
-                println!(
+                // Per-record: TRACE, not DEBUG/println. This single line, emitted
+                // unconditionally to stdout every 5 minutes, was the syslog flood.
+                trace!(
                     "{}[filter:{}] MATCH: {} (from: {})",
                     prefix,
                     filter.name,
@@ -277,7 +272,7 @@ async fn execute_message_filters(
             claimed.insert(id.clone());
         }
 
-        println!(
+        debug!(
             "{}[filter:{}] {} matched (total claimed: {})",
             prefix,
             filter.name,
@@ -315,14 +310,14 @@ async fn apply_filter_action(
 
     match action {
         FilterAction::Star => {
-            println!("{}[filter:{}] starring {} messages", prefix, filter_name, ids.len());
+            info!("{}[filter:{}] starring {} messages", prefix, filter_name, ids.len());
             if !dry_run {
                 let add = vec!["STARRED".to_string()];
                 client.batch_modify(ids, &add, &[]).await?;
             }
         }
         FilterAction::Flag => {
-            println!(
+            info!(
                 "{}[filter:{}] flagging {} messages as important",
                 prefix,
                 filter_name,
@@ -335,7 +330,7 @@ async fn apply_filter_action(
         }
         FilterAction::Move(dest) => {
             let dest_id = client.resolver.resolve_name(dest).unwrap_or(dest.as_str()).to_string();
-            println!(
+            info!(
                 "{}[filter:{}] moving {} messages to {}",
                 prefix,
                 filter_name,
@@ -374,10 +369,10 @@ async fn execute_state_filters(
         return Ok(0);
     }
 
-    println!("{}[state] searching active threads...", prefix);
+    debug!("{}[state] searching active threads...", prefix);
     debug!("{}[state] query: {}", prefix, active_query);
     let thread_ids = client.list_threads(&active_query).await?;
-    println!("{}[state] {} active threads to evaluate", prefix, thread_ids.len());
+    debug!("{}[state] {} active threads to evaluate", prefix, thread_ids.len());
 
     let clock = crate::cfg::state::RealClock;
     let total = thread_ids.len();
@@ -385,7 +380,7 @@ async fn execute_state_filters(
 
     for (i, thread_id) in thread_ids.iter().enumerate() {
         if (i + 1) % 50 == 0 {
-            println!("{}[state] [{}/{}] evaluating...", prefix, i + 1, total);
+            trace!("{}[state] [{}/{}] evaluating...", prefix, i + 1, total);
         }
         trace!("{}[state] [{}/{}] fetching thread {}", prefix, i + 1, total, thread_id);
         let thread = client.get_thread(thread_id).await?;
@@ -406,7 +401,9 @@ async fn evaluate_thread<C: Clock>(
     dry_run: bool,
 ) -> Result<bool> {
     let thread_labels = thread.labels_resolved(&client.resolver);
-    debug!(
+    // Per-record: fires once per active thread every run. TRACE, not DEBUG --
+    // at the default level this single line grew tatari.log ~48 MiB/day.
+    trace!(
         "{}evaluate_thread: id={}, msgs={}, labels={:?}, is_read={}",
         prefix,
         thread.id,
@@ -430,7 +427,8 @@ async fn evaluate_thread<C: Clock>(
         };
 
         let is_read = thread.is_read();
-        debug!(
+        // Per-record: once per matched thread every run -> TRACE, not DEBUG.
+        trace!(
             "{}[thread:{}] matched filter '{}': last_activity={}, is_read={}",
             prefix, thread.id, state_filter.name, last_activity, is_read
         );
@@ -442,7 +440,8 @@ async fn evaluate_thread<C: Clock>(
             }
             None => {
                 if state_filter.ttl == Ttl::Keep {
-                    debug!("{}[thread:{}] protected by '{}'", prefix, thread.id, state_filter.name);
+                    // Per-record: once per protected thread every run -> TRACE.
+                    trace!("{}[thread:{}] protected by '{}'", prefix, thread.id, state_filter.name);
                     return Ok(false);
                 }
             }
@@ -483,7 +482,7 @@ async fn apply_state_action(
 
             let dest_id = client.resolver.resolve_name(dest).unwrap_or(dest.as_str()).to_string();
 
-            println!(
+            debug!(
                 "{}[state:{}] thread {} -> {}",
                 prefix, state_filter.name, thread.id, dest,
             );
@@ -494,7 +493,7 @@ async fn apply_state_action(
             }
         }
         StateAction::Delete => {
-            println!("{}[state:{}] trashing thread {}", prefix, state_filter.name, thread.id,);
+            debug!("{}[state:{}] trashing thread {}", prefix, state_filter.name, thread.id,);
             if !dry_run {
                 client.trash_thread(&thread.id).await?;
             }

@@ -67,7 +67,7 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
         match result {
             Ok((name, Ok(()))) => {
                 let prefix = account_prefix(&name, multi);
-                println!("{}Completed successfully", prefix);
+                info!("{}Completed successfully", prefix);
             }
             Ok((name, Err(e))) => {
                 let prefix = account_prefix(&name, multi);
