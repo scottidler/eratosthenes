@@ -9,6 +9,7 @@ pub mod gmail;
 pub mod slack;
 
 use crate::cfg::config::{Config, load_config};
+use crate::cfg::state::StateAction;
 use crate::slack::SlackPoster;
 use eyre::{Context, Result};
 use log::{debug, warn};
@@ -85,12 +86,26 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
 
     let client = build_gmail_client(config, &prefix).await?;
 
+    // Threads already aged into a state-filter's destination stage (e.g.
+    // Purgatory, Oblivion) are excluded even if Gmail's own is:starred /
+    // is:important still matches them (a stale classifier tag, or a later
+    // reply that re-added INBOX without clearing the stage label). See
+    // docs/design/2026-06-06-slack-digest.md's known-noise note.
+    let stage_exclusions: String = config
+        .state_filters
+        .iter()
+        .filter_map(|f| match &f.action {
+            StateAction::Move(dest) if !dest.is_empty() => Some(format!(" -label:{}", dest.to_lowercase())),
+            _ => None,
+        })
+        .collect();
+
     let starred_ids = client
-        .list_threads("in:inbox is:starred")
+        .list_threads(&format!("in:inbox is:starred{}", stage_exclusions))
         .await
         .context("listing starred threads")?;
     let important_ids = client
-        .list_threads("in:inbox is:important")
+        .list_threads(&format!("in:inbox is:important{}", stage_exclusions))
         .await
         .context("listing important threads")?;
 
