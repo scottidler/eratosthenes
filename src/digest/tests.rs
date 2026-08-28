@@ -195,17 +195,27 @@ fn test_format_truncates_over_budget_keeping_exact_counts() {
             pin: Pin::Starred,
             date: ts(1_000 + i as i64),
             sender: format!("Sender Number {}", i),
-            subject: format!("A reasonably long subject line number {} to burn characters", i),
+            subject: format!(
+                "A reasonably long subject line number {} to burn characters",
+                i
+            ),
             thread_id: format!("THREAD{:04}", i),
         });
     }
     let out = format(&items, 0);
 
-    assert!(out.len() <= BUDGET, "body must fit budget, got {}", out.len());
+    assert!(
+        out.len() <= BUDGET,
+        "body must fit budget, got {}",
+        out.len()
+    );
     // Header count stays exact even though items are truncated.
     assert!(out.contains("*Pinned inbox digest* - 100 starred, 0 important"));
     assert!(out.contains("*:star: Starred (100)*"));
-    assert!(out.contains("... +"), "truncated digest must show a '... +N more' line");
+    assert!(
+        out.contains("... +"),
+        "truncated digest must show a '... +N more' line"
+    );
     assert!(out.trim_end().ends_with(SIGNATURE));
 }
 

@@ -41,7 +41,11 @@ pub struct MessageFilter {
     #[serde(default)]
     pub subject: Vec<String>,
 
-    #[serde(default, alias = "label", deserialize_with = "deserialize_labels_filter")]
+    #[serde(
+        default,
+        alias = "label",
+        deserialize_with = "deserialize_labels_filter"
+    )]
     pub labels: LabelsFilter,
 
     #[serde(default)]
@@ -119,10 +123,14 @@ impl MessageFilter {
             }
         }
 
-        if !self.labels.included.is_empty() && !labels.iter().any(|l| self.labels.included.contains(l)) {
+        if !self.labels.included.is_empty()
+            && !labels.iter().any(|l| self.labels.included.contains(l))
+        {
             return false;
         }
-        if !self.labels.excluded.is_empty() && labels.iter().any(|l| self.labels.excluded.contains(l)) {
+        if !self.labels.excluded.is_empty()
+            && labels.iter().any(|l| self.labels.excluded.contains(l))
+        {
             return false;
         }
 
@@ -151,7 +159,9 @@ impl MessageFilter {
     }
 }
 
-fn deserialize_opt_address_filter<'de, D>(deserializer: D) -> Result<Option<AddressFilter>, D::Error>
+fn deserialize_opt_address_filter<'de, D>(
+    deserializer: D,
+) -> Result<Option<AddressFilter>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -236,7 +246,9 @@ where
                             return Err(de::Error::custom("`excluded` must be a sequence"));
                         }
                     }
-                    other => return Err(de::Error::unknown_field(other, &["included", "excluded"])),
+                    other => {
+                        return Err(de::Error::unknown_field(other, &["included", "excluded"]));
+                    }
                 }
             }
             Ok(LabelsFilter { included, excluded })

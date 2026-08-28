@@ -28,13 +28,20 @@ fn resolve_log_level(cli_level: Option<&str>, config_level: &str) -> String {
 
 /// Resolve log level from accounts - use the first account's level as a reasonable default.
 fn log_level_from_accounts(cli_level: Option<&str>, accounts: &[Account]) -> String {
-    let config_level = accounts.first().map(|a| a.config.log_level.as_str()).unwrap_or("info");
+    let config_level = accounts
+        .first()
+        .map(|a| a.config.log_level.as_str())
+        .unwrap_or("info");
     resolve_log_level(cli_level, config_level)
 }
 
 /// Determine if we're running in multi-account mode (for output prefixing).
 fn account_prefix(name: &str, multi: bool) -> String {
-    if multi { format!("[{}] ", name) } else { String::new() }
+    if multi {
+        format!("[{}] ", name)
+    } else {
+        String::new()
+    }
 }
 
 async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
@@ -82,7 +89,11 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
     }
 
     if !errors.is_empty() {
-        eyre::bail!("{} account(s) failed:\n  {}", errors.len(), errors.join("\n  "));
+        eyre::bail!(
+            "{} account(s) failed:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        );
     }
     Ok(())
 }
@@ -120,13 +131,20 @@ async fn cmd_digest(cli: &Cli, names: Vec<String>) -> Result<()> {
     }
 
     if !errors.is_empty() {
-        eyre::bail!("{} account(s) failed:\n  {}", errors.len(), errors.join("\n  "));
+        eyre::bail!(
+            "{} account(s) failed:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        );
     }
     Ok(())
 }
 
 async fn cmd_auth_login(cli: &Cli, account: Option<String>) -> Result<()> {
-    let names = account.as_ref().map(|a| vec![a.clone()]).unwrap_or_default();
+    let names = account
+        .as_ref()
+        .map(|a| vec![a.clone()])
+        .unwrap_or_default();
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
     let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
     let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();

@@ -66,11 +66,13 @@ impl<'de> Deserialize<'de> for Ttl {
                     match key.as_str() {
                         "read" => {
                             let v: String = map.next_value()?;
-                            read = Some(parse_days(&v).map_err(|e| de::Error::custom(e.to_string()))?);
+                            read =
+                                Some(parse_days(&v).map_err(|e| de::Error::custom(e.to_string()))?);
                         }
                         "unread" => {
                             let v: String = map.next_value()?;
-                            unread = Some(parse_days(&v).map_err(|e| de::Error::custom(e.to_string()))?);
+                            unread =
+                                Some(parse_days(&v).map_err(|e| de::Error::custom(e.to_string()))?);
                         }
                         other => return Err(de::Error::unknown_field(other, &["read", "unread"])),
                     }
@@ -139,14 +141,20 @@ impl StateFilter {
             }
         };
 
-        if age >= ttl_duration { Ok(Some(self.action.clone())) } else { Ok(None) }
+        if age >= ttl_duration {
+            Ok(Some(self.action.clone()))
+        } else {
+            Ok(None)
+        }
     }
 }
 
 pub fn parse_days(s: &str) -> eyre::Result<chrono::Duration> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix('d') {
-        let days: i64 = num.parse().map_err(|_| eyre!("Invalid day count: {}", num))?;
+        let days: i64 = num
+            .parse()
+            .map_err(|_| eyre!("Invalid day count: {}", num))?;
         Ok(chrono::Duration::days(days))
     } else {
         Err(eyre!("TTL must end with 'd' (e.g. '7d'), got: {}", s))
@@ -237,7 +245,12 @@ mod tests {
         let old_date = now - Duration::days(365);
         let clock = FakeClock(now);
 
-        assert!(filter.evaluate_ttl(old_date, false, &clock).unwrap().is_none());
+        assert!(
+            filter
+                .evaluate_ttl(old_date, false, &clock)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -270,7 +283,12 @@ mod tests {
         let three_days_ago = now - Duration::days(3);
         let clock = FakeClock(now);
 
-        assert!(filter.evaluate_ttl(three_days_ago, false, &clock).unwrap().is_none());
+        assert!(
+            filter
+                .evaluate_ttl(three_days_ago, false, &clock)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -289,7 +307,12 @@ mod tests {
         let ten_days_ago = now - Duration::days(10);
         let clock = FakeClock(now);
 
-        assert!(filter.evaluate_ttl(ten_days_ago, true, &clock).unwrap().is_some());
+        assert!(
+            filter
+                .evaluate_ttl(ten_days_ago, true, &clock)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -308,7 +331,12 @@ mod tests {
         let ten_days_ago = now - Duration::days(10);
         let clock = FakeClock(now);
 
-        assert!(filter.evaluate_ttl(ten_days_ago, false, &clock).unwrap().is_none());
+        assert!(
+            filter
+                .evaluate_ttl(ten_days_ago, false, &clock)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

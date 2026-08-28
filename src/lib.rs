@@ -51,13 +51,20 @@ async fn build_gmail_client(config: &Config, prefix: &str) -> Result<gmail::clie
 }
 
 pub async fn run(account: &str, config: &Config, dry_run: bool, multi: bool) -> Result<()> {
-    let prefix = if multi { format!("[{}] ", account) } else { String::new() };
+    let prefix = if multi {
+        format!("[{}] ", account)
+    } else {
+        String::new()
+    };
 
     let mut client = build_gmail_client(config, &prefix).await?;
 
     // A header-based filter guard only works if the header is actually fetched.
     // Request the standard parsing headers plus every header any filter references.
-    let mut metadata_headers: Vec<String> = ["To", "Cc", "From", "Subject"].iter().map(|s| s.to_string()).collect();
+    let mut metadata_headers: Vec<String> = ["To", "Cc", "From", "Subject"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     for filter in &config.message_filters {
         for header_name in filter.headers.keys() {
             if !metadata_headers.contains(header_name) {
@@ -77,10 +84,12 @@ pub async fn run(account: &str, config: &Config, dry_run: bool, multi: bool) -> 
 pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) -> Result<()> {
     debug!("digest: account={}", account);
 
-    let slack = config
-        .slack
-        .as_ref()
-        .ok_or_else(|| eyre::eyre!("digest called for account '{}' without a slack config", account))?;
+    let slack = config.slack.as_ref().ok_or_else(|| {
+        eyre::eyre!(
+            "digest called for account '{}' without a slack config",
+            account
+        )
+    })?;
 
     let prefix = format!("[{}] ", account);
 
@@ -95,7 +104,9 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         .state_filters
         .iter()
         .filter_map(|f| match &f.action {
-            StateAction::Move(dest) if !dest.is_empty() => Some(format!(" -label:{}", dest.to_lowercase())),
+            StateAction::Move(dest) if !dest.is_empty() => {
+                Some(format!(" -label:{}", dest.to_lowercase()))
+            }
             _ => None,
         })
         .collect();
@@ -132,7 +143,11 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
     let items = digest::build(&threads, &starred_set, &important_set);
     let text = digest::format(&items, slack.browser_index);
 
-    debug!("digest: posting to channel={}, items={}", slack.channel, items.len());
+    debug!(
+        "digest: posting to channel={}, items={}",
+        slack.channel,
+        items.len()
+    );
     poster
         .post(&slack.channel, &text)
         .await

@@ -27,8 +27,10 @@ pub fn discover_accounts() -> Result<Vec<Account>> {
 
     let mut accounts = Vec::new();
 
-    let entries =
-        std::fs::read_dir(&config_dir).context(format!("Failed to read config directory: {}", config_dir.display()))?;
+    let entries = std::fs::read_dir(&config_dir).context(format!(
+        "Failed to read config directory: {}",
+        config_dir.display()
+    ))?;
 
     for entry in entries {
         let entry = entry.context("Failed to read directory entry")?;
@@ -88,7 +90,11 @@ pub fn filter_accounts(accounts: Vec<Account>, names: &[String]) -> Result<Vec<A
 
     for name in names {
         if !available.contains(&name.as_str()) {
-            eyre::bail!("unknown account '{}', available accounts: {:?}", name, available);
+            eyre::bail!(
+                "unknown account '{}', available accounts: {:?}",
+                name,
+                available
+            );
         }
     }
 
@@ -164,7 +170,9 @@ pub fn resolve_accounts(cli_config: Option<&PathBuf>, names: &[String]) -> Resul
             if let Some(path) = resolve_config_path(None) {
                 account_from_config(&path)?
             } else {
-                eyre::bail!("No config files found. Create *.yml files in ~/.config/eratosthenes/ or provide --config");
+                eyre::bail!(
+                    "No config files found. Create *.yml files in ~/.config/eratosthenes/ or provide --config"
+                );
             }
         } else {
             discovered
@@ -211,8 +219,12 @@ auth:
         write_valid_config(dir.path(), "home", 13132);
 
         let accounts = vec![
-            account_from_config(&dir.path().join("work.yml")).unwrap().remove(0),
-            account_from_config(&dir.path().join("home.yml")).unwrap().remove(0),
+            account_from_config(&dir.path().join("work.yml"))
+                .unwrap()
+                .remove(0),
+            account_from_config(&dir.path().join("home.yml"))
+                .unwrap()
+                .remove(0),
         ];
 
         let filtered = filter_accounts(accounts, &[]).unwrap();
@@ -226,8 +238,12 @@ auth:
         write_valid_config(dir.path(), "home", 13132);
 
         let accounts = vec![
-            account_from_config(&dir.path().join("work.yml")).unwrap().remove(0),
-            account_from_config(&dir.path().join("home.yml")).unwrap().remove(0),
+            account_from_config(&dir.path().join("work.yml"))
+                .unwrap()
+                .remove(0),
+            account_from_config(&dir.path().join("home.yml"))
+                .unwrap()
+                .remove(0),
         ];
 
         let filtered = filter_accounts(accounts, &["work".to_string()]).unwrap();
@@ -240,7 +256,11 @@ auth:
         let dir = tempfile::tempdir().unwrap();
         write_valid_config(dir.path(), "work", 13131);
 
-        let accounts = vec![account_from_config(&dir.path().join("work.yml")).unwrap().remove(0)];
+        let accounts = vec![
+            account_from_config(&dir.path().join("work.yml"))
+                .unwrap()
+                .remove(0),
+        ];
 
         let result = filter_accounts(accounts, &["bogus".to_string()]);
         assert!(result.is_err());
@@ -256,8 +276,12 @@ auth:
         write_valid_config(dir.path(), "home", 13131);
 
         let accounts = vec![
-            account_from_config(&dir.path().join("work.yml")).unwrap().remove(0),
-            account_from_config(&dir.path().join("home.yml")).unwrap().remove(0),
+            account_from_config(&dir.path().join("work.yml"))
+                .unwrap()
+                .remove(0),
+            account_from_config(&dir.path().join("home.yml"))
+                .unwrap()
+                .remove(0),
         ];
 
         let result = validate_accounts(&accounts);
@@ -273,8 +297,12 @@ auth:
         write_valid_config(dir.path(), "home", 13132);
 
         let accounts = vec![
-            account_from_config(&dir.path().join("work.yml")).unwrap().remove(0),
-            account_from_config(&dir.path().join("home.yml")).unwrap().remove(0),
+            account_from_config(&dir.path().join("work.yml"))
+                .unwrap()
+                .remove(0),
+            account_from_config(&dir.path().join("home.yml"))
+                .unwrap()
+                .remove(0),
         ];
 
         assert!(validate_accounts(&accounts).is_ok());

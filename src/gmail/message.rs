@@ -27,11 +27,15 @@ impl GmailMessage {
             .filter_map(|h| Some((h.name?, h.value?)))
             .collect();
 
-        let internal_date_millis = msg.internal_date.ok_or_else(|| eyre!("missing internal_date"))?;
+        let internal_date_millis = msg
+            .internal_date
+            .ok_or_else(|| eyre!("missing internal_date"))?;
 
         Ok(Self {
             id: msg.id.ok_or_else(|| eyre!("message missing id"))?,
-            thread_id: msg.thread_id.ok_or_else(|| eyre!("message missing thread_id"))?,
+            thread_id: msg
+                .thread_id
+                .ok_or_else(|| eyre!("message missing thread_id"))?,
             label_ids: msg.label_ids.unwrap_or_default(),
             internal_date: DateTime::from_timestamp_millis(internal_date_millis)
                 .ok_or_else(|| eyre!("invalid timestamp: {}", internal_date_millis))?,
@@ -63,11 +67,17 @@ impl GmailThread {
     }
 
     pub fn label_ids(&self) -> HashSet<String> {
-        self.messages.iter().flat_map(|m| m.label_ids.iter().cloned()).collect()
+        self.messages
+            .iter()
+            .flat_map(|m| m.label_ids.iter().cloned())
+            .collect()
     }
 
     pub fn labels(&self) -> Vec<Label> {
-        self.label_ids().into_iter().map(|id| Label::new(&id)).collect()
+        self.label_ids()
+            .into_iter()
+            .map(|id| Label::new(&id))
+            .collect()
     }
 
     pub fn labels_resolved(&self, resolver: &LabelResolver) -> Vec<Label> {

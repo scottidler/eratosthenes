@@ -87,10 +87,18 @@ pub struct Config {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    #[serde(rename = "message-filters", default, deserialize_with = "deserialize_named_filters")]
+    #[serde(
+        rename = "message-filters",
+        default,
+        deserialize_with = "deserialize_named_filters"
+    )]
     pub message_filters: Vec<MessageFilter>,
 
-    #[serde(rename = "state-filters", default, deserialize_with = "deserialize_named_states")]
+    #[serde(
+        rename = "state-filters",
+        default,
+        deserialize_with = "deserialize_named_states"
+    )]
     pub state_filters: Vec<StateFilter>,
 
     /// Optional per-account Slack digest config. `digest` is a no-op if absent.
@@ -106,8 +114,16 @@ pub fn load_config(config_path: &Path) -> Result<Config> {
     debug!("Loading configuration from {:?}", config_path);
 
     let content = fs::read_to_string(config_path).map_err(|e| {
-        error!("Failed to read config file {}: {}", config_path.display(), e);
-        eyre!("Failed to read config file {}: {}", config_path.display(), e)
+        error!(
+            "Failed to read config file {}: {}",
+            config_path.display(),
+            e
+        );
+        eyre!(
+            "Failed to read config file {}: {}",
+            config_path.display(),
+            e
+        )
     })?;
 
     let mut cfg: Config = serde_yaml::from_str(&content).map_err(|e| {
@@ -139,7 +155,9 @@ where
     for entry in seq {
         if let Value::Mapping(map) = entry {
             if map.len() != 1 {
-                return Err(de::Error::custom("Each filter must have exactly one name->body"));
+                return Err(de::Error::custom(
+                    "Each filter must have exactly one name->body",
+                ));
             }
             let (k, v) = map.into_iter().next().expect("checked len");
             let name = match k {
@@ -169,7 +187,9 @@ where
     for entry in seq {
         if let Value::Mapping(map) = entry {
             if map.len() != 1 {
-                return Err(de::Error::custom("Each state must have exactly one name->body"));
+                return Err(de::Error::custom(
+                    "Each state must have exactly one name->body",
+                ));
             }
             let (k, v) = map.into_iter().next().expect("checked len");
             let name = match k {

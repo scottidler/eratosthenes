@@ -13,7 +13,12 @@ pub fn compile_query(filter: &MessageFilter) -> String {
         if af.patterns.len() == 1 {
             parts.push(format!("from:({})", af.patterns[0]));
         } else if af.patterns.len() > 1 {
-            let joined = af.patterns.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(" ");
+            let joined = af
+                .patterns
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
             parts.push(format!("from:({})", joined));
         }
     }

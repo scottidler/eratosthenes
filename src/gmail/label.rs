@@ -39,7 +39,10 @@ impl LabelResolver {
             }
         }
 
-        Self { name_to_id, id_to_name }
+        Self {
+            name_to_id,
+            id_to_name,
+        }
     }
 
     pub fn resolve_name(&self, name: &str) -> Option<&str> {
@@ -57,7 +60,9 @@ impl LabelResolver {
 }
 
 pub async fn create_label_if_missing(
-    hub: &google_gmail1::Gmail<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>>,
+    hub: &google_gmail1::Gmail<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    >,
     resolver: &mut LabelResolver,
     name: &str,
 ) -> Result<String> {

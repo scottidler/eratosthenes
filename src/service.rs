@@ -170,7 +170,11 @@ fn validate_schedule(schedule: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eyre::bail!("Invalid OnCalendar schedule '{}': {}", schedule, stderr.trim());
+        eyre::bail!(
+            "Invalid OnCalendar schedule '{}': {}",
+            schedule,
+            stderr.trim()
+        );
     }
     Ok(())
 }
@@ -225,7 +229,8 @@ fn write_digest_env(slack_accounts: &[&Account]) -> Result<()> {
 
     let path = digest_env_path()?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create config directory for digest.env")?;
+        std::fs::create_dir_all(parent)
+            .context("Failed to create config directory for digest.env")?;
     }
     std::fs::write(&path, lines).context("Failed to write digest.env")?;
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
@@ -244,7 +249,11 @@ fn systemctl(args: &[&str]) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eyre::bail!("systemctl --user {} failed: {}", args.join(" "), stderr.trim());
+        eyre::bail!(
+            "systemctl --user {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        );
     }
     Ok(())
 }
@@ -261,7 +270,10 @@ pub fn install(interval: &str) -> Result<()> {
     // Warn about non-standard binary paths
     let binary_str = binary.display().to_string();
     if binary_str.contains("target/debug") || binary_str.contains("target/release") {
-        eprintln!("Warning: binary path contains target/ directory: {}", binary_str);
+        eprintln!(
+            "Warning: binary path contains target/ directory: {}",
+            binary_str
+        );
         eprintln!("  Consider running `cargo install --path .` first for a stable path.");
     }
 
@@ -275,7 +287,14 @@ pub fn install(interval: &str) -> Result<()> {
         println!("Found accounts: {}", names.join(", "));
 
         for account in &accounts {
-            let token_path_str = shellexpand(account.config.auth.token_cache_path().to_str().unwrap_or_default());
+            let token_path_str = shellexpand(
+                account
+                    .config
+                    .auth
+                    .token_cache_path()
+                    .to_str()
+                    .unwrap_or_default(),
+            );
             if !Path::new(&token_path_str).exists() {
                 eprintln!(
                     "Warning: no token cache for '{}'. Run `eratosthenes auth login {}` first.",
@@ -316,7 +335,10 @@ pub fn install(interval: &str) -> Result<()> {
 
 /// Install (or, if no account opts in, remove) the digest service + timer.
 fn install_digest_units(binary: &Path, accounts: &[Account]) -> Result<()> {
-    let slack_accounts: Vec<&Account> = accounts.iter().filter(|a| a.config.slack.is_some()).collect();
+    let slack_accounts: Vec<&Account> = accounts
+        .iter()
+        .filter(|a| a.config.slack.is_some())
+        .collect();
 
     if slack_accounts.is_empty() {
         remove_digest_units()?;
@@ -330,8 +352,10 @@ fn install_digest_units(binary: &Path, accounts: &[Account]) -> Result<()> {
 
     let svc_path = digest_service_path()?;
     let tmr_path = digest_timer_path()?;
-    std::fs::write(&svc_path, generate_digest_service(binary)).context("Failed to write digest service file")?;
-    std::fs::write(&tmr_path, generate_digest_timer(&schedule)).context("Failed to write digest timer file")?;
+    std::fs::write(&svc_path, generate_digest_service(binary))
+        .context("Failed to write digest service file")?;
+    std::fs::write(&tmr_path, generate_digest_timer(&schedule))
+        .context("Failed to write digest timer file")?;
 
     systemctl(&["daemon-reload"])?;
     systemctl(&["enable", "--now", &format!("{DIGEST_NAME}.timer")])?;
@@ -484,14 +508,18 @@ pub fn auth_status(account_name: &str, auth: &AuthConfig) -> Result<()> {
 
     if !token_path.exists() {
         println!("Status: NOT AUTHENTICATED");
-        println!("  No token cache found. Run: eratosthenes auth login {}", account_name);
+        println!(
+            "  No token cache found. Run: eratosthenes auth login {}",
+            account_name
+        );
         return Ok(());
     }
 
     let content = std::fs::read_to_string(token_path).context("Failed to read token cache")?;
 
     // yup-oauth2 token cache is JSON; check if it parses and has content
-    let parsed: serde_json::Value = serde_json::from_str(&content).context("Token cache is not valid JSON")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&content).context("Token cache is not valid JSON")?;
 
     if parsed.as_object().is_some_and(|obj| obj.is_empty()) {
         println!("Status: EMPTY (no tokens cached)");
@@ -535,7 +563,10 @@ pub fn config_validate(account_name: &str, config: &Config) -> Result<()> {
 pub fn config_show(account_name: &str, config: &Config) -> Result<()> {
     println!("Account: {}", account_name);
     println!("Creds path: {}", config.auth.creds_path.display());
-    println!("Client secret: {}", config.auth.client_secret_path().display());
+    println!(
+        "Client secret: {}",
+        config.auth.client_secret_path().display()
+    );
     println!("Token cache: {}", config.auth.token_cache_path().display());
     println!("Callback port: {}", config.auth.callback_port);
     println!("Log level: {}", config.log_level);

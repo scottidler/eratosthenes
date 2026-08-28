@@ -55,7 +55,11 @@ impl RateLimiter {
         let base = 1u64 << attempt.min(6);
         let jitter = base / 4;
         let wait = base.min(MAX_BACKOFF_SECS).saturating_add(jitter);
-        log::warn!("Rate limited, backing off for {}s (attempt {})", wait, attempt);
+        log::warn!(
+            "Rate limited, backing off for {}s (attempt {})",
+            wait,
+            attempt
+        );
         sleep(Duration::from_secs(wait)).await;
     }
 }
@@ -75,7 +79,11 @@ pub fn is_retryable(report: &eyre::Report) -> bool {
         || chain.contains("concurrent")
 }
 
-pub async fn with_retry<F, Fut, T>(limiter: &RateLimiter, op_name: &str, mut f: F) -> eyre::Result<T>
+pub async fn with_retry<F, Fut, T>(
+    limiter: &RateLimiter,
+    op_name: &str,
+    mut f: F,
+) -> eyre::Result<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = eyre::Result<T>>,
@@ -85,7 +93,12 @@ where
             Ok(val) => return Ok(val),
             Err(e) => {
                 if is_retryable(&e) {
-                    log::warn!("[retry] {} failed (attempt {}): {:#}", op_name, attempt + 1, e);
+                    log::warn!(
+                        "[retry] {} failed (attempt {}): {:#}",
+                        op_name,
+                        attempt + 1,
+                        e
+                    );
                     limiter.backoff(attempt).await;
                 } else {
                     return Err(e);
@@ -126,7 +139,9 @@ mod tests {
         let source = eyre::eyre!(
             "Bad Request: {{\"error\":{{\"code\":429,\"reason\":\"rateLimitExceeded\",\"status\":\"RESOURCE_EXHAUSTED\"}}}}"
         );
-        let report = Err::<(), _>(source).context("threads.get(abc123) failed").unwrap_err();
+        let report = Err::<(), _>(source)
+            .context("threads.get(abc123) failed")
+            .unwrap_err();
 
         // to_string() shows only the top context -> would NOT catch the 429.
         assert!(!report.to_string().contains("429"));
@@ -138,7 +153,9 @@ mod tests {
     fn test_is_retryable_ignores_non_transient_errors() {
         use eyre::Context;
         let source = eyre::eyre!("thread missing id");
-        let report = Err::<(), _>(source).context("threads.get(abc123) failed").unwrap_err();
+        let report = Err::<(), _>(source)
+            .context("threads.get(abc123) failed")
+            .unwrap_err();
         assert!(!is_retryable(&report));
     }
 }

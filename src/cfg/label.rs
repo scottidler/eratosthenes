@@ -98,7 +98,10 @@ mod tests {
     #[test]
     fn test_label_custom() {
         assert_eq!(Label::new("MyLabel"), Label::Custom("MyLabel".to_string()));
-        assert_eq!(Label::new("work/projects"), Label::Custom("work/projects".to_string()));
+        assert_eq!(
+            Label::new("work/projects"),
+            Label::Custom("work/projects".to_string())
+        );
     }
 
     #[test]
@@ -121,6 +124,9 @@ mod tests {
     fn test_to_gmail_id() {
         assert_eq!(Label::Inbox.to_gmail_id(), "INBOX");
         assert_eq!(Label::Starred.to_gmail_id(), "STARRED");
-        assert_eq!(Label::Custom("Purgatory".to_string()).to_gmail_id(), "Purgatory");
+        assert_eq!(
+            Label::Custom("Purgatory".to_string()).to_gmail_id(),
+            "Purgatory"
+        );
     }
 }

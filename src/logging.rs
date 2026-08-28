@@ -24,7 +24,12 @@ struct AccountLogger {
 }
 
 impl AccountLogger {
-    fn new(app_level: LevelFilter, interactive: bool, log_dir: &Path, accounts: &[&str]) -> Result<Self> {
+    fn new(
+        app_level: LevelFilter,
+        interactive: bool,
+        log_dir: &Path,
+        accounts: &[&str],
+    ) -> Result<Self> {
         let mut files = HashMap::new();
         for &name in accounts {
             let path = log_dir.join(format!("{}.log", name));
@@ -105,7 +110,8 @@ pub fn setup(level: &str, accounts: &[&str]) -> Result<()> {
 
     let interactive = std::io::stderr().is_terminal();
     let logger = AccountLogger::new(app_level, interactive, &log_dir, accounts)?;
-    log::set_boxed_logger(Box::new(logger)).map_err(|e| eyre::eyre!("Failed to initialize logger: {}", e))?;
+    log::set_boxed_logger(Box::new(logger))
+        .map_err(|e| eyre::eyre!("Failed to initialize logger: {}", e))?;
     log::set_max_level(LevelFilter::Trace);
 
     Ok(())

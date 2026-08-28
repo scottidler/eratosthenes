@@ -21,7 +21,10 @@ pub struct GmailClient {
 /// Header-based filter guards (e.g. List-Id, Precedence) are added on top of
 /// these via `set_metadata_headers`, derived from the active config.
 fn default_metadata_headers() -> Vec<String> {
-    ["To", "Cc", "From", "Subject"].iter().map(|s| s.to_string()).collect()
+    ["To", "Cc", "From", "Subject"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 impl GmailClient {
@@ -71,11 +74,19 @@ impl GmailClient {
         loop {
             let result = with_retry(&self.limiter, "messages.list", || async {
                 self.limiter.acquire(5).await;
-                let mut call = self.hub.users().messages_list("me").q(query).add_scope(GMAIL_SCOPE);
+                let mut call = self
+                    .hub
+                    .users()
+                    .messages_list("me")
+                    .q(query)
+                    .add_scope(GMAIL_SCOPE);
                 if let Some(ref token) = page_token {
                     call = call.page_token(token);
                 }
-                call.doit().await.map(|(_, r)| r).context("messages.list failed")
+                call.doit()
+                    .await
+                    .map(|(_, r)| r)
+                    .context("messages.list failed")
             })
             .await?;
 
@@ -128,11 +139,19 @@ impl GmailClient {
         loop {
             let result = with_retry(&self.limiter, "threads.list", || async {
                 self.limiter.acquire(10).await;
-                let mut call = self.hub.users().threads_list("me").q(query).add_scope(GMAIL_SCOPE);
+                let mut call = self
+                    .hub
+                    .users()
+                    .threads_list("me")
+                    .q(query)
+                    .add_scope(GMAIL_SCOPE);
                 if let Some(ref token) = page_token {
                     call = call.page_token(token);
                 }
-                call.doit().await.map(|(_, r)| r).context("threads.list failed")
+                call.doit()
+                    .await
+                    .map(|(_, r)| r)
+                    .context("threads.list failed")
             })
             .await?;
 
@@ -242,12 +261,23 @@ impl GmailClient {
     }
 
     pub async fn modify_message(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {
-        debug!("modify_message: id={}, add={:?}, remove={:?}", id, add, remove);
+        debug!(
+            "modify_message: id={}, add={:?}, remove={:?}",
+            id, add, remove
+        );
         with_retry(&self.limiter, "messages.modify", || async {
             self.limiter.acquire(5).await;
             let req = ModifyMessageRequest {
-                add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
-                remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
+                add_label_ids: if add.is_empty() {
+                    None
+                } else {
+                    Some(add.to_vec())
+                },
+                remove_label_ids: if remove.is_empty() {
+                    None
+                } else {
+                    Some(remove.to_vec())
+                },
             };
             self.hub
                 .users()
@@ -261,8 +291,18 @@ impl GmailClient {
         .await
     }
 
-    pub async fn batch_modify(&self, ids: &[String], add: &[String], remove: &[String]) -> Result<()> {
-        debug!("batch_modify: count={}, add={:?}, remove={:?}", ids.len(), add, remove);
+    pub async fn batch_modify(
+        &self,
+        ids: &[String],
+        add: &[String],
+        remove: &[String],
+    ) -> Result<()> {
+        debug!(
+            "batch_modify: count={}, add={:?}, remove={:?}",
+            ids.len(),
+            add,
+            remove
+        );
         if ids.is_empty() {
             return Ok(());
         }
@@ -271,9 +311,17 @@ impl GmailClient {
             with_retry(&self.limiter, "messages.batchModify", || async {
                 self.limiter.acquire(50).await;
                 let req = BatchModifyMessagesRequest {
-                    add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
+                    add_label_ids: if add.is_empty() {
+                        None
+                    } else {
+                        Some(add.to_vec())
+                    },
                     ids: Some(chunk.to_vec()),
-                    remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
+                    remove_label_ids: if remove.is_empty() {
+                        None
+                    } else {
+                        Some(remove.to_vec())
+                    },
                 };
                 self.hub
                     .users()
@@ -291,12 +339,23 @@ impl GmailClient {
     }
 
     pub async fn modify_thread(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {
-        debug!("modify_thread: id={}, add={:?}, remove={:?}", id, add, remove);
+        debug!(
+            "modify_thread: id={}, add={:?}, remove={:?}",
+            id, add, remove
+        );
         with_retry(&self.limiter, "threads.modify", || async {
             self.limiter.acquire(10).await;
             let req = ModifyThreadRequest {
-                add_label_ids: if add.is_empty() { None } else { Some(add.to_vec()) },
-                remove_label_ids: if remove.is_empty() { None } else { Some(remove.to_vec()) },
+                add_label_ids: if add.is_empty() {
+                    None
+                } else {
+                    Some(add.to_vec())
+                },
+                remove_label_ids: if remove.is_empty() {
+                    None
+                } else {
+                    Some(remove.to_vec())
+                },
             };
             self.hub
                 .users()

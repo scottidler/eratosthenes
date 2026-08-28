@@ -84,7 +84,8 @@ pub fn build(
 /// signature is always the last line.
 pub fn format(items: &[DigestItem], browser_index: u8) -> String {
     let mut starred: Vec<&DigestItem> = items.iter().filter(|i| i.pin == Pin::Starred).collect();
-    let mut important: Vec<&DigestItem> = items.iter().filter(|i| i.pin == Pin::Important).collect();
+    let mut important: Vec<&DigestItem> =
+        items.iter().filter(|i| i.pin == Pin::Important).collect();
 
     // Most-actionable first: newest at the top of each section.
     starred.sort_by_key(|i| std::cmp::Reverse(i.date));
@@ -107,7 +108,15 @@ pub fn format(items: &[DigestItem], browser_index: u8) -> String {
     let mut s_show = s_total;
     let mut i_show = i_total;
     loop {
-        let msg = render(&starred, &important, s_show, i_show, s_total, i_total, browser_index);
+        let msg = render(
+            &starred,
+            &important,
+            s_show,
+            i_show,
+            s_total,
+            i_total,
+            browser_index,
+        );
         if msg.len() <= BUDGET {
             return msg;
         }
@@ -130,7 +139,10 @@ fn render(
     i_total: usize,
     browser_index: u8,
 ) -> String {
-    let mut out = format!("*Pinned inbox digest* - {} starred, {} important\n", s_total, i_total);
+    let mut out = format!(
+        "*Pinned inbox digest* - {} starred, {} important\n",
+        s_total, i_total
+    );
 
     if s_total > 0 {
         out.push_str(&format!("\n*:star: Starred ({})*\n", s_total));
@@ -178,7 +190,9 @@ fn line(item: &DigestItem, browser_index: u8) -> String {
 /// Escape the three characters Slack treats specially in `mrkdwn` text. A bare
 /// `>` in the link display text would close the `<url|text>` link early.
 fn escape_mrkdwn(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Display name from a message: parse the `From` header's name, falling back to
@@ -213,7 +227,11 @@ fn parse_display_name(raw: &str) -> Option<String> {
         }
         return None;
     }
-    if raw.is_empty() { None } else { Some(raw.to_string()) }
+    if raw.is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
 }
 
 #[cfg(test)]

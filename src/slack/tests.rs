@@ -17,7 +17,10 @@ impl FakeSlackPoster {
 
 impl SlackPoster for FakeSlackPoster {
     async fn post(&self, channel: &str, text: &str) -> Result<()> {
-        self.posts.lock().unwrap().push((channel.to_string(), text.to_string()));
+        self.posts
+            .lock()
+            .unwrap()
+            .push((channel.to_string(), text.to_string()));
         Ok(())
     }
 }
@@ -49,6 +52,10 @@ fn test_from_env_missing_var_errors() {
         Ok(_) => panic!("expected error for missing env var"),
         Err(e) => e.to_string(),
     };
-    assert!(err.contains(var), "error should name the missing var: {}", err);
+    assert!(
+        err.contains(var),
+        "error should name the missing var: {}",
+        err
+    );
     drop(guard);
 }

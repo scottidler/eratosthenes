@@ -46,8 +46,12 @@ impl HttpSlackPoster {
     pub fn from_env(token_env: &str) -> Result<Self> {
         debug!("HttpSlackPoster::from_env: token_env={}", token_env);
 
-        let token = std::env::var(token_env)
-            .map_err(|_| eyre!("Slack token env var '{}' is not set; cannot post digest", token_env))?;
+        let token = std::env::var(token_env).map_err(|_| {
+            eyre!(
+                "Slack token env var '{}' is not set; cannot post digest",
+                token_env
+            )
+        })?;
 
         let connector = hyper_rustls::HttpsConnectorBuilder::new()
             .with_native_roots()
@@ -56,7 +60,9 @@ impl HttpSlackPoster {
             .enable_http1()
             .build();
 
-        let http = hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+        let http =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector);
 
         Ok(Self { token, http })
     }
@@ -64,7 +70,11 @@ impl HttpSlackPoster {
 
 impl SlackPoster for HttpSlackPoster {
     async fn post(&self, channel: &str, text: &str) -> Result<()> {
-        debug!("HttpSlackPoster::post: channel={}, text_len={}", channel, text.len());
+        debug!(
+            "HttpSlackPoster::post: channel={}, text_len={}",
+            channel,
+            text.len()
+        );
 
         let payload = serde_json::json!({
             "channel": channel,
@@ -75,8 +85,14 @@ impl SlackPoster for HttpSlackPoster {
         let req = http::Request::builder()
             .method(http::Method::POST)
             .uri(POST_MESSAGE_URL)
-            .header(http::header::AUTHORIZATION, format!("Bearer {}", self.token))
-            .header(http::header::CONTENT_TYPE, "application/json; charset=utf-8")
+            .header(
+                http::header::AUTHORIZATION,
+                format!("Bearer {}", self.token),
+            )
+            .header(
+                http::header::CONTENT_TYPE,
+                "application/json; charset=utf-8",
+            )
             .body(Full::new(Bytes::from(body)))
             .context("Failed to build Slack request")?;
 
@@ -97,10 +113,15 @@ impl SlackPoster for HttpSlackPoster {
         if !status.is_success() {
             let preview = String::from_utf8_lossy(&bytes);
             warn!("Slack HTTP {} from chat.postMessage: {}", status, preview);
-            eyre::bail!("Slack chat.postMessage returned HTTP {}: {}", status, preview);
+            eyre::bail!(
+                "Slack chat.postMessage returned HTTP {}: {}",
+                status,
+                preview
+            );
         }
 
-        let parsed: SlackResponse = serde_json::from_slice(&bytes).context("Failed to parse Slack response JSON")?;
+        let parsed: SlackResponse =
+            serde_json::from_slice(&bytes).context("Failed to parse Slack response JSON")?;
 
         if !parsed.ok {
             let err = parsed.error.unwrap_or_else(|| "unknown error".to_string());
@@ -108,7 +129,11 @@ impl SlackPoster for HttpSlackPoster {
             eyre::bail!("Slack chat.postMessage failed: {}", err);
         }
 
-        debug!("HttpSlackPoster::post: posted to {} ({} chars)", channel, text.len());
+        debug!(
+            "HttpSlackPoster::post: posted to {} ({} chars)",
+            channel,
+            text.len()
+        );
         Ok(())
     }
 }
