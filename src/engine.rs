@@ -185,9 +185,16 @@ async fn sanitize_stages(
     Ok(total_cleaned)
 }
 
+/// A filter paired with the candidate message ids ITS OWN Gmail query returned.
+struct FilterCandidates<'a> {
+    filter: &'a MessageFilter,
+    ids: Vec<String>,
+}
+
 /// Phase 1: ACL-style message filter execution.
-/// Fetches all candidate messages once, then evaluates filters in order.
-/// First matching filter claims the message - it is excluded from further filters.
+/// Each filter's candidate scope is its OWN query; message FETCHES are deduped across
+/// filters, scope is not. Filters are then evaluated in declaration order and the first
+/// matching filter claims the message - it is excluded from further filters.
 async fn execute_message_filters(
     client: &GmailClient,
     filters: &[MessageFilter],
@@ -201,7 +208,9 @@ async fn execute_message_filters(
         dry_run
     );
 
-    // Collect unique candidate IDs across all filters
+    // Each filter keeps the ids its OWN query returned; `all_ids` is only the deduped
+    // union used for the single fetch pass, never a filter's candidate scope.
+    let mut scoped: Vec<FilterCandidates> = Vec::new();
     let mut all_ids: Vec<String> = Vec::new();
     let mut seen_ids: HashSet<String> = HashSet::new();
 
@@ -219,11 +228,12 @@ async fn execute_message_filters(
             filter.name,
             ids.len()
         );
-        for id in ids {
+        for id in &ids {
             if seen_ids.insert(id.clone()) {
-                all_ids.push(id);
+                all_ids.push(id.clone());
             }
         }
+        scoped.push(FilterCandidates { filter, ids });
     }
 
     debug!(
@@ -244,14 +254,61 @@ async fn execute_message_filters(
         messages.insert(id.clone(), msg);
     }
 
-    // ACL evaluation: first matching filter claims each message
-    let mut claimed: HashSet<String> = HashSet::new();
-    let mut total_matched = 0usize;
+    let matched_per_filter = match_message_filters(&scoped, &messages, prefix);
 
-    for filter in filters {
+    let mut total_matched = 0usize;
+    // A matched id is claimed the moment it matches, so the per-filter matched sets are
+    // disjoint and the running sum IS the size of the claimed set.
+    let mut claimed = 0usize;
+
+    for (candidates, matched_ids) in scoped.iter().zip(&matched_per_filter) {
+        let filter = candidates.filter;
+        claimed += matched_ids.len();
+
+        debug!(
+            "{}[filter:{}] {} matched (total claimed: {})",
+            prefix,
+            filter.name,
+            matched_ids.len(),
+            claimed
+        );
+
+        if !matched_ids.is_empty() {
+            total_matched += matched_ids.len();
+            for action in &filter.actions {
+                apply_filter_action(client, matched_ids, action, &filter.name, prefix, dry_run)
+                    .await?;
+            }
+        }
+    }
+
+    Ok(total_matched)
+}
+
+/// Match every filter against the candidates ITS OWN query returned, in declaration
+/// order, first-match-wins across filters. Returns the matched message ids per filter,
+/// parallel to `scoped`. Pure: no Gmail calls and no writes, so the plan is inspectable
+/// and testable before anything is applied.
+///
+/// The Gmail query is an intentional PREFILTER and this matcher is authoritative. Gmail
+/// cannot express `cc: []`, `headers.List-Id: []`, or globset semantics -- it does not
+/// glob at all, so `from:(*@tatari.tv)` returns every unread inbox message by treating
+/// the `*` as noise. So per-filter scope does NOT mean trusting a filter's query to be
+/// precise: every candidate is re-checked against `MessageFilter::matches` here, which is
+/// what makes `matched <= query returned` hold for every filter by construction.
+fn match_message_filters(
+    scoped: &[FilterCandidates<'_>],
+    messages: &HashMap<String, GmailMessage>,
+    prefix: &str,
+) -> Vec<Vec<String>> {
+    let mut claimed: HashSet<String> = HashSet::new();
+    let mut matched_per_filter: Vec<Vec<String>> = Vec::with_capacity(scoped.len());
+
+    for candidates in scoped {
+        let filter = candidates.filter;
         let mut matched_ids: Vec<String> = Vec::new();
 
-        for id in &all_ids {
+        for id in &candidates.ids {
             if claimed.contains(id) {
                 continue;
             }
@@ -285,33 +342,16 @@ async fn execute_message_filters(
                     msg.subject,
                     msg.from.first().map(|s| s.as_str()).unwrap_or("?")
                 );
+                // Claim on match - excluded from every later filter.
+                claimed.insert(id.clone());
                 matched_ids.push(id.clone());
             }
         }
 
-        // Claim matched messages - excluded from further filters
-        for id in &matched_ids {
-            claimed.insert(id.clone());
-        }
-
-        debug!(
-            "{}[filter:{}] {} matched (total claimed: {})",
-            prefix,
-            filter.name,
-            matched_ids.len(),
-            claimed.len()
-        );
-
-        if !matched_ids.is_empty() {
-            total_matched += matched_ids.len();
-            for action in &filter.actions {
-                apply_filter_action(client, &matched_ids, action, &filter.name, prefix, dry_run)
-                    .await?;
-            }
-        }
+        matched_per_filter.push(matched_ids);
     }
 
-    Ok(total_matched)
+    matched_per_filter
 }
 
 async fn apply_filter_action(
@@ -603,7 +643,130 @@ fn build_active_threads_query(state_filters: &[StateFilter]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfg::filter::{AddressFilter, LabelsFilter};
     use crate::cfg::state::{StateAction, Ttl};
+    use chrono::DateTime;
+
+    fn from_filter(name: &str, patterns: &[&str]) -> MessageFilter {
+        MessageFilter {
+            name: name.to_string(),
+            to: None,
+            cc: None,
+            from: Some(AddressFilter {
+                patterns: patterns.iter().map(|p| p.to_string()).collect(),
+            }),
+            subject: vec![],
+            labels: LabelsFilter::default(),
+            headers: HashMap::new(),
+            actions: vec![FilterAction::Star],
+        }
+    }
+
+    fn message(id: &str, from: &str, label_ids: &[&str]) -> GmailMessage {
+        GmailMessage {
+            id: id.to_string(),
+            thread_id: format!("thread-{}", id),
+            label_ids: label_ids.iter().map(|l| l.to_string()).collect(),
+            internal_date: DateTime::UNIX_EPOCH,
+            headers: HashMap::new(),
+            to: vec!["scott@example.com".to_string()],
+            cc: vec![],
+            from: vec![from.to_string()],
+            subject: format!("subject {}", id),
+        }
+    }
+
+    fn unread(id: &str, from: &str) -> GmailMessage {
+        message(id, from, &["INBOX", "UNREAD"])
+    }
+
+    fn message_map(msgs: Vec<GmailMessage>) -> HashMap<String, GmailMessage> {
+        msgs.into_iter().map(|m| (m.id.clone(), m)).collect()
+    }
+
+    /// Per-filter scope: two filters whose queries returned DISJOINT id sets, where each
+    /// filter's criteria would happily match the other's message. Neither may touch the
+    /// other's candidates. This is the pooled-candidates defect, pinned.
+    #[test]
+    fn test_scope_isolation_filters_never_match_another_filters_candidates() {
+        let alpha = from_filter("alpha", &["*@example.com"]);
+        let beta = from_filter("beta", &["*@example.com"]);
+
+        let messages = message_map(vec![
+            unread("id-alpha", "alice@example.com"),
+            unread("id-beta", "bob@example.com"),
+        ]);
+
+        let scoped = vec![
+            FilterCandidates {
+                filter: &alpha,
+                ids: vec!["id-alpha".to_string()],
+            },
+            FilterCandidates {
+                filter: &beta,
+                ids: vec!["id-beta".to_string()],
+            },
+        ];
+
+        let matched = match_message_filters(&scoped, &messages, "");
+
+        assert_eq!(matched, vec![vec!["id-alpha"], vec!["id-beta"]]);
+    }
+
+    /// `claimed` still spans filters: an id in BOTH queries goes to the first filter only.
+    #[test]
+    fn test_first_match_wins_still_spans_filters() {
+        let alpha = from_filter("alpha", &["*@example.com"]);
+        let beta = from_filter("beta", &["*@example.com"]);
+
+        let messages = message_map(vec![
+            unread("shared", "alice@example.com"),
+            unread("id-beta", "bob@example.com"),
+        ]);
+
+        let scoped = vec![
+            FilterCandidates {
+                filter: &alpha,
+                ids: vec!["shared".to_string()],
+            },
+            FilterCandidates {
+                filter: &beta,
+                ids: vec!["shared".to_string(), "id-beta".to_string()],
+            },
+        ];
+
+        let matched = match_message_filters(&scoped, &messages, "");
+
+        assert_eq!(matched, vec![vec!["shared"], vec!["id-beta"]]);
+    }
+
+    /// The query is a prefilter, so candidates get dropped here: a read message, one
+    /// failing the glob Gmail could not enforce, and one never fetched.
+    #[test]
+    fn test_matched_is_a_subset_of_the_filters_own_candidates() {
+        let filter = from_filter("only-example", &["*@example.com"]);
+
+        let messages = message_map(vec![
+            unread("keep", "alice@example.com"),
+            message("read", "bob@example.com", &["INBOX"]),
+            unread("other-domain", "carol@other.test"),
+        ]);
+
+        let scoped = vec![FilterCandidates {
+            filter: &filter,
+            ids: vec![
+                "keep".to_string(),
+                "read".to_string(),
+                "other-domain".to_string(),
+                "never-fetched".to_string(),
+            ],
+        }];
+
+        let matched = match_message_filters(&scoped, &messages, "");
+
+        assert_eq!(matched, vec![vec!["keep"]]);
+        assert!(matched[0].len() <= scoped[0].ids.len());
+    }
 
     #[test]
     fn test_build_active_threads_query() {
