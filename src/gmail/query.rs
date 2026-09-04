@@ -1,11 +1,23 @@
 use crate::cfg::filter::MessageFilter;
 
+fn join_patterns(patterns: &[String]) -> String {
+    patterns
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub fn compile_query(filter: &MessageFilter) -> String {
     let mut parts = Vec::new();
 
+    // Multiple patterns compile to a single Gmail brace-OR term (`field:{a b}`),
+    // never one `field:(...)` term per pattern joined by AND-at-top-level space.
     if let Some(ref af) = filter.to {
-        for pat in &af.patterns {
-            parts.push(format!("to:{}", pat));
+        if af.patterns.len() == 1 {
+            parts.push(format!("to:{}", af.patterns[0]));
+        } else if af.patterns.len() > 1 {
+            parts.push(format!("to:{{{}}}", join_patterns(&af.patterns)));
         }
     }
 
@@ -13,13 +25,7 @@ pub fn compile_query(filter: &MessageFilter) -> String {
         if af.patterns.len() == 1 {
             parts.push(format!("from:({})", af.patterns[0]));
         } else if af.patterns.len() > 1 {
-            let joined = af
-                .patterns
-                .iter()
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            parts.push(format!("from:({})", joined));
+            parts.push(format!("from:{{{}}}", join_patterns(&af.patterns)));
         }
     }
 
@@ -115,6 +121,51 @@ mod tests {
 
         let query = compile_query(&filter);
         assert_eq!(query, "subject:(urgent) is:unread");
+    }
+
+    #[test]
+    fn test_compile_multi_pattern_from_is_brace_or() {
+        let filter = MessageFilter {
+            name: "leadership".to_string(),
+            to: None,
+            cc: None,
+            from: Some(AddressFilter {
+                patterns: vec![
+                    "philip@tatari.tv".to_string(),
+                    "mark.weiler@tatari.tv".to_string(),
+                ],
+            }),
+            subject: vec![],
+            labels: LabelsFilter::default(),
+            headers: HashMap::new(),
+            actions: vec![FilterAction::Star],
+        };
+
+        let query = compile_query(&filter);
+        assert!(query.contains("from:{philip@tatari.tv mark.weiler@tatari.tv}"));
+        // Never one from:(...) term per pattern set joined by AND-space.
+        assert!(!query.contains("from:(philip@tatari.tv mark.weiler@tatari.tv)"));
+    }
+
+    #[test]
+    fn test_compile_multi_pattern_to_is_single_brace_or_term() {
+        let filter = MessageFilter {
+            name: "test".to_string(),
+            to: Some(AddressFilter {
+                patterns: vec!["a@example.com".to_string(), "b@example.com".to_string()],
+            }),
+            cc: None,
+            from: None,
+            subject: vec![],
+            labels: LabelsFilter::default(),
+            headers: HashMap::new(),
+            actions: vec![FilterAction::Star],
+        };
+
+        let query = compile_query(&filter);
+        // Exactly one to: term, not two ANDed to: terms.
+        assert_eq!(query.matches("to:").count(), 1);
+        assert!(query.contains("to:{a@example.com b@example.com}"));
     }
 
     #[test]
