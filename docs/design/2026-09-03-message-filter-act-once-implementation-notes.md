@@ -348,3 +348,48 @@ None.
 
 ### Open questions
 - None.
+
+## Orchestration notes (team-lead)
+
+Appended after Phase 5 by the orchestrating session, per the append-only rule.
+
+### Design decisions
+- **`run --mark-only` does NOT run `sanitize_stages` or the state-filter stage.**
+  Phase 5 raised this as a judgment call because the doc does not say either way.
+  Decided here, not left open: the doc's Phase 5 bullet says `--mark-only` must
+  "apply NO actions", and the state-filter stage issues real `modify_thread` and
+  `trash_thread` writes (`src/engine.rs`). Running it under a flag advertised as
+  action-free would contradict that bullet and break the phase's own success
+  criterion of zero modifications. The doc's "reuses ... the whole matching path"
+  is about the message-filter matching path, which is the only path the marker
+  concerns. Recorded as decided so a later reader does not reopen it.
+- **The pre-existing `otto ci` failure was split out of Phase 1.** `otto ci` was
+  already red at baseline `278af89` on clippy's `useless_borrows_in_formatting`
+  (`src/main.rs:64`, a redundant `&name`), unrelated to this design doc. Landed
+  alone as `a1a37c8` with no phase trailer, so each phase commit walks cleanly
+  against the doc's bullets during an implementation audit.
+
+### Deviations
+- None beyond those recorded per phase.
+
+### Tradeoffs
+- Phases were implemented by one delegated agent each, at the model annotated in
+  the doc, rather than inline in one context. Cost: two phase reports arrived
+  truncated and had to be re-requested, and one required a mid-flight correction
+  (Phase 5 was initially briefed that mark-only could be built by filtering
+  `plan_filter_writes` output; it cannot, because a filter with a `Move` carries
+  the marker inside that write's add-list, so filtering would have archived the
+  `bots` candidates). Benefit: per-phase model tags were honored and each phase
+  was implemented against a clean context.
+
+### Open questions
+- Phase 4's open question stands and is unresolved: `marker-label` is validated
+  against state filters only, so a marker equal to a MESSAGE-filter `Move`
+  destination (`marker-label: Bots`) still loads. Out of scope for the phases as
+  written; no config does it today.
+- Three acceptance criteria are LIVE-ONLY and remain unverified until the rollout
+  steps run against the real mailbox with the timer stopped: per-filter
+  `matched <= query returned` in a debug run (step 3), `Done: 0` on the second of
+  two consecutive runs (step 5), and pin removal surviving two timer intervals on
+  both the `Star` and `Flag` arms (step 6). Each has unit coverage standing in for
+  it; none has been observed live.
