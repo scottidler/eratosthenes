@@ -8,7 +8,14 @@ fn join_patterns(patterns: &[String]) -> String {
         .join(" ")
 }
 
-pub fn compile_query(filter: &MessageFilter) -> String {
+/// Compile one message filter to a Gmail search query. `marker` is the account's marker
+/// label (`marker-label`); every compiled query excludes it, so a message a filter has
+/// already HANDLED is never fetched again. Pass `""` to omit the exclusion (tests only).
+///
+/// `-label:<marker>` is sound here where a thread-level negation would not be: this query
+/// goes to `users.messages.list`, so predicate and returned unit are both message-level
+/// and there is no existential projection.
+pub fn compile_query(filter: &MessageFilter, marker: &str) -> String {
     let mut parts = Vec::new();
 
     // Multiple patterns compile to a single Gmail brace-OR term (`field:{a b}`),
@@ -42,8 +49,17 @@ pub fn compile_query(filter: &MessageFilter) -> String {
         }
     }
 
-    // Only match unread messages - prevents re-labeling read emails
+    // An empty filter compiles to an empty query and the caller skips it, so neither the
+    // marker exclusion nor the read scope is worth emitting on its own.
     if !parts.is_empty() {
+        // Exclude anything a message-filter already HANDLED. This, not `is:unread`, is
+        // what makes acting idempotent.
+        if !marker.is_empty() {
+            parts.push(format!("-label:{}", marker.to_lowercase()));
+        }
+        // SCOPE constraint, not an idempotency guard: it declares that filters act on
+        // unread mail only. Un-starring from the thread list leaves a message UNREAD, so
+        // it does NOT stop re-labeling.
         parts.push("is:unread".to_string());
     }
 
@@ -78,7 +94,7 @@ mod tests {
             actions: vec![FilterAction::Star],
         };
 
-        let query = compile_query(&filter);
+        let query = compile_query(&filter, "Triaged");
         assert!(query.contains("to:scott@example.com"));
         assert!(query.contains("from:(*@example.com)"));
         assert!(query.contains("label:inbox"));
@@ -102,8 +118,8 @@ mod tests {
             actions: vec![FilterAction::Flag],
         };
 
-        let query = compile_query(&filter);
-        assert_eq!(query, "from:(*@company.com) is:unread");
+        let query = compile_query(&filter, "Triaged");
+        assert_eq!(query, "from:(*@company.com) -label:triaged is:unread");
     }
 
     #[test]
@@ -119,8 +135,8 @@ mod tests {
             actions: vec![FilterAction::Flag],
         };
 
-        let query = compile_query(&filter);
-        assert_eq!(query, "subject:(urgent) is:unread");
+        let query = compile_query(&filter, "Triaged");
+        assert_eq!(query, "subject:(urgent) -label:triaged is:unread");
     }
 
     #[test]
@@ -141,7 +157,7 @@ mod tests {
             actions: vec![FilterAction::Star],
         };
 
-        let query = compile_query(&filter);
+        let query = compile_query(&filter, "Triaged");
         assert!(query.contains("from:{philip@tatari.tv mark.weiler@tatari.tv}"));
         // Never one from:(...) term per pattern set joined by AND-space.
         assert!(!query.contains("from:(philip@tatari.tv mark.weiler@tatari.tv)"));
@@ -162,7 +178,7 @@ mod tests {
             actions: vec![FilterAction::Star],
         };
 
-        let query = compile_query(&filter);
+        let query = compile_query(&filter, "Triaged");
         // Exactly one to: term, not two ANDed to: terms.
         assert_eq!(query.matches("to:").count(), 1);
         assert!(query.contains("to:{a@example.com b@example.com}"));
@@ -181,7 +197,48 @@ mod tests {
             actions: vec![FilterAction::Star],
         };
 
-        let query = compile_query(&filter);
+        let query = compile_query(&filter, "Triaged");
         assert!(query.is_empty());
+    }
+
+    /// Every non-empty compiled query excludes the marker, whatever the filter's shape.
+    #[test]
+    fn test_marker_exclusion_present_in_every_compiled_query() {
+        let shapes = vec![
+            ("to-only", Some(vec!["a@example.com"]), None, vec![]),
+            ("from-only", None, Some(vec!["*@example.com"]), vec![]),
+            ("subject-only", None, None, vec!["*urgent*"]),
+            (
+                "combined",
+                Some(vec!["a@example.com", "b@example.com"]),
+                Some(vec!["*@example.com"]),
+                vec!["*urgent*"],
+            ),
+        ];
+
+        for (name, to, from, subject) in shapes {
+            let filter = MessageFilter {
+                name: name.to_string(),
+                to: to.map(|p| AddressFilter {
+                    patterns: p.iter().map(|s| s.to_string()).collect(),
+                }),
+                cc: None,
+                from: from.map(|p| AddressFilter {
+                    patterns: p.iter().map(|s| s.to_string()).collect(),
+                }),
+                subject: subject.iter().map(|s| s.to_string()).collect(),
+                labels: LabelsFilter::default(),
+                headers: HashMap::new(),
+                actions: vec![FilterAction::Star],
+            };
+
+            let query = compile_query(&filter, "Triaged");
+            assert!(
+                query.contains("-label:triaged"),
+                "filter '{}' compiled without the marker exclusion: {}",
+                name,
+                query
+            );
+        }
     }
 }

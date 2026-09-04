@@ -59,22 +59,48 @@ impl LabelResolver {
     }
 }
 
+/// Where a created label shows up in Gmail's UI. Destinations (Bots, Purgatory) are
+/// `Shown`; the marker is `Hidden`, or it puts a chip on nearly every message and a row
+/// in the sidebar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LabelVisibility {
+    Shown,
+    Hidden,
+}
+
+impl LabelVisibility {
+    fn label_list(&self) -> &'static str {
+        match self {
+            LabelVisibility::Shown => "labelShow",
+            LabelVisibility::Hidden => "labelHide",
+        }
+    }
+
+    fn message_list(&self) -> &'static str {
+        match self {
+            LabelVisibility::Shown => "show",
+            LabelVisibility::Hidden => "hide",
+        }
+    }
+}
+
 pub async fn create_label_if_missing(
     hub: &google_gmail1::Gmail<
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     >,
     resolver: &mut LabelResolver,
     name: &str,
+    visibility: LabelVisibility,
 ) -> Result<String> {
     if let Some(id) = resolver.resolve_name(name) {
         return Ok(id.to_string());
     }
 
-    log::info!("Creating missing label: {}", name);
+    log::info!("Creating missing label: {} ({:?})", name, visibility);
     let label = google_gmail1::api::Label {
         name: Some(name.to_string()),
-        label_list_visibility: Some("labelShow".to_string()),
-        message_list_visibility: Some("show".to_string()),
+        label_list_visibility: Some(visibility.label_list().to_string()),
+        message_list_visibility: Some(visibility.message_list().to_string()),
         ..Default::default()
     };
 
@@ -124,6 +150,15 @@ mod tests {
     fn test_unknown_label_returns_none() {
         let resolver = LabelResolver::from_api_labels(vec![]);
         assert_eq!(resolver.resolve_name("NonExistent"), None);
+    }
+
+    /// The marker must be created hidden; destinations stay shown.
+    #[test]
+    fn test_label_visibility_strings() {
+        assert_eq!(LabelVisibility::Shown.label_list(), "labelShow");
+        assert_eq!(LabelVisibility::Shown.message_list(), "show");
+        assert_eq!(LabelVisibility::Hidden.label_list(), "labelHide");
+        assert_eq!(LabelVisibility::Hidden.message_list(), "hide");
     }
 
     #[test]

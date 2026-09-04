@@ -134,3 +134,132 @@ None.
 
 ### Open questions
 None.
+
+## Phase 4: Marker label and act-once
+
+### Design decisions
+- `marker-label` lives on the account root as `Config::marker_label`
+  (`src/cfg/config.rs`), `#[serde(default = "default_marker_label")]` -> `Triaged`,
+  picked up by the struct's existing `rename_all = "kebab-case"`. No dotfiles change.
+- Validation is `Config::validate` (`src/cfg/config.rs`), two named checks:
+  `validate_marker_label` (no state-filter label, no state-filter destination,
+  compared case-INSENSITIVELY and also rejecting an empty/whitespace marker) and
+  `validate_move_position` (count `FilterAction::Move`; reject count > 1; reject
+  count == 1 whose index is not `len - 1`). Both errors name the offending filter
+  and which clause failed.
+- New `pub fn parse_config(&str) -> Result<Config>` (`src/cfg/config.rs`) is
+  parse-THEN-validate; `load_config` is that plus file IO and creds-path
+  resolution. That makes "FAILS to load" assertable in a unit test against the
+  real load path instead of a bare `serde_yaml::from_str`, which would bypass
+  validation entirely.
+- `LabelVisibility { Shown, Hidden }` (`src/gmail/label.rs`) replaces the
+  hardcoded `labelShow`/`show` pair. Chosen over two `&str` parameters so the two
+  strings can never be mismatched at a call site. Destinations are `Shown`; the
+  marker is `Hidden`.
+- `ensure_labels` (`src/engine.rs`) registers the marker LAST, after the
+  destinations, with `LabelVisibility::Hidden`. Its `FilterAction` arm became an
+  exhaustive `match` rather than `if let Move(..)`, so a future action variant that
+  needs a label cannot be silently skipped; `Tag`'s label is registered too.
+- `FilterAction::Tag(String)` (`src/cfg/filter.rs`) plus `parse_action`, which
+  handles ONE action for both the scalar and sequence forms. Bare `Tag` is a loud
+  error naming the mapping form rather than a `Move("Tag")`; bare `Move` likewise.
+  `{Tag: <label>}` and `{Move: <label>}` mappings parse.
+- The write plan is DATA: `PlannedWrite { action, ids, add, remove }` and the pure
+  `plan_filter_writes(filter, matched_ids, messages, thread_labels, resolver,
+  marker) -> Vec<PlannedWrite>` (`src/engine.rs`). `apply_planned_write` is the
+  thin shell that issues one `batch_modify` and logs it. This is what makes "no
+  STARRED add is issued" / "exactly one STARRED add" assertable with no Gmail:
+  every Phase 4 success criterion is asserted against planned writes.
+- Per-action scoping lives in `plan_pin_ids` (`src/engine.rs`), used ONLY by the
+  `Star`/`Flag` arm: skip a thread whose label union already carries the pin, else
+  emit exactly the newest matched message id in that thread (ties keep the first in
+  matched order, so the plan is deterministic). `Move` and user `Tag` take
+  `matched_ids.to_vec()` unchanged.
+- Suppression input is `HashMap<String, HashSet<String>>` thread-id -> label union,
+  filled by `fetch_thread_labels` with one `client.get_thread` per DISTINCT matched
+  thread, cached across filters for the whole run, and only for filters where
+  `pins(filter)` is true.
+- `record_planned_pins` (`src/engine.rs`) folds each filter's planned pins back
+  into that cache before the next filter plans. Not in the doc, and a real hole
+  without it: claiming is per MESSAGE, so two different filters can match two
+  different messages in one thread, and each would have seen a union with no
+  `STARRED` and added its own star -- manufacturing exactly the multi-star threads
+  this phase exists to stop. Runs under `--dry-run` too, so the preview equals what
+  a real run would write.
+- Marker enforcement is doubled: `-label:<marker>` appended in `compile_query`
+  (lowercased, matching the existing `label:` convention) AND
+  `MessageFilter::matches` rejects a message carrying `Label::new(marker)` before
+  any other criterion. `matches` grew a `marker: &str` parameter; `""` disables it
+  for the pre-existing tests that predate the marker.
+- `--dry-run` moved from the top-level `Cli` struct into `Command::Run`
+  (`src/cli.rs`), so clap REJECTS it for every other subcommand instead of
+  accepting and ignoring it. Both user-facing strings reworded to "no message or
+  thread changes; missing labels may be created", which is true given
+  `ensure_labels` runs ahead of the dry-run guard.
+- Both misleading `is:unread` comments corrected in place
+  (`src/gmail/query.rs`, and the read-skip inside `match_message_filters` in
+  `src/engine.rs`): it is a scope constraint, not an idempotency guard.
+
+### Deviations
+- The doc specifies the marker exclusion in `MessageFilter::matches`; implemented
+  there, but as a new `marker: &str` parameter rather than by reading it off the
+  filter, because the marker is account-global config and duplicating it onto every
+  `MessageFilter` would create two sources of truth. Same effect, correct seam.
+- The doc says `compile_query` appends `-label:<marker>`; implemented with the
+  marker as an explicit parameter (`compile_query(filter, marker)`) rather than
+  reaching for a `Config`, keeping the function pure like the rest of that module.
+- `apply_filter_action` is GONE, replaced by `plan_filter_writes` +
+  `apply_planned_write`. The doc's Phase 4 text describes editing the action loop
+  in place ("fold the marker into the `Move` write"); the doc's own Testing
+  Strategy and success criteria require the write set to be inspectable without a
+  live mailbox, and its "Rejected: fold into the last APPLIED action" analysis
+  explicitly names plan-then-write as the restructure that would be needed for a
+  per-message lookahead. This is that restructure, done for testability, WITHOUT
+  adopting the rejected per-message rule: the carrier is still knowable from
+  `filter.actions` alone.
+- `record_planned_pins` has no counterpart in the doc: see Design decisions for
+  why it is required rather than optional.
+- The `Tag` action is expressible in config as `{Tag: <label>}`; the doc says only
+  that `Tag` must not parse as `Move("Tag")` and that "exposing `Tag` in config
+  costs nothing". A bare `Tag` string cannot name a label, so it is a named error
+  instead of a silent Move.
+- Marker collision is validated against STATE filters only, as the doc specifies.
+  A marker colliding with a MESSAGE-filter `Move` destination is not rejected; see
+  Open questions.
+- The two exact-match query tests were updated as the doc predicted
+  (`from:(*@company.com) -label:triaged is:unread`,
+  `subject:(urgent) -label:triaged is:unread`).
+- Phase 4 does NOT assert the live `Done: 0` criterion, per the doc: this phase
+  causes one final re-pin wave until Phase 5 backfills markers.
+
+### Tradeoffs
+- Marker written as its RESOLVED Gmail id (`resolve_label_id`, falling back to the
+  name) rather than plumbing a hard failure when the marker is unregistered. Kept
+  the codebase's existing `unwrap_or(name)` idiom; `ensure_labels` guarantees
+  registration before the message-filter stage, and the fallback is correct for
+  system labels whose id equals their name. A stricter fail-closed variant would
+  have to change the same idiom at four other call sites.
+- Thread unions are keyed by RAW label id, not by `Label`, because
+  `GmailThread::label_ids` already returns raw ids and the two pins the suppression
+  check cares about (`STARRED`, `IMPORTANT`) are system labels whose id equals
+  their name. A resolved-`Label` union would be more uniform and buy nothing here.
+- Suppression state is read ONCE per thread per run, before any write. Cheaper than
+  re-fetching per filter, and `record_planned_pins` keeps it coherent with what
+  this run is about to write; it does NOT see a concurrent external change made
+  mid-run, which a double stamp makes harmless anyway.
+- A filter with matches but NO actions now gets a marker-only write. It claimed the
+  message, so under "marker means HANDLED" it did handle it. The alternative
+  (stamp nothing) would leave the message eligible forever while still being
+  claimed away from later filters every run.
+- Bare `eratosthenes --dry-run` is now a parse error and must be typed
+  `eratosthenes run --dry-run`. The doc accepts this cost explicitly; the smoke
+  test pins both halves (accepted on `run`, rejected on `digest` and
+  `service install`).
+
+### Open questions
+- `marker-label` is validated against state filters only, per the doc's exact
+  wording. A marker equal to a MESSAGE-filter `Move` destination (e.g.
+  `marker-label: Bots`) loads today: it would make that filter's add-list carry the
+  same id twice (harmless) and would exclude every `Bots`-labeled message from
+  every filter (mostly already true via `is:unread`). Worth rejecting for the same
+  fail-loudly reason, but it is not in Phase 4's scope and no config does it.

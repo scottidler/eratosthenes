@@ -44,7 +44,7 @@ fn account_prefix(name: &str, multi: bool) -> String {
     }
 }
 
-async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
+async fn cmd_run(cli: &Cli, names: Vec<String>, dry_run: bool) -> Result<()> {
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
     let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
     let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
@@ -54,7 +54,6 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
     let mut join_set = tokio::task::JoinSet::new();
 
     for account in accounts {
-        let dry_run = cli.dry_run;
         join_set.spawn(async move {
             let name = account.name;
             let config = account.config;
@@ -273,8 +272,10 @@ async fn main() -> Result<()> {
     eratosthenes::init_tls()?;
 
     match &cli.command {
-        None => cmd_run(&cli, Vec::new()).await,
-        Some(Command::Run { accounts }) => cmd_run(&cli, accounts.clone()).await,
+        // Bare `eratosthenes` is still `run`, but WITHOUT --dry-run: the flag now lives
+        // on the `run` subcommand, so a dry run is typed `eratosthenes run --dry-run`.
+        None => cmd_run(&cli, Vec::new(), false).await,
+        Some(Command::Run { accounts, dry_run }) => cmd_run(&cli, accounts.clone(), *dry_run).await,
         Some(Command::Digest { accounts }) => cmd_digest(&cli, accounts.clone()).await,
         Some(Command::Auth(opts)) => match &opts.command {
             AuthCommand::Login { account } => cmd_auth_login(&cli, account.clone()).await,

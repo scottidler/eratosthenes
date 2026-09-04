@@ -6,8 +6,8 @@ use serde_yaml::{Value, from_value};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::cfg::filter::MessageFilter;
-use crate::cfg::state::StateFilter;
+use crate::cfg::filter::{FilterAction, MessageFilter};
+use crate::cfg::state::{StateAction, StateFilter};
 
 /// XDG config dir, honoring `$XDG_CONFIG_HOME` and falling back to `$HOME/.config`.
 pub fn xdg_config_dir() -> Option<PathBuf> {
@@ -104,10 +104,126 @@ pub struct Config {
     /// Optional per-account Slack digest config. `digest` is a no-op if absent.
     #[serde(default)]
     pub slack: Option<SlackConfig>,
+
+    /// Label recording that a message-filter HANDLED a message. Every message-filter
+    /// excludes it, so a handled message is never acted on again. Defaulted, so no
+    /// config change is required to adopt it.
+    #[serde(default = "default_marker_label")]
+    pub marker_label: String,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_marker_label() -> String {
+    "Triaged".to_string()
+}
+
+impl Config {
+    /// Reject configs whose marker or action order the engine cannot honor. Both checks
+    /// fail at LOAD, not at runtime: each one is silent and destructive if it slips
+    /// through to a live mailbox.
+    fn validate(&self) -> Result<()> {
+        self.validate_marker_label()?;
+        self.validate_move_position()?;
+        Ok(())
+    }
+
+    /// The marker must name no state-filter label and no state-filter destination.
+    /// `derive_stages` harvests state Move destinations and `ensure_labels` harvests
+    /// custom names out of state filters' `labels` blocks, so a colliding marker would
+    /// reach `sanitize_stages` and be stripped off the very messages it marks.
+    fn validate_marker_label(&self) -> Result<()> {
+        if self.marker_label.trim().is_empty() {
+            return Err(eyre!("marker-label must not be empty"));
+        }
+
+        for state in &self.state_filters {
+            for label in &state.labels {
+                if label.to_gmail_id().eq_ignore_ascii_case(&self.marker_label) {
+                    return Err(eyre!(
+                        "marker-label '{}' collides with state-filter '{}' label '{}': \
+                         the marker must name no state-filter label and no state-filter \
+                         destination, or stage sanitization strips it",
+                        self.marker_label,
+                        state.name,
+                        label.to_gmail_id()
+                    ));
+                }
+            }
+            if let StateAction::Move(dest) = &state.action
+                && dest.eq_ignore_ascii_case(&self.marker_label)
+            {
+                return Err(eyre!(
+                    "marker-label '{}' collides with state-filter '{}' destination '{}': \
+                     the marker must name no state-filter label and no state-filter \
+                     destination, or stage sanitization strips it",
+                    self.marker_label,
+                    state.name,
+                    dest
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// The marker rides the filter's LAST write, and a `Move` is the only action that
+    /// destroys future eligibility (it strips INBOX and UNREAD), so the marker must fold
+    /// into the `Move` write itself. That is knowable from `filter.actions` alone only
+    /// while every filter has at most one `Move`, in final position.
+    fn validate_move_position(&self) -> Result<()> {
+        for filter in &self.message_filters {
+            let moves: Vec<usize> = filter
+                .actions
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| matches!(a, FilterAction::Move(_)))
+                .map(|(i, _)| i)
+                .collect();
+
+            if moves.len() > 1 {
+                return Err(eyre!(
+                    "message-filter '{}' declares {} Move actions ({:?}); at most one \
+                     Move per filter is allowed, and one message cannot land in two \
+                     destinations",
+                    filter.name,
+                    moves.len(),
+                    filter.actions
+                ));
+            }
+
+            if let Some(&index) = moves.first()
+                && index + 1 != filter.actions.len()
+            {
+                return Err(eyre!(
+                    "message-filter '{}' declares a Move at position {} of {} actions \
+                     ({:?}); a Move must be the LAST action, because the marker folds \
+                     into the Move write and an action after it would be applied to an \
+                     already-archived message",
+                    filter.name,
+                    index + 1,
+                    filter.actions.len(),
+                    filter.actions
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Parse and VALIDATE a config from YAML text. `load_config` is this plus file IO and
+/// creds-path resolution, so a config that parses here loads, and one that fails here
+/// never reaches a mailbox.
+pub fn parse_config(content: &str) -> Result<Config> {
+    let cfg: Config = serde_yaml::from_str(content).map_err(|e| {
+        error!("Failed to parse YAML: {}", e);
+        eyre!("Failed to parse YAML: {}", e)
+    })?;
+    cfg.validate()?;
+    Ok(cfg)
 }
 
 pub fn load_config(config_path: &Path) -> Result<Config> {
@@ -126,10 +242,7 @@ pub fn load_config(config_path: &Path) -> Result<Config> {
         )
     })?;
 
-    let mut cfg: Config = serde_yaml::from_str(&content).map_err(|e| {
-        error!("Failed to parse YAML: {}", e);
-        eyre!("Failed to parse YAML: {}", e)
-    })?;
+    let mut cfg = parse_config(&content)?;
 
     // Resolve relative creds-path against the config file's directory
     let creds_str = cfg.auth.creds_path.to_str().unwrap_or_default();
@@ -369,6 +482,145 @@ slack:
 
         let result: Result<Config, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "missing schedule must be a hard error");
+    }
+
+    #[test]
+    fn test_marker_label_defaults_to_triaged() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+"#;
+
+        let config = parse_config(yaml).unwrap();
+        assert_eq!(config.marker_label, "Triaged");
+    }
+
+    #[test]
+    fn test_marker_label_override() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+marker-label: Handled
+"#;
+
+        let config = parse_config(yaml).unwrap();
+        assert_eq!(config.marker_label, "Handled");
+    }
+
+    /// A marker naming a state-filter DESTINATION would be stripped by stage
+    /// sanitization, silently un-marking every message it marked.
+    #[test]
+    fn test_marker_label_colliding_with_state_destination_fails_to_load() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+marker-label: Oblivion
+state-filters:
+  - Purge:
+      label: Purgatory
+      ttl: 3d
+      action: Oblivion
+"#;
+
+        let err = parse_config(yaml).expect_err("colliding marker must fail to load");
+        let msg = format!("{}", err);
+        assert!(msg.contains("marker-label 'Oblivion'"), "got: {}", msg);
+        assert!(msg.contains("state-filter 'Purge'"), "got: {}", msg);
+        assert!(msg.contains("destination"), "got: {}", msg);
+    }
+
+    /// The other half of the same rule: a state filter's `labels` block, which
+    /// `ensure_labels` also harvests custom names from.
+    #[test]
+    fn test_marker_label_colliding_with_state_label_fails_to_load() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+marker-label: Purgatory
+state-filters:
+  - Purge:
+      label: Purgatory
+      ttl: 3d
+      action: Oblivion
+"#;
+
+        let err = parse_config(yaml).expect_err("colliding marker must fail to load");
+        let msg = format!("{}", err);
+        assert!(msg.contains("marker-label 'Purgatory'"), "got: {}", msg);
+        assert!(msg.contains("label 'Purgatory'"), "got: {}", msg);
+    }
+
+    #[test]
+    fn test_marker_label_not_colliding_loads() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+marker-label: Triaged
+state-filters:
+  - Purge:
+      label: Purgatory
+      ttl: 3d
+      action: Oblivion
+"#;
+
+        let config = parse_config(yaml).unwrap();
+        assert_eq!(config.marker_label, "Triaged");
+    }
+
+    fn filter_yaml(action: &str) -> String {
+        format!(
+            r#"
+auth:
+  creds-path: /tmp/creds
+message-filters:
+  - bots:
+      from: '*@example.com'
+      action: {}
+"#,
+            action
+        )
+    }
+
+    /// The validator's full accept/reject table (design doc, Phase 4).
+    #[test]
+    fn test_move_must_be_the_last_action() {
+        // ACCEPT: one Move, trivially final because it is the only action.
+        let cfg = parse_config(&filter_yaml("Bots")).unwrap();
+        assert_eq!(
+            cfg.message_filters[0].actions,
+            vec![FilterAction::Move("Bots".to_string())]
+        );
+
+        // ACCEPT: no Move at all.
+        assert!(parse_config(&filter_yaml("Star")).is_ok());
+        // ACCEPT: one Move, last.
+        assert!(parse_config(&filter_yaml("[Star, Bots]")).is_ok());
+        // ACCEPT: two pins, no Move, so the constraint does not apply.
+        assert!(parse_config(&filter_yaml("[Star, Flag]")).is_ok());
+
+        // REJECT: Move not last - the orphan case, where a later action fails after the
+        // Move already archived the message.
+        let err =
+            parse_config(&filter_yaml("[Bots, Star]")).expect_err("[Bots, Star] must fail to load");
+        let msg = format!("{}", err);
+        assert!(msg.contains("message-filter 'bots'"), "got: {}", msg);
+        assert!(msg.contains("must be the LAST action"), "got: {}", msg);
+
+        // REJECT: two Moves to the same destination.
+        let err =
+            parse_config(&filter_yaml("[Bots, Bots]")).expect_err("[Bots, Bots] must fail to load");
+        let msg = format!("{}", err);
+        assert!(msg.contains("message-filter 'bots'"), "got: {}", msg);
+        assert!(msg.contains("2 Move actions"), "got: {}", msg);
+
+        // REJECT: two Moves to different destinations.
+        let err = parse_config(&filter_yaml("[Bots, Purgatory]"))
+            .expect_err("[Bots, Purgatory] must fail to load");
+        assert!(
+            format!("{}", err).contains("2 Move actions"),
+            "got: {}",
+            err
+        );
     }
 
     #[test]

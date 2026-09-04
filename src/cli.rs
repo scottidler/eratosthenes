@@ -24,10 +24,6 @@ pub struct Cli {
     /// Log level (error, warn, info, debug, trace)
     #[arg(short, long, global = true)]
     pub log_level: Option<String>,
-
-    /// Dry run - show what would be done without making changes
-    #[arg(long, global = true)]
-    pub dry_run: bool,
 }
 
 #[derive(Subcommand)]
@@ -37,6 +33,15 @@ pub enum Command {
         /// Account(s) to run (default: all discovered)
         #[arg(num_args = 0..)]
         accounts: Vec<String>,
+
+        /// Dry run - no message or thread changes; missing labels may be created
+        ///
+        /// Lives on `run`, not on the top-level command: `run` is the only subcommand
+        /// that honors it, and a top-level flag would be ACCEPTED and silently ignored
+        /// by `digest` (which posts to Slack) and `service install` (which writes unit
+        /// files and calls systemctl).
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Post the pinned-inbox (Starred + Important) digest to Slack
