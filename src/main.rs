@@ -61,7 +61,7 @@ async fn cmd_run(cli: &Cli, names: Vec<String>) -> Result<()> {
             logging::ACCOUNT
                 .scope(name.clone(), async move {
                     let prefix = account_prefix(&name, multi);
-                    info!("{}Starting account '{}'", prefix, &name);
+                    info!("{}Starting account '{}'", prefix, name);
                     let result = eratosthenes::run(&name, &config, dry_run, multi).await;
                     (name, result)
                 })
