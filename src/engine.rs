@@ -8,7 +8,7 @@ use crate::cfg::filter::{FilterAction, MessageFilter};
 use crate::cfg::label::Label;
 use crate::cfg::state::{Clock, StateAction, StateFilter, Ttl};
 use crate::gmail::client::GmailClient;
-use crate::gmail::label::create_label_if_missing;
+use crate::gmail::label::{LabelResolver, create_label_if_missing};
 use crate::gmail::message::{GmailMessage, GmailThread};
 use crate::gmail::query::compile_query;
 
@@ -254,7 +254,7 @@ async fn execute_message_filters(
         messages.insert(id.clone(), msg);
     }
 
-    let matched_per_filter = match_message_filters(&scoped, &messages, prefix);
+    let matched_per_filter = match_message_filters(&scoped, &messages, &client.resolver, prefix);
 
     let mut total_matched = 0usize;
     // A matched id is claimed the moment it matches, so the per-filter matched sets are
@@ -288,7 +288,8 @@ async fn execute_message_filters(
 /// Match every filter against the candidates ITS OWN query returned, in declaration
 /// order, first-match-wins across filters. Returns the matched message ids per filter,
 /// parallel to `scoped`. Pure: no Gmail calls and no writes, so the plan is inspectable
-/// and testable before anything is applied.
+/// and testable before anything is applied. Takes the `LabelResolver` as a plain
+/// parameter (not a `GmailClient`) so the function stays pure and injectable.
 ///
 /// The Gmail query is an intentional PREFILTER and this matcher is authoritative. Gmail
 /// cannot express `cc: []`, `headers.List-Id: []`, or globset semantics -- it does not
@@ -299,6 +300,7 @@ async fn execute_message_filters(
 fn match_message_filters(
     scoped: &[FilterCandidates<'_>],
     messages: &HashMap<String, GmailMessage>,
+    resolver: &LabelResolver,
     prefix: &str,
 ) -> Vec<Vec<String>> {
     let mut claimed: HashSet<String> = HashSet::new();
@@ -320,7 +322,7 @@ fn match_message_filters(
                 trace!("{}[filter:{}] skipping {} (read)", prefix, filter.name, id);
                 continue;
             }
-            let labels = msg.labels();
+            let labels = msg.labels_resolved(resolver);
             trace!(
                 "{}[filter:{}] checking {} to={:?} cc={:?} from={:?}",
                 prefix, filter.name, id, msg.to, msg.cc, msg.from
@@ -684,6 +686,12 @@ mod tests {
         msgs.into_iter().map(|m| (m.id.clone(), m)).collect()
     }
 
+    /// A resolver with no custom labels registered, for tests that don't exercise
+    /// label resolution.
+    fn empty_resolver() -> LabelResolver {
+        LabelResolver::from_api_labels(vec![])
+    }
+
     /// Per-filter scope: two filters whose queries returned DISJOINT id sets, where each
     /// filter's criteria would happily match the other's message. Neither may touch the
     /// other's candidates. This is the pooled-candidates defect, pinned.
@@ -708,7 +716,7 @@ mod tests {
             },
         ];
 
-        let matched = match_message_filters(&scoped, &messages, "");
+        let matched = match_message_filters(&scoped, &messages, &empty_resolver(), "");
 
         assert_eq!(matched, vec![vec!["id-alpha"], vec!["id-beta"]]);
     }
@@ -735,7 +743,7 @@ mod tests {
             },
         ];
 
-        let matched = match_message_filters(&scoped, &messages, "");
+        let matched = match_message_filters(&scoped, &messages, &empty_resolver(), "");
 
         assert_eq!(matched, vec![vec!["shared"], vec!["id-beta"]]);
     }
@@ -762,10 +770,41 @@ mod tests {
             ],
         }];
 
-        let matched = match_message_filters(&scoped, &messages, "");
+        let matched = match_message_filters(&scoped, &messages, &empty_resolver(), "");
 
         assert_eq!(matched, vec![vec!["keep"]]);
         assert!(matched[0].len() <= scoped[0].ids.len());
+    }
+
+    /// Design doc 2026-09-03, Phase 3 defect #4: a custom label arrives from Gmail as a
+    /// raw id (`Label_60`), not its name (`Oblivion`). A `labels.excluded: [Oblivion]`
+    /// filter must resolve that id before comparing, or the exclusion is a silent no-op.
+    #[test]
+    fn test_labels_excluded_matches_resolved_custom_label_name() {
+        let mut filter = from_filter("excludes-oblivion", &["*@example.com"]);
+        filter.labels = LabelsFilter {
+            included: vec![],
+            excluded: vec![Label::Custom("Oblivion".to_string())],
+        };
+
+        let mut msg = unread("id-1", "alice@example.com");
+        msg.label_ids.push("Label_60".to_string());
+        let messages = message_map(vec![msg]);
+
+        let resolver = LabelResolver::from_api_labels(vec![google_gmail1::api::Label {
+            id: Some("Label_60".to_string()),
+            name: Some("Oblivion".to_string()),
+            ..Default::default()
+        }]);
+
+        let scoped = vec![FilterCandidates {
+            filter: &filter,
+            ids: vec!["id-1".to_string()],
+        }];
+
+        let matched = match_message_filters(&scoped, &messages, &resolver, "");
+
+        assert_eq!(matched, vec![Vec::<String>::new()]);
     }
 
     #[test]

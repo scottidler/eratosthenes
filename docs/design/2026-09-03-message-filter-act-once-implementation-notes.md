@@ -95,3 +95,42 @@ None.
 
 ### Open questions
 None.
+
+## Phase 3: Resolve custom labels in message-filters
+
+### Design decisions
+- Added `GmailMessage::labels_resolved(&LabelResolver) -> Vec<Label>`
+  (`src/gmail/message.rs`), byte-for-byte the same shape as
+  `GmailThread::labels_resolved`: map each raw `label_ids` entry through
+  `resolver.resolve_id`, falling back to the raw id when the resolver has no name for
+  it (covers system labels like `STARRED`/`UNREAD`, whose id already equals their name).
+- `match_message_filters` (`src/engine.rs`) takes `resolver: &LabelResolver` as a new
+  parameter and calls `msg.labels_resolved(resolver)` in place of `msg.labels()` at the
+  one call site. `execute_message_filters` passes `&client.resolver` in, so the pure
+  matcher stays free of `GmailClient` and any async/Gmail dependency, per the team-lead's
+  explicit instruction, while the resolver that's already loaded before the message-
+  filter stage runs (`ensure_labels`, `src/engine.rs:33`) reaches the comparison.
+- Added `empty_resolver()` test helper (`LabelResolver::from_api_labels(vec![])`) so the
+  three pre-existing `match_message_filters` tests, which don't exercise label
+  resolution, only need a no-op resolver rather than constructing real label data.
+
+### Deviations
+- The doc names the call site as `src/engine.rs:266`; by the time this phase started
+  (after Phase 2's extraction into `match_message_filters`) it was at line 323, per the
+  team-lead's task message. Same seam, different line number after Phase 2's refactor;
+  fixed at its current location, not the stale one.
+- The doc says "`client.resolver` is already in scope" at the call site, true on `main`
+  but not true after Phase 2: the call site now lives inside the pure
+  `match_message_filters`, which has no `client`. Threaded `&LabelResolver` in as an
+  explicit parameter from `execute_message_filters` instead, keeping the function pure
+  and injectable rather than reaching for a client inside it. Same effect, correct seam.
+
+### Tradeoffs
+- Passed `&LabelResolver` rather than the whole `&GmailClient` into
+  `match_message_filters`, even though `execute_message_filters` already has a
+  `&GmailClient` on hand. Narrower parameter, and keeps the pure matcher's dependency
+  surface limited to exactly what it uses, matching Phase 2's stated goal of a testable,
+  client-free match plan.
+
+### Open questions
+None.

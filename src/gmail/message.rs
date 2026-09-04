@@ -51,6 +51,13 @@ impl GmailMessage {
         self.label_ids.iter().map(|id| Label::new(id)).collect()
     }
 
+    pub fn labels_resolved(&self, resolver: &LabelResolver) -> Vec<Label> {
+        self.label_ids
+            .iter()
+            .map(|id| Label::new(resolver.resolve_id(id).unwrap_or(id.as_str())))
+            .collect()
+    }
+
     pub fn is_read(&self) -> bool {
         !self.label_ids.iter().any(|l| l == "UNREAD")
     }
