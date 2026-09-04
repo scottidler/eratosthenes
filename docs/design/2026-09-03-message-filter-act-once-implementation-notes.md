@@ -263,3 +263,88 @@ None.
   same id twice (harmless) and would exclude every `Bots`-labeled message from
   every filter (mostly already true via `is:unread`). Worth rejecting for the same
   fail-loudly reason, but it is not in Phase 4's scope and no config does it.
+
+## Phase 5: Marker backfill mode, example config, README
+
+### Design decisions
+- `--mark-only` is a new field on `Command::Run` (`src/cli.rs`), alongside `dry_run`,
+  threaded through `cmd_run` (`src/main.rs`) -> `eratosthenes::run`
+  (`src/lib.rs`) -> `engine::execute` (`src/engine.rs`) as a plain `bool`, mirroring
+  the existing `dry_run` plumbing exactly. Bare `eratosthenes` (no subcommand) is
+  unaffected: it still calls `cmd_run` with both flags `false`.
+- `engine::execute` branches on `mark_only` FIRST, before the dry-run banner: when
+  true it logs a distinct `=== MARK-ONLY: ... ===` banner, calls `ensure_labels`
+  (the marker must be registered before anything can fold its id into an add-list,
+  same ordering requirement as a normal run), calls `execute_message_filters` with
+  `mark_only=true`, logs a `Done: N messages marked (mark-only)` line, and
+  `return`s -- Phase 0 (`sanitize_stages`) and Phase 2 (state filters) never run.
+  Chosen because the doc's own wording is "reuses account discovery and the
+  matching path"; sanitize_stages and state-filter age-off are unrelated to the
+  marker and mutate the mailbox in ways a one-shot backfill tool has no business
+  doing.
+- `dry_run` still threads through into mark-only mode (`execute_message_filters`'s
+  `dry_run` parameter is orthogonal to `mark_only`), so `run --dry-run --mark-only`
+  previews exactly what would be stamped with zero Gmail writes, using the same
+  seam the normal dry-run path already uses.
+- Implemented at the PLAN level, per the team-lead's direction: `plan_filter_writes`
+  (`src/engine.rs`) grew a `mark_only: bool` parameter and, when true, returns
+  early with exactly ONE `PlannedWrite { action: Tag(marker), ids: matched_ids
+  (the FULL handled set), add: [marker_id], remove: [] }` before any of the
+  existing Star/Flag/Move/fold logic runs. No pin write, no `Move` write, and
+  critically no `INBOX`/`UNREAD` removal, because in mark-only mode nothing
+  destroys eligibility, so the marker must not carry a removal either -- doing so
+  would archive the `bots` candidates, which the doc calls out as a serious
+  defect. This is what makes "issues ZERO STARRED/IMPORTANT/Move modifications"
+  assertable on the plan alone, exactly as Phase 4's tests already do.
+- `execute_message_filters` skips `fetch_thread_labels` when `mark_only` (no
+  suppression check is ever consulted in mark-only mode, so the `threads.get`
+  round trip buys nothing) and calls `plan_filter_writes(..., mark_only)`.
+  `record_planned_pins` is still called unconditionally: it is a no-op for
+  mark-only's `Tag`-only writes (it only folds `Star`/`Flag` adds), so branching
+  around it would add a condition for zero behavior change.
+- New `log_mark_only_stamps(ids, messages, prefix) -> usize` (`src/engine.rs`)
+  logs exactly one INFO line per id (`[mark-only] stamped <id> date=... from=...
+  subject=...`) and returns the count actually logged. Called from
+  `execute_message_filters`'s write-application loop, once per planned write,
+  before `apply_planned_write` issues it. Returning the count (rather than `()`)
+  makes "stamps N messages while logging exactly N lines" a directly assertable
+  unit-test property instead of a log-capture exercise: no log-capturing
+  infrastructure exists anywhere in this codebase, so per-call-count is the
+  testable analog of per-message-count logging.
+- `apply_planned_write` grew a `mark_only: bool` parameter whose only effect is to
+  suppress the pre-existing aggregate `"[filter:{}] tagging {} messages with
+  {}"` INFO line for the `Tag` arm when `mark_only` is true: the per-message
+  lines from `log_mark_only_stamps` already logged the same information at
+  message granularity, so the aggregate line would be a paired-log
+  discrepancy (N lines claiming to be N, plus one more) rather than a clean
+  match against the success criterion.
+- `eratosthenes.example.yml` gained a `marker-label` block explaining default,
+  purpose, the state-filter-collision constraint, and the Gmail-UI reset
+  mechanism, placed before `message-filters:` since the marker is what those
+  filters exclude. `README.md` gained a "Message filters act once" section:
+  what the marker does, how to override/reset it, and the exact 5-command
+  rollout sequence (stop timer, dry-run sanity check, `run --mark-only`, a
+  normal run, restart timer) lifted from the doc's own Rollout Plan.
+
+### Deviations
+- None. The plan-level collapse in `plan_filter_writes` is the "correct seam" the
+  team-lead's task message itself specified, not a deviation from it.
+
+### Tradeoffs
+- `log_mark_only_stamps` is called from inside the write-application loop
+  (per-write, per-filter) rather than once at the end over a globally
+  deduplicated set. Since `claimed` already makes each filter's `matched_ids`
+  disjoint (Phase 2), and mark-only always emits exactly one write per filter
+  covering that filter's own `matched_ids`, this is equivalent to a single
+  end-of-run pass with no duplicate ids possible across filters -- simpler to
+  call it at the existing per-write seam than to plumb a second accumulator
+  through the whole function.
+- Suppressing the aggregate `Tag` log line only in `mark_only` mode (not always)
+  keeps the normal-run log shape for a user-configured `Tag` action unchanged
+  from Phase 4, at the cost of one extra `bool` threaded into
+  `apply_planned_write`. The alternative (always suppress it for `Tag`) would
+  silently change a normal run's existing log output for a case Phase 5 was not
+  asked to touch.
+
+### Open questions
+- None.

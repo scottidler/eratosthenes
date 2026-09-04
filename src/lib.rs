@@ -50,7 +50,13 @@ async fn build_gmail_client(config: &Config, prefix: &str) -> Result<gmail::clie
         .context("Failed to initialize Gmail client")
 }
 
-pub async fn run(account: &str, config: &Config, dry_run: bool, multi: bool) -> Result<()> {
+pub async fn run(
+    account: &str,
+    config: &Config,
+    dry_run: bool,
+    mark_only: bool,
+    multi: bool,
+) -> Result<()> {
     let prefix = if multi {
         format!("[{}] ", account)
     } else {
@@ -74,7 +80,7 @@ pub async fn run(account: &str, config: &Config, dry_run: bool, multi: bool) -> 
     }
     client.set_metadata_headers(metadata_headers);
 
-    engine::execute(&mut client, config, &prefix, dry_run).await
+    engine::execute(&mut client, config, &prefix, dry_run, mark_only).await
 }
 
 /// Build and post the pinned-inbox digest for one account. The caller only

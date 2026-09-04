@@ -44,7 +44,7 @@ fn account_prefix(name: &str, multi: bool) -> String {
     }
 }
 
-async fn cmd_run(cli: &Cli, names: Vec<String>, dry_run: bool) -> Result<()> {
+async fn cmd_run(cli: &Cli, names: Vec<String>, dry_run: bool, mark_only: bool) -> Result<()> {
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
     let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
     let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
@@ -61,7 +61,7 @@ async fn cmd_run(cli: &Cli, names: Vec<String>, dry_run: bool) -> Result<()> {
                 .scope(name.clone(), async move {
                     let prefix = account_prefix(&name, multi);
                     info!("{}Starting account '{}'", prefix, name);
-                    let result = eratosthenes::run(&name, &config, dry_run, multi).await;
+                    let result = eratosthenes::run(&name, &config, dry_run, mark_only, multi).await;
                     (name, result)
                 })
                 .await
@@ -274,8 +274,12 @@ async fn main() -> Result<()> {
     match &cli.command {
         // Bare `eratosthenes` is still `run`, but WITHOUT --dry-run: the flag now lives
         // on the `run` subcommand, so a dry run is typed `eratosthenes run --dry-run`.
-        None => cmd_run(&cli, Vec::new(), false).await,
-        Some(Command::Run { accounts, dry_run }) => cmd_run(&cli, accounts.clone(), *dry_run).await,
+        None => cmd_run(&cli, Vec::new(), false, false).await,
+        Some(Command::Run {
+            accounts,
+            dry_run,
+            mark_only,
+        }) => cmd_run(&cli, accounts.clone(), *dry_run, *mark_only).await,
         Some(Command::Digest { accounts }) => cmd_digest(&cli, accounts.clone()).await,
         Some(Command::Auth(opts)) => match &opts.command {
             AuthCommand::Login { account } => cmd_auth_login(&cli, account.clone()).await,

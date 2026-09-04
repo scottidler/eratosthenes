@@ -94,3 +94,29 @@ fn dry_run_help_admits_label_creation() {
         stdout
     );
 }
+
+/// `--mark-only` is a MODE of `run`, not a new subcommand: it must be accepted there
+/// and nowhere else.
+#[test]
+fn mark_only_is_a_run_flag_not_a_subcommand() {
+    let bin = env!("CARGO_BIN_EXE_eratosthenes");
+
+    let accepted = Command::new(bin)
+        .args(["run", "--mark-only", "--help"])
+        .output()
+        .expect("failed to run eratosthenes binary");
+    assert!(
+        accepted.status.success(),
+        "run --mark-only must parse, got:\n{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+
+    let rejected = Command::new(bin)
+        .args(["digest", "--mark-only"])
+        .output()
+        .expect("failed to run eratosthenes binary");
+    assert!(
+        !rejected.status.success(),
+        "digest --mark-only must be REJECTED, mark-only is run-only"
+    );
+}

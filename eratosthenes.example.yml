@@ -51,6 +51,16 @@ slack:
   #   *-*-* 09:00:00       - every day at 9am
   schedule: Mon,Thu 07:00:00
 
+# ---- marker-label (OPTIONAL) -----------------------------------------------
+# The label a message-filter stamps on every message it HANDLES (whether or not
+# the action changed anything), so unstarring/un-flagging it later STICKS: the
+# marker excludes the message from every filter forever after. Defaults to
+# `Triaged` if omitted, so no config change is required to adopt it. Must not
+# name any state-filter label or destination (Purgatory/Oblivion/etc. below),
+# or stage sanitization would strip it right back off. To reset (re-consider
+# every message from scratch), delete this label in the Gmail UI by hand.
+# marker-label: Triaged
+
 # ---- message-filters -------------------------------------------------------
 # Applied to INCOMING messages as they are classified. Each entry is keyed by a
 # unique name; ALL of its conditions must match (logical AND); first match wins.

@@ -17,14 +17,44 @@ pub async fn execute(
     config: &Config,
     prefix: &str,
     dry_run: bool,
+    mark_only: bool,
 ) -> Result<()> {
     debug!(
-        "{}execute: dry_run={}, message_filters={}, state_filters={}",
+        "{}execute: dry_run={}, mark_only={}, message_filters={}, state_filters={}",
         prefix,
         dry_run,
+        mark_only,
         config.message_filters.len(),
         config.state_filters.len()
     );
+
+    if mark_only {
+        // One-shot backfill mode, not a permanent verb: reuses account discovery and
+        // the message-filter matching path, stamps the marker on every message a
+        // normal run would HANDLE, and applies no Star/Flag/Move. Stage sanitization
+        // and state filters are unrelated to the marker and do not run here.
+        info!(
+            "{}=== MARK-ONLY: stamping marker on handled messages, no actions applied ===",
+            prefix
+        );
+        ensure_labels(client, config).await?;
+        let total_marked = execute_message_filters(
+            client,
+            &config.message_filters,
+            &config.marker_label,
+            prefix,
+            dry_run,
+            mark_only,
+        )
+        .await?;
+        info!(
+            "{}Done: {} messages marked (mark-only){}",
+            prefix,
+            total_marked,
+            if dry_run { " (dry run)" } else { "" }
+        );
+        return Ok(());
+    }
 
     if dry_run {
         // Truthful, because `ensure_labels` below is NOT behind the dry-run guard:
@@ -53,6 +83,7 @@ pub async fn execute(
         &config.marker_label,
         prefix,
         dry_run,
+        mark_only,
     )
     .await?;
 
@@ -228,13 +259,15 @@ async fn execute_message_filters(
     marker: &str,
     prefix: &str,
     dry_run: bool,
+    mark_only: bool,
 ) -> Result<usize> {
     debug!(
-        "{}execute_message_filters: count={}, marker={}, dry_run={}",
+        "{}execute_message_filters: count={}, marker={}, dry_run={}, mark_only={}",
         prefix,
         filters.len(),
         marker,
-        dry_run
+        dry_run,
+        mark_only
     );
 
     // Each filter keeps the ids its OWN query returned; `all_ids` is only the deduped
@@ -311,7 +344,9 @@ async fn execute_message_filters(
         }
         total_matched += matched_ids.len();
 
-        if pins(filter) {
+        // Mark-only never pins and never suppresses, so the suppression check's
+        // `threads.get` round trip buys it nothing -- skip it.
+        if !mark_only && pins(filter) {
             fetch_thread_labels(client, matched_ids, &messages, &mut thread_labels, prefix).await?;
         }
 
@@ -322,6 +357,7 @@ async fn execute_message_filters(
             &thread_labels,
             &client.resolver,
             marker,
+            mark_only,
         );
         debug!(
             "{}[filter:{}] {} planned writes",
@@ -333,11 +369,18 @@ async fn execute_message_filters(
         // filters can match two DIFFERENT messages in one thread (claiming is per
         // message), and without this the second filter would see a stale union and add a
         // second star to a thread the first filter just pinned. Unconditional, including
-        // under --dry-run, so the preview is what a real run would do.
+        // under --dry-run, so the preview is what a real run would do. A no-op in
+        // mark-only mode, since its writes are never Star/Flag.
         record_planned_pins(&writes, &messages, &mut thread_labels);
 
         for write in &writes {
-            apply_planned_write(client, write, &filter.name, prefix, dry_run).await?;
+            if mark_only {
+                // The stamp is irreversible in effect (a stamped message is never
+                // handled again), so the operator needs a list to undo a wrong freeze
+                // by hand: one INFO line per stamped message, before the write issues.
+                log_mark_only_stamps(&write.ids, &messages, prefix);
+            }
+            apply_planned_write(client, write, &filter.name, prefix, dry_run, mark_only).await?;
         }
     }
 
@@ -437,6 +480,12 @@ struct PlannedWrite {
 /// cannot half-apply: a `Move` archives and reads the message, so there would be no next
 /// run to retry a separate stamp. With no `Move`, one marker-only write follows the pins;
 /// no pin destroys eligibility, so a failed marker write just retries next run.
+///
+/// `mark_only` (the `--mark-only` backfill mode) collapses ALL of the above to exactly
+/// one marker-only `Tag(<marker>)` write over the FULL matched set: no pin write (so no
+/// `STARRED`/`IMPORTANT` add), no `Move` write, and crucially no `INBOX`/`UNREAD` removal.
+/// Without a `Move`, nothing destroys eligibility, so the marker must not carry one either
+/// -- a mark-only run that archived the `bots` candidates would be a serious defect.
 fn plan_filter_writes(
     filter: &MessageFilter,
     matched_ids: &[String],
@@ -444,12 +493,23 @@ fn plan_filter_writes(
     thread_labels: &HashMap<String, HashSet<String>>,
     resolver: &LabelResolver,
     marker: &str,
+    mark_only: bool,
 ) -> Vec<PlannedWrite> {
     if matched_ids.is_empty() {
         return Vec::new();
     }
 
     let marker_id = resolve_label_id(resolver, marker);
+
+    if mark_only {
+        return vec![PlannedWrite {
+            action: FilterAction::Tag(marker.to_string()),
+            ids: matched_ids.to_vec(),
+            add: vec![marker_id],
+            remove: Vec::new(),
+        }];
+    }
+
     let mut writes: Vec<PlannedWrite> = Vec::new();
     let mut has_move = false;
 
@@ -636,16 +696,19 @@ async fn apply_planned_write(
     filter_name: &str,
     prefix: &str,
     dry_run: bool,
+    mark_only: bool,
 ) -> Result<()> {
     debug!(
-        "{}apply_planned_write: filter={}, action={:?}, count={}, add={:?}, remove={:?}, dry_run={}",
+        "{}apply_planned_write: filter={}, action={:?}, count={}, add={:?}, remove={:?}, \
+         dry_run={}, mark_only={}",
         prefix,
         filter_name,
         write.action,
         write.ids.len(),
         write.add,
         write.remove,
-        dry_run
+        dry_run,
+        mark_only
     );
 
     let count = write.ids.len();
@@ -669,10 +732,15 @@ async fn apply_planned_write(
             );
         }
         FilterAction::Tag(label) => {
-            info!(
-                "{}[filter:{}] tagging {} messages with {}",
-                prefix, filter_name, count, label
-            );
+            // `--mark-only` already logged one line per stamped message
+            // (`log_mark_only_stamps`); an aggregate line here would just be noise on
+            // top of the per-message rollback list the operator actually needs.
+            if !mark_only {
+                info!(
+                    "{}[filter:{}] tagging {} messages with {}",
+                    prefix, filter_name, count, label
+                );
+            }
         }
     }
 
@@ -682,6 +750,39 @@ async fn apply_planned_write(
             .await?;
     }
     Ok(())
+}
+
+/// `--mark-only` needs an undo list: the stamp is irreversible in effect (a message
+/// carrying the marker is never handled again by any filter), so every message it stamps
+/// gets exactly one INFO line naming it. Returns the number of lines emitted, which must
+/// equal `ids.len()` for every id whose metadata was actually fetched -- that equality IS
+/// the "stamps N messages while logging exactly N lines" criterion.
+fn log_mark_only_stamps(
+    ids: &[String],
+    messages: &HashMap<String, GmailMessage>,
+    prefix: &str,
+) -> usize {
+    let mut logged = 0usize;
+    for id in ids {
+        let Some(msg) = messages.get(id) else {
+            warn!(
+                "{}[mark-only] stamping {} but its metadata was never fetched, cannot log \
+                 date/from/subject",
+                prefix, id
+            );
+            continue;
+        };
+        info!(
+            "{}[mark-only] stamped {} date={} from={} subject={:?}",
+            prefix,
+            id,
+            msg.internal_date.to_rfc3339(),
+            msg.from.first().map(|s| s.as_str()).unwrap_or("?"),
+            msg.subject
+        );
+        logged += 1;
+    }
+    logged
 }
 
 async fn execute_state_filters(
@@ -1010,6 +1111,17 @@ mod tests {
         thread_labels: &HashMap<String, HashSet<String>>,
         resolver: &LabelResolver,
     ) -> Vec<PlannedWrite> {
+        plan_all_writes_mode(scoped, messages, thread_labels, resolver, false)
+    }
+
+    /// Same as `plan_all_writes`, with `mark_only` exposed for the `--mark-only` tests.
+    fn plan_all_writes_mode(
+        scoped: &[FilterCandidates<'_>],
+        messages: &HashMap<String, GmailMessage>,
+        thread_labels: &HashMap<String, HashSet<String>>,
+        resolver: &LabelResolver,
+        mark_only: bool,
+    ) -> Vec<PlannedWrite> {
         let matched_per_filter = match_message_filters(scoped, messages, resolver, MARKER, "");
         let mut unions = thread_labels.clone();
         let mut all_writes: Vec<PlannedWrite> = Vec::new();
@@ -1021,6 +1133,7 @@ mod tests {
                 &unions,
                 resolver,
                 MARKER,
+                mark_only,
             );
             record_planned_pins(&writes, messages, &mut unions);
             all_writes.extend(writes);
@@ -1550,5 +1663,167 @@ mod tests {
 
         let stages = derive_stages(&filters);
         assert_eq!(stages, vec!["INBOX"]);
+    }
+
+    /// `--mark-only` success criterion: a pin filter's plan collapses to exactly one
+    /// marker-only write over the FULL handled set (both threads' messages, not one per
+    /// thread), with no `STARRED` add and no removal at all.
+    #[test]
+    fn test_mark_only_pin_filter_collapses_to_one_tag_write_over_the_full_handled_set() {
+        let filter = from_filter("leadership", &["*@example.com"]);
+        let messages = message_map(vec![
+            msg_at("a1", "t1", "boss@example.com", &["INBOX", "UNREAD"], 1_000),
+            msg_at("a2", "t1", "boss@example.com", &["INBOX", "UNREAD"], 2_000),
+            msg_at("b1", "t2", "boss@example.com", &["INBOX", "UNREAD"], 3_000),
+        ]);
+        let scoped = scope_one(&filter, &["a1", "a2", "b1"]);
+
+        let writes = plan_all_writes_mode(
+            &scoped,
+            &messages,
+            &thread_label_map(&[("t1", &["INBOX", "UNREAD"]), ("t2", &["INBOX", "UNREAD"])]),
+            &live_resolver(),
+            true,
+        );
+
+        assert_eq!(
+            writes.len(),
+            1,
+            "mark-only issues one write, no separate pin write: {:?}",
+            writes
+        );
+        let write = &writes[0];
+        assert_eq!(write.action, FilterAction::Tag(MARKER.to_string()));
+        let mut ids = write.ids.clone();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["a1", "a2", "b1"],
+            "every HANDLED message is stamped, not one per thread"
+        );
+        assert_eq!(write.add, vec![MARKER_ID.to_string()]);
+        assert!(
+            !write.add.contains(&"STARRED".to_string()),
+            "mark-only must issue zero STARRED adds: {:?}",
+            write
+        );
+        assert!(
+            write.remove.is_empty(),
+            "a marker-only write removes nothing"
+        );
+    }
+
+    /// The trap named in the design doc: `plan_filter_writes` folds the marker into the
+    /// `Move` write BECAUSE a `Move` destroys eligibility. In mark-only mode there is no
+    /// `Move`, so nothing destroys eligibility, and the marker must NOT carry INBOX/UNREAD
+    /// removal. A mark-only run that archived the `bots` candidates would be a serious
+    /// defect, so this is tested explicitly rather than left to fall out of the collapse.
+    #[test]
+    fn test_mark_only_never_removes_inbox_or_unread_for_a_move_filter() {
+        let mut filter = from_filter("bots", &["*@example.com"]);
+        filter.actions = vec![FilterAction::Move("Bots".to_string())];
+        let messages = message_map(vec![
+            msg_at("bot-1", "t1", "ci@example.com", &["INBOX", "UNREAD"], 1_000),
+            msg_at("bot-2", "t1", "ci@example.com", &["INBOX", "UNREAD"], 2_000),
+        ]);
+        let scoped = scope_one(&filter, &["bot-1", "bot-2"]);
+
+        // The thread already carries the Bots label from an older message, which under a
+        // normal run would be irrelevant (Move is never suppressed); here it also proves
+        // mark-only never touches the destination label at all.
+        let writes = plan_all_writes_mode(
+            &scoped,
+            &messages,
+            &thread_label_map(&[("t1", &["INBOX", "UNREAD", "Label_5"])]),
+            &live_resolver(),
+            true,
+        );
+
+        assert_eq!(
+            writes.len(),
+            1,
+            "mark-only collapses to one marker-only write"
+        );
+        let write = &writes[0];
+        assert_eq!(write.action, FilterAction::Tag(MARKER.to_string()));
+        assert_eq!(write.ids, vec!["bot-1", "bot-2"], "the full HANDLED set");
+        assert_eq!(write.add, vec![MARKER_ID.to_string()]);
+        assert!(
+            !write.add.contains(&"Label_5".to_string()),
+            "no destination label added, no Move issued: {:?}",
+            write
+        );
+        assert!(
+            write.remove.is_empty(),
+            "mark-only must not remove INBOX/UNREAD: archiving the bots candidates would \
+             be a serious defect: {:?}",
+            write
+        );
+    }
+
+    /// A message already carrying the marker never re-enters the HANDLED set: it fails
+    /// `matches()` just like a normal run, so mark-only stamps nothing for it either.
+    #[test]
+    fn test_mark_only_skips_an_already_marked_message() {
+        let filter = from_filter("leadership", &["*@example.com"]);
+        let msg = msg_at(
+            "id-1",
+            "t1",
+            "boss@example.com",
+            &["INBOX", "UNREAD", MARKER_ID],
+            1_000,
+        );
+        let messages = message_map(vec![msg]);
+        let scoped = scope_one(&filter, &["id-1"]);
+
+        let writes = plan_all_writes_mode(
+            &scoped,
+            &messages,
+            &thread_label_map(&[("t1", &["INBOX", "UNREAD", MARKER_ID])]),
+            &live_resolver(),
+            true,
+        );
+
+        assert!(
+            writes.is_empty(),
+            "nothing matched, so mark-only has nothing to stamp: {:?}",
+            writes
+        );
+    }
+
+    /// The logging half of the success criterion: "stamps N messages while logging
+    /// exactly N lines". One INFO line per id whose metadata was fetched.
+    #[test]
+    fn test_log_mark_only_stamps_logs_exactly_one_line_per_stamped_message() {
+        let messages = message_map(vec![
+            msg_at("m1", "t1", "boss@example.com", &["INBOX", "UNREAD"], 1_000),
+            msg_at("m2", "t2", "boss@example.com", &["INBOX", "UNREAD"], 2_000),
+        ]);
+        let ids = vec!["m1".to_string(), "m2".to_string()];
+
+        let logged = log_mark_only_stamps(&ids, &messages, "");
+
+        assert_eq!(logged, ids.len(), "one INFO line per stamped message");
+    }
+
+    /// An id whose metadata was never fetched cannot be logged with date/from/subject; it
+    /// is skipped (and warned about) rather than silently miscounted as logged.
+    #[test]
+    fn test_log_mark_only_stamps_skips_ids_missing_from_the_fetched_set() {
+        let messages = message_map(vec![msg_at(
+            "m1",
+            "t1",
+            "boss@example.com",
+            &["INBOX", "UNREAD"],
+            1_000,
+        )]);
+        let ids = vec!["m1".to_string(), "missing".to_string()];
+
+        let logged = log_mark_only_stamps(&ids, &messages, "");
+
+        assert_eq!(
+            logged, 1,
+            "only the message actually fetched gets a log line"
+        );
     }
 }

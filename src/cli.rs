@@ -42,6 +42,15 @@ pub enum Command {
         /// files and calls systemctl).
         #[arg(long)]
         dry_run: bool,
+
+        /// Marker backfill mode: stamp the marker label on every message a normal run
+        /// would HANDLE, applying no Star/Flag/Move. One-shot rollout tool, not a
+        /// permanent verb: reuses account discovery and the message-filter matching
+        /// path, so it lives here rather than as its own subcommand. Logs id, date,
+        /// from, subject for every message it stamps, since the stamp is irreversible
+        /// in effect and that log is the only way to undo a wrong freeze by hand.
+        #[arg(long)]
+        mark_only: bool,
     },
 
     /// Post the pinned-inbox (Starred + Important) digest to Slack

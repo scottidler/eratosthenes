@@ -9,6 +9,8 @@ Starred and Important threads with `ttl: Keep` so they stay put.
 ## Commands
 
 - `eratosthenes run [accounts...]` - run the inbox-zero engine (default command).
+  - `--dry-run` - no message or thread changes; missing labels may still be created.
+  - `--mark-only` - one-shot marker backfill (see below); applies no Star/Flag/Move.
 - `eratosthenes digest [accounts...]` - post the pinned-inbox (Starred +
   Important) digest to Slack.
 - `eratosthenes auth login|logout|status` - manage OAuth2 tokens.
@@ -20,6 +22,40 @@ Starred and Important threads with `ttl: Keep` so they stay put.
 
 Per-account YAML lives at `~/.config/eratosthenes/<account>.yml`. See
 [`eratosthenes.example.yml`](eratosthenes.example.yml) for a full annotated example.
+
+### Message filters act once
+
+A message-filter stamps a `marker-label` (default `Triaged`) on every message it
+HANDLES, whether or not the action changed anything. Every message-filter
+excludes marked mail, so unstarring or un-flagging a message is permanent: it
+is never re-acted on. Adopting this needs no config change (the marker
+defaults); override the name with `marker-label` if `Triaged` collides with
+something in your mailbox. It must not name a `state-filters` label or
+destination, or stage age-off would strip it right back off.
+
+Delete the `Triaged` label in the Gmail UI to reset: every message becomes
+eligible again on the next run.
+
+**Rolling this out onto an existing inbox:** the first run after adopting
+markers would otherwise re-apply every filter to your ENTIRE current pinned
+set one last time, since none of it carries the marker yet. Avoid that with a
+one-shot backfill:
+
+```sh
+systemctl --user stop eratosthenes.timer     # stop the timer first
+eratosthenes run --dry-run --log-level debug # sanity-check the per-filter counts
+eratosthenes run --mark-only                 # stamp today's mailbox, apply nothing
+eratosthenes run                             # should now report 0 matched
+systemctl --user start eratosthenes.timer    # resume
+```
+
+`run --mark-only` stamps the marker on exactly the set a normal run would
+HANDLE (post-match, post-claim, deduped by message id) and issues zero
+`STARRED`/`IMPORTANT`/`Move` writes. It logs one INFO line per stamped message
+(id, date, from, subject): the stamp is irreversible in effect, so that log is
+how a wrongly-frozen message gets found and hand-cleared. Mail that arrives
+while the timer is stopped is stamped and never starred - keep the window
+short.
 
 ### Slack digest
 
