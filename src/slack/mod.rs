@@ -123,8 +123,13 @@ impl SlackPoster for HttpSlackPoster {
         })
         .await
         .map_err(|_| {
+            // The bound covers the body read as well as the request, so an
+            // elapsed timeout does NOT mean the message failed to post. Say so:
+            // nothing retries this in-process, but a human re-running `digest`
+            // on a bare "returned nothing" would double-post.
             eyre!(
-                "Slack chat.postMessage returned nothing within {}s",
+                "Slack chat.postMessage returned nothing within {}s; the message MAY \
+already have posted, so check the channel before re-running",
                 REQUEST_TIMEOUT.as_secs()
             )
         })??;

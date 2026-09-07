@@ -109,7 +109,7 @@ pub async fn create_label_if_missing(
 
     // The `Label` is built inside the closure, not hoisted: `with_retry` calls
     // this once per attempt and the request builder consumes the value.
-    let created = with_retry(limiter, "labels.create", || async {
+    let attempt = with_retry(limiter, "labels.create", || async {
         limiter.acquire(5).await;
         let label = google_gmail1::api::Label {
             name: Some(name.to_string()),
@@ -127,7 +127,44 @@ pub async fn create_label_if_missing(
             .context(format!("Failed to create label '{}'", name))?;
         Ok(created)
     })
-    .await?;
+    .await;
+
+    let created = match attempt {
+        Ok(created) => created,
+        Err(create_err) => {
+            // "The create failed" and "the label is absent" are different
+            // facts, and `resolve_name` above cannot tell them apart: it is a
+            // snapshot taken BEFORE the call, so it cannot see a label that
+            // came into existence during it. Two ways that happens: a
+            // concurrent run created it, or our own retry's first attempt
+            // SUCCEEDED and only its response was lost, in which case attempt
+            // two gets a duplicate error for a label we ourselves just made.
+            //
+            // So ask the mailbox instead of trusting the stale snapshot. One
+            // extra list, on the failure path only. Deliberately not keyed on
+            // Gmail's duplicate-error shape (409 vs a 400 whose message says
+            // "exists"): existence is the question, so existence is what gets
+            // checked.
+            match lookup_label_id(hub, limiter, name).await {
+                Ok(Some(id)) => {
+                    log::info!("Label '{}' already exists; adopting id {}", name, id);
+                    resolver.ensure_label(name, id.clone());
+                    return Ok(id);
+                }
+                Ok(None) => return Err(create_err),
+                Err(list_err) => {
+                    // Report the ORIGINAL failure: it is the one that explains
+                    // what went wrong, and the recheck failing too is a detail.
+                    log::warn!(
+                        "could not re-check labels after a failed create of '{}': {:#}",
+                        name,
+                        list_err
+                    );
+                    return Err(create_err);
+                }
+            }
+        }
+    };
 
     let id = created
         .id
@@ -135,6 +172,36 @@ pub async fn create_label_if_missing(
 
     resolver.ensure_label(name, id.clone());
     Ok(id)
+}
+
+/// Current server-side id for `name`, or `None` if the mailbox does not have
+/// it. Used only to answer "did this label end up existing anyway?" after a
+/// failed create.
+async fn lookup_label_id(
+    hub: &google_gmail1::Gmail<
+        hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    >,
+    limiter: &RateLimiter,
+    name: &str,
+) -> Result<Option<String>> {
+    let list = with_retry(limiter, "labels.list (post-create recheck)", || async {
+        limiter.acquire(1).await;
+        hub.users()
+            .labels_list("me")
+            .add_scope(crate::gmail::auth::GMAIL_SCOPE)
+            .doit()
+            .await
+            .map(|(_, list)| list)
+            .context("Failed to list Gmail labels")
+    })
+    .await?;
+
+    Ok(list
+        .labels
+        .unwrap_or_default()
+        .into_iter()
+        .find(|label| label.name.as_deref() == Some(name))
+        .and_then(|label| label.id))
 }
 
 #[cfg(test)]

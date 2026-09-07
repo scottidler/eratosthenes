@@ -1170,3 +1170,160 @@ true)]`, which needs tokio's `test-util` feature (NOT in `full`), added as a
 dev-dependency. Virtual time exercises the REAL 30s constant and the REAL
 backoff ladder at zero wall-clock cost; a shortened test-only timeout would not
 be testing the constant that ships.
+
+
+## Panel round 8 remediation (2026-09-07)
+
+Round 8 (`/tmp/review-panel/triage-r1/synthesis-r8.md`) audited `117e58c` and
+`95f8d22`, the first commits in this stack to ship unreviewed. `117e58c` came
+back clean. The rest of this entry is what round 8 found in `95f8d22` and in
+the S1-S3 analysis, and what was done about it.
+
+### What round 8 refuted (claims made in the audit brief that were WRONG)
+
+- **The OAuth path is NOT unbounded.** The brief flagged it as the top concern
+  on the theory that `yup-oauth2` makes its own HTTP calls outside the new
+  bound. Wrong: every generated `doit()` opens with `loop { let token =
+  self.hub.auth.get_token(...).await ... }`
+  (`google-gmail1-7.0.0+20251215/src/api.rs:3533-3548`), so the token fetch AND
+  refresh happen inside `f()` and therefore inside
+  `timeout(REQUEST_TIMEOUT, f())`. `build_authenticator` makes no network call
+  at all (`yup-oauth2-12.1.2/src/authenticator.rs:539-566` only builds a client
+  and reads disk). The one direct `get_token` is `src/main.rs:215`, inside
+  interactive `auth login`. Real residual, footnote only: yup-oauth2's client
+  never gets `with_timeout` set, which affects `auth login` and nothing on the
+  scheduled path.
+- **S1 quota reasoning was wrong**, and the correct shape is better than the
+  proposal. See MF4 below.
+- **"The engine runs every 5 minutes" does not apply to triage.** The 5-minute
+  timer is the AGING unit (`src/service.rs`); triage is `OnCalendar`.
+- **`with_retry` IS the only chokepoint**, enumerated rather than assumed: 14
+  `with_retry` sites and 14 terminal calls, each lexically inside a closure.
+
+### MF3: `TimeoutStartSec` was required after all, and ground 2 was inoperative
+
+The doc bullet corrected earlier today gave three grounds for overturning the
+settled decision. Grounds 1 and 3 hold, both independently verified.
+
+Ground 2 does not, and this is the important correction: it claimed orphaned
+grandchildren are covered by systemd's default `KillMode=control-group`. That
+is TRUE about systemd and FALSE as protection. `KillMode` applies on unit STOP,
+every generated unit is `Type=oneshot`, and `man systemd.service` says the start
+timeout is disabled by default for oneshot. Nothing ever stops a wedged oneshot,
+so the cgroup kill can never fire against the failure it was cited for. **An
+inoperative justification was written into a design doc**, which is worse than
+leaving the finding open.
+
+Worse still for the run unit: `OnUnitActiveSec` is relative to last activation,
+and while a unit is `activating` later start jobs merge into the running one. So
+a wedge silently stops the 5-minute engine with no failed unit and no log line
+-- exactly the invisible failure the transport bounds were added to remove, one
+level up.
+
+Fixed: all three units now emit `TimeoutStartSec`, derived from the constants
+they bound rather than guessed. `run_start_timeout()` = 3760s,
+`digest_start_timeout()` = 2376s, `triage_start_timeout(50)` = 26204s. The
+triage value tracks `max-threads`, and `resolve_max_threads` takes the LARGEST
+across accounts because one timer fires one run that loops all of them. The
+"nobody has measured a healthy ceiling" blocker claimed earlier was simply
+wrong: the ceiling is computable from `TRIAGE_TIMEOUT`, `DRAFT_TIMEOUT`,
+`DIGEST_TIMEOUT`, and `worst_case_call_duration()`.
+
+### MF1: a label that already exists no longer fails the run
+
+`resolve_name` is a snapshot taken BEFORE the create call, so it cannot see a
+label that came into existence during it -- either from a concurrent run, or
+from our own retry whose first attempt succeeded and only lost its response, in
+which case attempt two gets a duplicate error for a label we just made. No 409
+term existed in `is_retryable`, so it propagated and failed the run.
+
+Fixed by asking the mailbox rather than trusting the snapshot: on ANY create
+failure, `lookup_label_id` re-lists and adopts the label if it now exists. One
+extra list, on the failure path only. Deliberately not keyed on Gmail's
+duplicate-error shape (409 versus a 400 whose message says "exists"), because
+existence is the question, so existence is what gets checked.
+
+### MF2: `is_retryable` retried permanent errors, and this commit made that expensive
+
+Neither review seat found this; the panel's own probe did. `contains("rate")`
+was a bare substring over the whole rendered chain, and
+`create_label_if_missing` interpolates the LABEL NAME into that chain. So a
+permanent HTTP 400 on a label called `Corporate`, `Separate`, `moderate`,
+`generate`, or `accurate` classified as retryable. Pre-existing, but the COST
+changed: bounding the transport turned each false positive from a fast failure
+into five 30s attempts plus 38s of ladder.
+
+`is_retryable` is now structural: it walks the source chain to the typed
+`google_gmail1::Error` and reads `Failure(response).status()`, or
+`BadRequest(json)`'s `error.code` / `error.status` / `error.errors[].reason`
+from their own fields. The transport timeout stays a text match because it is
+the one error this module GENERATES rather than receives. An untyped error
+mentioning a status no longer retries, which is what keeps the matcher from
+silently falling back to the old sweep. Six label names are asserted as bait in
+`test_is_retryable_ignores_a_label_name_that_merely_contains_rate`, so the test
+cannot pass by accident.
+
+### MF4 / S1: the write order is a correctness constraint
+
+Root cause confirmed and sharper than round 7's framing. `SEEN_LABEL`'s doc
+comment claims message-level semantics; `plan_write` put the marker in a
+`ThreadWrite`'s `add` list and `modify_thread` applied it as a `threads.modify`,
+labeling every message the thread held at call time. A message that arrived
+after the snapshot got marked without ever being classified, and
+`-label:llm/seen` then hid it forever. Permanent, not racy.
+
+Round 8 established that **one ordering is strictly worse than the bug**:
+
+- marker first, then a failed bucket write -> every message marked, no bucket
+  label, thread can never resurface. PERMANENT LOSS.
+- bucket first, then a failed marker write -> messages unmarked, thread
+  resurfaces next run, the label write is idempotent, and `refresh_drafts`
+  skips already-drafted threads so there is no double-draft. SELF-HEALS at the
+  cost of one extra LLM call.
+
+Implemented in that order. `ThreadWrite` now carries `classified_message_ids`
+and its `add` holds the bucket only; the marker goes on in ONE trailing
+`messages.batchModify` over the ids from writes that actually landed.
+`batch_modify` chunks at 1000 ids for 50 quota units, so 50 threads cost 50
+units for the whole pass rather than 50 per thread -- the opposite of the
+proposal's worry. Being last also enforces the ordering structurally and turns
+per-thread partial states into one all-or-nothing marker write. `plan_write`
+still validates the marker label even though it no longer applies it, so a
+missing marker fails the PLAN rather than leaving buckets written and nothing
+recorded.
+
+### Cheap wins taken in the same pass
+
+- **`body-chars` had no minimum validation.** Nothing validated `TriageConfig`
+  at all. `body-chars: 5` yielded a bare unmarked 5-char cut, reachable only by
+  configuring below the floor, since `budget_messages` exempts the newest
+  message. `TriageConfig::validate` now rejects `body_chars <
+  MIN_MARKED_FRAGMENT_CHARS` and is wired into `Config::validate`, so the
+  exemption is unreachable by construction rather than defended by a comment.
+- **`backoff_secs` exceeded its own stated ceiling.** It clamped `base` and
+  then added the spread on top, returning 76s at attempt 6 against a
+  `MAX_BACKOFF_SECS` of 60. Unreachable at `MAX_RETRIES = 5`, a trap for
+  whoever raises it. Clamp is now applied last, asserted over 32 attempts.
+  Separately, the variable called "jitter" has no randomness, so parallel
+  accounts align their retries perfectly; renamed to `spread` and documented as
+  deterministic rather than left claiming something the code does not do.
+- `test_truncate_never_exceeds_max` now starts at 0.
+- The Slack timeout message says the post MAY have landed, so a human
+  re-running `digest` on a bare "returned nothing" does not double-post.
+
+### Brief claims round 8 found OVERSTATED but not wrong
+
+- C3's escaping is "bounded and small next to `BUDGET`": the worst case is
+  ~8820 against a 10000 budget, so 88%. Bounded, not small. The ladder still
+  terminates.
+- `test_line_caps_exceed_the_fixture_figures` proves one fixture sits under the
+  caps, not that ordinary mail will not clip.
+
+### Still open after round 8
+
+- **S2**: the scope analysis holds, with no permanent-delete call site anywhere
+  in `src/` or `tests/`. Narrowing `mail.google.com` to `gmail.modify` is
+  Scott's call because it forces a re-auth through a browser flow.
+- **S3**: amending the doc's "3-7 bullets" from a guarantee to a target.
+- The yup-oauth2 `with_timeout` footnote, which affects `auth login` only.
+- Round 8's three `defer` items.

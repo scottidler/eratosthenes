@@ -134,8 +134,13 @@ fn test_cap_message_is_silent_when_the_cap_did_not_bite() {
     assert_eq!(cap_message(&selection, 50), None);
 }
 
+/// Audit S1/MF4: the thread-level write carries the BUCKET ONLY. The seen
+/// marker is message-level by contract, and `threads.modify` would put it on
+/// every message the thread holds at call time -- including one that arrived
+/// after the snapshot and was never classified, which `-label:llm/seen` then
+/// hides forever.
 #[test]
-fn test_plan_write_adds_the_bucket_and_the_seen_marker() {
+fn test_plan_write_adds_the_bucket_and_not_the_seen_marker() {
     let config = triage_config();
     let resolver = resolver_with_llm_labels();
     let thread = thread_with_labels("t1", &["INBOX"]);
@@ -146,10 +151,54 @@ fn test_plan_write_adds_the_bucket_and_the_seen_marker() {
     assert_eq!(write.bucket, "needs-reply");
     assert_eq!(
         write.add,
-        vec!["Label_1".to_string(), "Label_3".to_string()],
-        "bucket label then the seen marker"
+        vec!["Label_1".to_string()],
+        "the bucket label, and nothing else, goes through threads.modify"
+    );
+    let seen_id = resolver
+        .resolve_name(SEEN_LABEL)
+        .expect("the fixture resolves the marker");
+    assert!(
+        !write.add.iter().any(|id| id == seen_id),
+        "the seen marker must not ride along on a thread-level write"
     );
     assert!(write.remove.is_empty());
+}
+
+/// The marker's target set: exactly the messages the classifier saw.
+#[test]
+fn test_plan_write_records_the_classified_message_ids() {
+    let config = triage_config();
+    let resolver = resolver_with_llm_labels();
+    let thread = thread_with_labels("t1", &["INBOX"]);
+    let bucket = &config.buckets[0];
+
+    let write = plan_write(&thread, bucket, &config.buckets, &resolver, SEEN_LABEL).unwrap();
+    assert_eq!(
+        write.classified_message_ids,
+        vec!["m1".to_string()],
+        "the marker targets the snapshot's messages, not the thread"
+    );
+}
+
+/// A missing marker label must fail the PLAN, not the trailing write: otherwise
+/// the run mutates every bucket and only then discovers it cannot record what
+/// it saw, leaving buckets written and nothing marked.
+#[test]
+fn test_plan_write_fails_when_the_seen_label_is_unresolvable() {
+    let config = triage_config();
+    let resolver = resolver_with_llm_labels();
+    let thread = thread_with_labels("t1", &["INBOX"]);
+    let bucket = &config.buckets[0];
+
+    let err = plan_write(
+        &thread,
+        bucket,
+        &config.buckets,
+        &resolver,
+        "llm/never-created",
+    )
+    .expect_err("an unresolvable marker must not plan a write");
+    assert!(format!("{err:#}").contains("llm/never-created"), "{err:#}");
 }
 
 /// Reclassification: a noise thread a human replies into becomes needs-reply

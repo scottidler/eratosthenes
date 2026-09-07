@@ -121,22 +121,38 @@ pub fn cap_message(selection: &Selection, cap: usize) -> Option<String> {
     ))
 }
 
-/// One thread's label mutation: exactly one `threads.modify` so a thread is
-/// never half-written.
+/// One thread's BUCKET mutation: one `threads.modify` so a thread is never
+/// half-written.
+///
+/// The seen marker is deliberately NOT in `add`. `SEEN_LABEL`'s contract is
+/// message-level, and `threads.modify` is a thread-level operation: it labels
+/// every message the thread holds AT THE TIME OF THE CALL, including one that
+/// arrived after the classifier's snapshot was taken. That message was never
+/// classified, yet `-label:llm/seen` then hides it forever, so the loss was
+/// permanent rather than merely racy (audit S1/MF4). The marker is applied
+/// separately, over `classified_message_ids` and nothing else.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ThreadWrite {
     pub thread_id: String,
     pub bucket: String,
     pub add: Vec<String>,
     pub remove: Vec<String>,
+    /// Exactly the messages the classifier actually saw. The seen marker goes
+    /// on these and no others, which is what makes a mid-pass arrival resurface
+    /// on the next run instead of vanishing.
+    pub classified_message_ids: Vec<String>,
 }
 
-/// Build the add/remove sets for one classified thread: add the new bucket plus
-/// the seen marker, remove any OTHER `llm/*` bucket the thread already carries.
+/// Build the add/remove sets for one classified thread: add the new bucket,
+/// remove any OTHER `llm/*` bucket the thread already carries.
 ///
 /// Removing the previous bucket is what makes reclassification work: a noise
 /// thread a human replies into becomes needs-reply, and it must not end up
 /// carrying both.
+///
+/// `seen_label` is still validated here even though it is not applied here: a
+/// missing marker label must fail the PLAN, not the trailing write, or the run
+/// would mutate buckets and only then discover it cannot record what it saw.
 pub fn plan_write(
     thread: &TriageThread,
     bucket: &TriageBucket,
@@ -148,10 +164,9 @@ pub fn plan_write(
         .resolve_name(&bucket.label)
         .ok_or_else(|| eyre::eyre!("label '{}' is not in the resolver", bucket.label))?
         .to_string();
-    let seen_id = resolver
+    resolver
         .resolve_name(seen_label)
-        .ok_or_else(|| eyre::eyre!("label '{}' is not in the resolver", seen_label))?
-        .to_string();
+        .ok_or_else(|| eyre::eyre!("label '{}' is not in the resolver", seen_label))?;
 
     let present = thread.label_ids();
     let remove: Vec<String> = buckets
@@ -165,8 +180,9 @@ pub fn plan_write(
     Ok(ThreadWrite {
         thread_id: thread.id.clone(),
         bucket: bucket.name.clone(),
-        add: vec![bucket_id, seen_id],
+        add: vec![bucket_id],
         remove,
+        classified_message_ids: thread.messages.iter().map(|m| m.id.clone()).collect(),
     })
 }
 
@@ -343,7 +359,20 @@ async fn classify_and_label(
 
     let writes = plan_writes(&threads, &classification, triage, &client.resolver, dry_run)?;
 
+    // ORDER IS A CORRECTNESS CONSTRAINT, not a preference (audit MF4).
+    //
+    // Bucket first, then the marker. If the marker write fails after the bucket
+    // write succeeded, the messages stay unmarked, the thread resurfaces on the
+    // next run, reclassification is idempotent for the label write, and
+    // `refresh_drafts` skips threads that already have a draft -- so it
+    // self-heals at the cost of one extra LLM call.
+    //
+    // The reverse order does NOT self-heal: marker first, then a failed bucket
+    // write, leaves every message marked seen with no bucket label, and
+    // `-label:llm/seen` means the thread can never resurface. That is permanent
+    // loss, strictly worse than the bug this fixes.
     let mut applied = 0usize;
+    let mut to_mark: Vec<String> = Vec::new();
     for write in &writes {
         client
             .modify_thread(&write.thread_id, &write.add, &write.remove)
@@ -357,6 +386,36 @@ async fn classify_and_label(
             write.remove.len()
         );
         applied += 1;
+        // Only writes that actually landed earn a marker.
+        to_mark.extend(write.classified_message_ids.iter().cloned());
+    }
+
+    // ONE call for the whole pass, not one per thread: `batch_modify` chunks at
+    // 1000 ids for 50 quota units, so 50 threads cost 50 units total rather
+    // than 50 per thread. It also makes the marker write all-or-nothing across
+    // the run instead of leaving per-thread partial states, and structurally
+    // enforces the ordering above by being last.
+    if !to_mark.is_empty() {
+        let seen_id = client
+            .resolver
+            .resolve_name(SEEN_LABEL)
+            .ok_or_else(|| eyre::eyre!("label '{}' is not in the resolver", SEEN_LABEL))?
+            .to_string();
+        client
+            .batch_modify(&to_mark, std::slice::from_ref(&seen_id), &[])
+            .await
+            .with_context(|| {
+                format!(
+                    "marking {} classified messages as seen (buckets are already written; \
+the next run will reclassify these threads)",
+                    to_mark.len()
+                )
+            })?;
+        debug!(
+            "{}marked {} classified messages seen in one batch",
+            prefix,
+            to_mark.len()
+        );
     }
 
     let skipped = classification.unknown_buckets.len() + classification.missing_ids.len();

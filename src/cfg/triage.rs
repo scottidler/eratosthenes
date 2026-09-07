@@ -70,6 +70,29 @@ pub struct TriageConfig {
     pub buckets: Vec<TriageBucket>,
 }
 
+impl TriageConfig {
+    /// Reject a `body-chars` too small to carry a truncation marker.
+    ///
+    /// `body::truncate` cuts bare below that floor, and a bare sliver reads to
+    /// the model as a COMPLETE short message. `budget_messages` exempts the
+    /// newest message from the floor so a thread is never sent empty, which
+    /// means the only way to reach a bare cut is a `body-chars` configured
+    /// below it. Validating here makes that unreachable by construction instead
+    /// of defended by a comment.
+    pub fn validate(&self) -> eyre::Result<()> {
+        if self.body_chars < crate::triage::body::MIN_MARKED_FRAGMENT_CHARS {
+            eyre::bail!(
+                "triage body-chars is {} but must be at least {}: below that a truncated body \
+cannot carry its truncation marker, and an unmarked fragment reads to the model as a \
+complete message",
+                self.body_chars,
+                crate::triage::body::MIN_MARKED_FRAGMENT_CHARS
+            );
+        }
+        Ok(())
+    }
+}
+
 fn default_max_threads() -> u32 {
     50
 }
@@ -256,6 +279,39 @@ buckets:
             .expect_err("bucket missing name must fail to load");
         let msg = format!("{}", err);
         assert!(msg.contains("triage bucket '#1'"), "got: {}", msg);
+    }
+
+    /// A `body-chars` below the marked-fragment floor is rejected at LOAD, so
+    /// `budget_messages`' newest-message exemption can never actually produce
+    /// an unmarked sliver (audit follow-on to C4).
+    #[test]
+    fn test_body_chars_below_the_marker_floor_is_rejected() {
+        let floor = crate::triage::body::MIN_MARKED_FRAGMENT_CHARS;
+        let yaml = format!("schedule: 'Mon 07:00:00'\nbody-chars: {}\n", floor - 1);
+        let config: TriageConfig = serde_yaml::from_str(&yaml).expect("parses");
+        let err = config
+            .validate()
+            .expect_err("a body-chars below the floor must not load");
+        let text = format!("{err:#}");
+        assert!(text.contains("body-chars"), "{}", text);
+        assert!(text.contains(&floor.to_string()), "{}", text);
+    }
+
+    #[test]
+    fn test_body_chars_at_the_floor_loads() {
+        let floor = crate::triage::body::MIN_MARKED_FRAGMENT_CHARS;
+        let yaml = format!("schedule: 'Mon 07:00:00'\nbody-chars: {}\n", floor);
+        let config: TriageConfig = serde_yaml::from_str(&yaml).expect("parses");
+        assert!(config.validate().is_ok());
+    }
+
+    /// The shipped default must satisfy its own validator.
+    #[test]
+    fn test_the_default_body_chars_is_valid() {
+        let config: TriageConfig =
+            serde_yaml::from_str("schedule: 'Mon 07:00:00'\n").expect("parses");
+        assert_eq!(config.body_chars, 4000);
+        assert!(config.validate().is_ok());
     }
 
     #[test]

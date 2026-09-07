@@ -1285,9 +1285,34 @@ Decisions where an answered question belongs.
   > `std::process::Child::kill()`, which is SIGKILL on unix (tokio 1.50.0
   > `process/mod.rs:1247`, and its own doc comment says so). SIGKILL cannot be
   > ignored, so the failure mode this decision was written for does not exist.
-  > Orphaned grandchildren, the one real gap the in-process bound cannot close,
-  > are handled by systemd's default `KillMode=control-group` on unit stop, and
-  > not by `TimeoutStartSec` at all.
+  > Orphaned grandchildren are the one real gap the in-process bound cannot
+  > close.
+  >
+  > **AMENDED again, same day, after panel round 8.** The sentence here
+  > previously claimed that gap "is handled by systemd's default
+  > `KillMode=control-group` on unit stop, and not by `TimeoutStartSec` at all."
+  > That is true about systemd's defaults and FALSE as protection, and citing it
+  > was the error. `KillMode` applies on unit STOP; all three generated units are
+  > `Type=oneshot`, and `man systemd.service` states the start timeout "is
+  > disabled by default" for oneshot. So nothing ever stops a wedged oneshot and
+  > the cgroup kill can never fire against the failure it was cited for.
+  >
+  > Worse for the run unit: its timer is `OnUnitActiveSec`, defined relative to
+  > last activation. While a unit sits in `activating`, later start jobs MERGE
+  > into the running one, so a wedge silently stops the 5-minute engine with no
+  > failed unit and no log line. That is precisely the invisible-failure shape
+  > the transport bounds were added to remove, reintroduced one level up.
+  >
+  > `TimeoutStartSec` is therefore REQUIRED, and is now emitted on all three
+  > units (`src/service.rs`). The values are derived, not guessed:
+  > `run_start_timeout()`, `digest_start_timeout()`, and
+  > `triage_start_timeout(max_threads)` sum the per-call and per-child ceilings
+  > they bound, giving 3760s, 2376s, and 26204s at `max-threads: 50`. Each sits
+  > far above the worst LEGITIMATE run, because a bound that can kill healthy
+  > work is worse than no bound, and the triage value tracks `max-threads` so
+  > raising the cap cannot silently invalidate it. The "nobody has measured a
+  > healthy ceiling" blocker recorded below was wrong: the ceiling is computable
+  > from the constants already in the code.
   >
   > The arithmetic was also written for a unit that makes ONE transport call.
   > That holds for digest; triage makes one classify call plus up to
@@ -1307,16 +1332,14 @@ Decisions where an answered question belongs.
   > shared connector), and `slack::REQUEST_TIMEOUT` (15s over both the request
   > and the body read).
   >
-  > `TimeoutStartSec` is therefore NOT the mechanism that satisfies this
-  > section's intent, and remains unimplemented deliberately. It is now only a
-  > coarse backstop against a future unbounded await, and sizing it needs a
-  > measured healthy-run ceiling for a DRAFTING triage run, which nobody has
-  > taken. `gmail::rate::worst_case_call_duration()` (188s per call: five
-  > attempts plus the backoff ladder) is the per-call derivation any such number
-  > must start from. The theoretical whole-run worst case is ~6.8h, which is
-  > dominated by the case where every call times out five times, i.e. a run that
-  > is failing rather than one that is slow: a bound sized for it protects
-  > nothing.
+  > `TimeoutStartSec` is not the mechanism that satisfies this section's intent
+  > -- the per-call transport bounds are -- but it is a REQUIRED backstop for
+  > the oneshot reason above, and it is implemented.
+  > `gmail::rate::worst_case_call_duration()` (188s per call: five attempts plus
+  > the backoff ladder) is the per-call derivation the unit values are built
+  > from. They are deliberately generous: the derivations are additive worst
+  > cases that assume every call burns its full ceiling, which is not physically
+  > reachable, and that pessimism is the safety margin.
 
   Clyde's 900s is for a ~500KB report render and is the wrong shape to copy.
   **Naming, because `120` was doing two unrelated jobs** (panel R5-B3, and the

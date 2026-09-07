@@ -64,10 +64,21 @@ impl RateLimiter {
 
 /// The backoff wait for one attempt, extracted as a pure function so the sleep
 /// and the worst-case arithmetic below cannot disagree about it.
+///
+/// The clamp is applied LAST. It used to clamp `base` and then add the spread
+/// on top, which returns 76s at attempt 6 for a `MAX_BACKOFF_SECS` that says
+/// 60: unreachable at `MAX_RETRIES = 5`, but a trap for whoever raises it.
+///
+/// The spread is deterministic, and the name says so. It is a fixed 25% of the
+/// exponential step, NOT jitter: there is no randomness here, so several
+/// accounts retrying in parallel align their attempts perfectly rather than
+/// spreading out. That is acceptable only because runs are sequential per
+/// process; adding real jitter needs an RNG dependency and is a separate
+/// decision, so the name is honest instead of aspirational.
 fn backoff_secs(attempt: u32) -> u64 {
     let base = 1u64 << attempt.min(6);
-    let jitter = base / 4;
-    base.min(MAX_BACKOFF_SECS).saturating_add(jitter)
+    let spread = base / 4;
+    base.saturating_add(spread).min(MAX_BACKOFF_SECS)
 }
 
 const MAX_RETRIES: u32 = 5;
@@ -88,23 +99,85 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// files would not.
 pub const TIMEOUT_MARKER: &str = "transport timeout";
 
+/// HTTP statuses worth another attempt: Gmail's rate limit plus the transient
+/// server-side family. Anything else is a permanent error, and retrying it now
+/// costs five `REQUEST_TIMEOUT`s plus the whole backoff ladder.
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 429 | 500 | 502 | 503 | 504)
+}
+
+/// Reasons Google puts in a JSON error body for a condition that will clear on
+/// its own. Matched exactly, against the `reason` field, never as loose text.
+const RETRYABLE_REASONS: &[&str] = &[
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "backendError",
+    "internalError",
+];
+
+/// Google's structured error body: `error.code` is the status, `error.status`
+/// is the canonical code, and `error.errors[].reason` is the machine-readable
+/// reason. All three are read from their own fields rather than from the
+/// rendered text.
+fn json_error_is_retryable(body: &serde_json::Value) -> bool {
+    let error = &body["error"];
+
+    if let Some(code) = error["code"].as_u64()
+        && is_retryable_status(code as u16)
+    {
+        return true;
+    }
+    if error["status"].as_str() == Some("RESOURCE_EXHAUSTED") {
+        return true;
+    }
+    if let Some(entries) = error["errors"].as_array() {
+        return entries.iter().any(|entry| {
+            entry["reason"]
+                .as_str()
+                .is_some_and(|reason| RETRYABLE_REASONS.contains(&reason))
+        });
+    }
+    false
+}
+
 /// Classify an error as a transient Gmail rate/availability failure worth
-/// retrying. The 429/503 details live in the SOURCE of a `.context()`-wrapped
-/// error, so the whole chain must be inspected (`{:#}`), not just `to_string()`
-/// which renders only the top context and would never see the code or reason.
+/// retrying.
 ///
-/// A transport timeout is retryable: it is precisely the transient class this
-/// function exists for. Note that this multiplies the worst-case wall clock by
-/// `MAX_RETRIES`, which is why the unit-level bound has to be derived from
+/// Classified STRUCTURALLY, off the typed `google_gmail1::Error` in the source
+/// chain. It used to be a bare substring sweep over the whole rendered chain,
+/// which is unsound in a way that bit: `create_label_if_missing` interpolates
+/// the LABEL NAME into its context, and a bare `contains("rate")` matches
+/// "Corporate", "Separate", "moderate", "generate", "accurate". A permanent 400
+/// on any such label was classified as retryable. That was survivable while a
+/// retry was cheap; bounding the transport made every false positive cost five
+/// 30s attempts plus 38s of ladder, so the classifier had to get precise.
+///
+/// A transport timeout stays a text match, because it is the one error this
+/// module GENERATES rather than receives -- see `TIMEOUT_MARKER`. It is
+/// retryable: it is precisely the transient class this function exists for.
+/// Note that retrying multiplies the worst-case wall clock by `MAX_RETRIES`,
+/// which is why a unit-level bound has to be derived from
 /// `worst_case_call_duration()` and not from `REQUEST_TIMEOUT` alone.
 pub fn is_retryable(report: &eyre::Report) -> bool {
-    let chain = format!("{report:#}");
-    chain.contains("429")
-        || chain.contains("503")
-        || chain.contains("rate")
-        || chain.contains("RESOURCE_EXHAUSTED")
-        || chain.contains("concurrent")
-        || chain.contains(TIMEOUT_MARKER)
+    if format!("{report:#}").contains(TIMEOUT_MARKER) {
+        return true;
+    }
+
+    for source in report.chain() {
+        if let Some(err) = source.downcast_ref::<google_gmail1::Error>() {
+            return match err {
+                google_gmail1::Error::Failure(response) => {
+                    is_retryable_status(response.status().as_u16())
+                }
+                google_gmail1::Error::BadRequest(body) => json_error_is_retryable(body),
+                // A dropped connection or a truncated stream is transient in
+                // exactly the way a retry is for.
+                google_gmail1::Error::HttpError(_) | google_gmail1::Error::Io(_) => true,
+                _ => false,
+            };
+        }
+    }
+    false
 }
 
 /// The real ceiling on one `with_retry` call: every attempt timing out, plus
@@ -187,22 +260,92 @@ mod tests {
         assert!(remaining <= MAX_TOKENS - 200);
     }
 
+    /// The typed error lives in the SOURCE; the top context is generic. This is
+    /// the case a `to_string()` check would miss, and it is now answered by
+    /// walking the chain to the real `google_gmail1::Error` rather than by
+    /// pattern-matching rendered text.
     #[test]
-    fn test_is_retryable_finds_429_in_source_not_top_context() {
+    fn test_is_retryable_finds_the_rate_limit_in_the_typed_source() {
         use eyre::Context;
-        // The Gmail 429 lives in the SOURCE; the top context is generic. This is
-        // exactly the case the old `to_string()` check missed.
-        let source = eyre::eyre!(
-            "Bad Request: {{\"error\":{{\"code\":429,\"reason\":\"rateLimitExceeded\",\"status\":\"RESOURCE_EXHAUSTED\"}}}}"
-        );
+        let source = google_gmail1::Error::BadRequest(serde_json::json!({
+            "error": {
+                "code": 429,
+                "status": "RESOURCE_EXHAUSTED",
+                "errors": [{ "reason": "rateLimitExceeded" }]
+            }
+        }));
         let report = Err::<(), _>(source)
             .context("threads.get(abc123) failed")
             .unwrap_err();
 
-        // to_string() shows only the top context -> would NOT catch the 429.
         assert!(!report.to_string().contains("429"));
-        // is_retryable inspects the full chain -> catches it.
         assert!(is_retryable(&report));
+    }
+
+    /// Audit MF2, the regression that motivated going structural. A bare
+    /// `contains("rate")` over the rendered chain matched the LABEL NAME that
+    /// `create_label_if_missing` interpolates into its context, so a permanent
+    /// 400 on a label called "Corporate" was retried five times at up to 30s
+    /// each. The bait is asserted present so this test cannot pass by accident.
+    #[test]
+    fn test_is_retryable_ignores_a_label_name_that_merely_contains_rate() {
+        use eyre::Context;
+        for label in [
+            "Corporate",
+            "Separate",
+            "moderate",
+            "generate",
+            "accurate",
+            "Corporate/rate-cards",
+        ] {
+            let source = google_gmail1::Error::BadRequest(serde_json::json!({
+                "error": { "code": 400, "message": "Invalid label name" }
+            }));
+            let report = Err::<(), _>(source)
+                .context(format!("Failed to create label '{}'", label))
+                .unwrap_err();
+
+            assert!(
+                format!("{report:#}").contains("rate"),
+                "the substring bait must be present for '{}' or this test proves nothing",
+                label
+            );
+            assert!(
+                !is_retryable(&report),
+                "a permanent 400 must not retry because '{}' contains 'rate'",
+                label
+            );
+        }
+    }
+
+    /// The transient server-side family retries; a permanent client error does
+    /// not. Driven off the typed `Failure` status, not off text.
+    #[test]
+    fn test_is_retryable_splits_transient_from_permanent_statuses() {
+        for status in [429u16, 500, 502, 503, 504] {
+            assert!(is_retryable_status(status), "{} should retry", status);
+        }
+        for status in [400u16, 401, 403, 404, 409, 412, 422] {
+            assert!(!is_retryable_status(status), "{} must not retry", status);
+        }
+    }
+
+    /// A duplicate-label 409 is NOT retryable: retrying cannot help, because
+    /// the label already exists. `create_label_if_missing` handles it by
+    /// re-checking existence, not by retrying (audit MF1).
+    #[test]
+    fn test_is_retryable_does_not_retry_a_duplicate() {
+        use eyre::Context;
+        let source = google_gmail1::Error::BadRequest(serde_json::json!({
+            "error": {
+                "code": 409,
+                "errors": [{ "reason": "duplicate" }]
+            }
+        }));
+        let report = Err::<(), _>(source)
+            .context("Failed to create label 'llm/needs-reply'")
+            .unwrap_err();
+        assert!(!is_retryable(&report));
     }
 
     #[test]
@@ -212,6 +355,17 @@ mod tests {
         let report = Err::<(), _>(source)
             .context("threads.get(abc123) failed")
             .unwrap_err();
+        assert!(!is_retryable(&report));
+    }
+
+    /// An untyped error carries no status to classify, so it must not retry.
+    /// This is what keeps the structural matcher from silently falling back to
+    /// the old text sweep.
+    #[test]
+    fn test_is_retryable_ignores_an_untyped_error_mentioning_a_status() {
+        use eyre::Context;
+        let source = eyre::eyre!("server said 503 once upon a time");
+        let report = Err::<(), _>(source).context("threads.list").unwrap_err();
         assert!(!is_retryable(&report));
     }
 
@@ -294,6 +448,22 @@ mod tests {
     fn test_backoff_secs_is_the_documented_ladder() {
         let ladder: Vec<u64> = (0..MAX_RETRIES).map(backoff_secs).collect();
         assert_eq!(ladder, vec![1, 2, 5, 10, 20]);
+    }
+
+    /// The clamp is applied last, so `MAX_BACKOFF_SECS` is a real ceiling
+    /// rather than a number the function exceeds. Unreachable at the current
+    /// `MAX_RETRIES`, asserted so raising it cannot reintroduce the trap.
+    #[test]
+    fn test_backoff_secs_never_exceeds_its_stated_ceiling() {
+        for attempt in 0..32 {
+            assert!(
+                backoff_secs(attempt) <= MAX_BACKOFF_SECS,
+                "attempt {} waits {}s, over the {}s ceiling",
+                attempt,
+                backoff_secs(attempt),
+                MAX_BACKOFF_SECS
+            );
+        }
     }
 
     /// The number a unit-level `TimeoutStartSec` must be derived from. Pinned

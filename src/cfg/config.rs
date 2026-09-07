@@ -134,6 +134,13 @@ impl Config {
     fn validate(&self) -> Result<()> {
         self.validate_marker_label()?;
         self.validate_move_position()?;
+        // Same rule, same reason: a `body-chars` too small to carry a
+        // truncation marker silently feeds the classifier unmarked fragments
+        // that read as complete messages. Fail at load, not per-thread at
+        // runtime.
+        if let Some(triage) = self.triage.as_ref() {
+            triage.validate()?;
+        }
         Ok(())
     }
 

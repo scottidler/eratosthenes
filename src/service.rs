@@ -2,12 +2,78 @@ use eyre::{Context, Result};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use eratosthenes::cfg::account::{Account, discover_accounts};
 use eratosthenes::cfg::config::{AuthConfig, Config, xdg_config_dir};
 use eratosthenes::cfg::expand_tilde;
+use eratosthenes::digest::bullets::DIGEST_TIMEOUT;
+use eratosthenes::gmail::rate::worst_case_call_duration;
+use eratosthenes::triage::claude::TRIAGE_TIMEOUT;
+use eratosthenes::triage::draft::DRAFT_TIMEOUT;
 
 const SERVICE_NAME: &str = "eratosthenes";
+
+/// Ceiling on ONE unit start (`TimeoutStartSec`), derived rather than guessed.
+///
+/// This is a BACKSTOP and NOT the mechanism that bounds work: the per-call
+/// bounds in `gmail::rate` and the per-child bounds in `triage::claude` are
+/// what stop a run from hanging. What this catches is a future unbounded await
+/// somewhere neither of those covers.
+///
+/// For `Type=oneshot` it is genuinely load-bearing, which is the correction
+/// audit MF3 forced. systemd DISABLES the start timeout by default for oneshot
+/// units, so without this nothing ever stops a wedged unit -- and
+/// `KillMode=control-group`, which only applies on STOP, can therefore never
+/// fire. Worse, the run unit's timer is `OnUnitActiveSec`: while a unit sits in
+/// `activating`, later start jobs MERGE into the running one, so the 5-minute
+/// engine silently stops with no failed unit and no log line. That is the exact
+/// invisible failure the transport bounds were added to remove, one level up.
+///
+/// Every value below is sized ABOVE the worst LEGITIMATE run and no tighter. A
+/// bound that can kill healthy work is worse than no bound, and nothing here
+/// depends on being tight. The derivations are additive worst cases that assume
+/// EVERY call burns its full ceiling, which is not physically reachable -- that
+/// pessimism is the safety margin.
+///
+/// Gmail calls a derivation does not enumerate one by one: pagination pages,
+/// label creation and its recheck, `users.getProfile`, the token refresh that
+/// happens inside a call.
+const GMAIL_CALL_HEADROOM: u32 = 8;
+
+/// The aging engine makes no LLM call: it is Gmail traffic and local filtering.
+/// A healthy run is seconds, so this is generously above it while still
+/// restoring the engine within ~13 timer fires rather than never.
+fn run_start_timeout() -> Duration {
+    worst_case_call_duration() * (12 + GMAIL_CALL_HEADROOM)
+}
+
+/// One bullet pass plus the pinned-inbox fetch. `DIGEST_TIMEOUT` is the LLM
+/// call; the rest is Gmail.
+fn digest_start_timeout() -> Duration {
+    DIGEST_TIMEOUT + worst_case_call_duration() * (4 + GMAIL_CALL_HEADROOM)
+}
+
+/// One classify call, then one draft call per candidate thread at the cap, plus
+/// the Gmail calls around them. Tracks `max-threads` so raising the cap cannot
+/// silently invalidate the bound.
+fn triage_start_timeout(max_threads: u32) -> Duration {
+    let llm = TRIAGE_TIMEOUT + DRAFT_TIMEOUT * max_threads;
+    let gmail = worst_case_call_duration() * (max_threads + GMAIL_CALL_HEADROOM);
+    llm + gmail
+}
+
+/// The largest `max-threads` across triage-enabled accounts. One timer fires
+/// one `eratosthenes triage` that loops over every account, so the bound has to
+/// cover the biggest of them, not the first.
+fn resolve_max_threads(triage_accounts: &[&Account]) -> u32 {
+    triage_accounts
+        .iter()
+        .filter_map(|a| a.config.triage.as_ref())
+        .map(|t| t.max_threads)
+        .max()
+        .unwrap_or(0)
+}
 
 fn service_dir() -> Result<PathBuf> {
     let dir = xdg_config_dir()
@@ -129,9 +195,11 @@ Description=Eratosthenes Gmail Inbox Zero Engine
 Type=oneshot
 ExecStart={binary} run
 Environment=PATH={cargo_bin}:/usr/local/bin:/usr/bin:/bin
+TimeoutStartSec={timeout}
 ",
         binary = binary.display(),
         cargo_bin = cargo_bin_dir(),
+        timeout = run_start_timeout().as_secs(),
     )
 }
 
@@ -163,9 +231,11 @@ Type=oneshot
 ExecStart={binary} digest
 Environment=PATH={claude_path}
 EnvironmentFile=-%h/.config/eratosthenes/digest.env
+TimeoutStartSec={timeout}
 ",
         binary = binary.display(),
         claude_path = claude_capable_path(),
+        timeout = digest_start_timeout().as_secs(),
     )
 }
 
@@ -189,7 +259,7 @@ WantedBy=timers.target
 /// Resolved Decisions 2026-09-06) carries no credential for this unit to
 /// source. The credential lives in the child's own `claude` login, not in
 /// eratosthenes' environment.
-fn generate_triage_service(binary: &Path) -> String {
+fn generate_triage_service(binary: &Path, max_threads: u32) -> String {
     format!(
         "\
 [Unit]
@@ -199,9 +269,11 @@ Description=Eratosthenes LLM Triage
 Type=oneshot
 ExecStart={binary} triage
 Environment=PATH={claude_path}
+TimeoutStartSec={timeout}
 ",
         binary = binary.display(),
         claude_path = claude_capable_path(),
+        timeout = triage_start_timeout(max_threads).as_secs(),
     )
 }
 
@@ -545,8 +617,11 @@ fn install_triage_units(binary: &Path, accounts: &[Account]) -> Result<()> {
 
     let svc_path = triage_service_path()?;
     let tmr_path = triage_timer_path()?;
-    std::fs::write(&svc_path, generate_triage_service(binary))
-        .context("Failed to write triage service file")?;
+    std::fs::write(
+        &svc_path,
+        generate_triage_service(binary, resolve_max_threads(&triage_accounts)),
+    )
+    .context("Failed to write triage service file")?;
     std::fs::write(&tmr_path, generate_triage_timer(&schedule))
         .context("Failed to write triage timer file")?;
 
@@ -900,7 +975,7 @@ mod tests {
     #[test]
     fn test_generate_triage_service() {
         let binary = PathBuf::from("/home/user/.cargo/bin/eratosthenes");
-        let output = generate_triage_service(&binary);
+        let output = generate_triage_service(&binary, 50);
 
         assert!(output.contains("Type=oneshot"));
         assert!(output.contains("ExecStart=/home/user/.cargo/bin/eratosthenes triage"));
@@ -910,6 +985,64 @@ mod tests {
         // Same PATH fix as the digest unit: `claude` must resolve under systemd.
         assert!(output.contains("Environment=PATH="));
         assert!(output.contains(".local/bin"));
+    }
+
+    /// Audit MF3. systemd disables the start timeout by default for
+    /// Type=oneshot, so a unit without this line can wedge forever, and the run
+    /// unit's OnUnitActiveSec timer then merges later start jobs into the hung
+    /// one: the engine stops silently. Every generated service must carry it.
+    #[test]
+    fn test_every_generated_service_bounds_its_start() {
+        let binary = PathBuf::from("/usr/bin/eratosthenes");
+        for (name, unit) in [
+            ("run", generate_service(&binary)),
+            ("digest", generate_digest_service(&binary)),
+            ("triage", generate_triage_service(&binary, 50)),
+        ] {
+            assert!(
+                unit.contains("TimeoutStartSec="),
+                "{} unit has no start bound:\n{}",
+                name,
+                unit
+            );
+            assert!(
+                unit.contains("Type=oneshot"),
+                "{} is assumed oneshot by the reasoning above",
+                name
+            );
+        }
+    }
+
+    /// The bound must sit ABOVE the worst legitimate run, never near it: one
+    /// that can kill healthy work is worse than none. Asserted against the
+    /// per-call and per-child ceilings it is derived from.
+    #[test]
+    fn test_start_timeouts_exceed_the_work_they_bound() {
+        assert!(run_start_timeout() > worst_case_call_duration());
+        assert!(digest_start_timeout() > DIGEST_TIMEOUT + worst_case_call_duration());
+        assert!(triage_start_timeout(50) > TRIAGE_TIMEOUT + DRAFT_TIMEOUT * 50);
+
+        // The doc-literal value round 7 asked for, which would have SIGKILLed a
+        // healthy drafting run at its second draft.
+        assert!(
+            triage_start_timeout(50) > Duration::from_secs(360),
+            "the corrected bound must not be the one the doc got wrong"
+        );
+    }
+
+    /// Tracks `max-threads`, so raising the cap cannot silently invalidate the
+    /// bound.
+    #[test]
+    fn test_triage_start_timeout_scales_with_max_threads() {
+        assert!(triage_start_timeout(100) > triage_start_timeout(50));
+        assert!(triage_start_timeout(50) > triage_start_timeout(10));
+    }
+
+    /// One timer fires one run that loops every account, so the bound covers
+    /// the LARGEST cap, not the first account's.
+    #[test]
+    fn test_resolve_max_threads_takes_the_largest() {
+        assert_eq!(resolve_max_threads(&[]), 0);
     }
 
     #[test]

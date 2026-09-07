@@ -394,7 +394,7 @@ mod tests {
     /// rather than being added on top of it.
     #[test]
     fn test_truncate_never_exceeds_max() {
-        for max in 1..=64 {
+        for max in 0..=64 {
             let out = truncate(&"x".repeat(500), max);
             assert!(
                 out.chars().count() <= max,
