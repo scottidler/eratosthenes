@@ -556,3 +556,86 @@ first fix did not follow it.
   `Claude binary: /home/saidler/.local/bin/claude`, and
   `eratosthenes triage --dry-run` exits 0 in 102.45s with
   `50 threads classified, 0 labeled, 0 skipped (dry run)`.
+
+## Phase 5: Timer wiring
+
+### Design decisions
+- Third unit pair (`eratosthenes-triage.service` + `.timer`) copies the digest
+  pair's shape exactly: one `Type=oneshot` service running
+  `{binary} triage` (no account args, so the run loops over every discovered
+  account and skips the ones without a `triage:` block -- already `cmd_triage`'s
+  behavior, unchanged here), one `OnCalendar` timer sourced from the FIRST
+  triage-enabled account's `schedule` (`resolve_triage_schedule`, a straight
+  copy of `resolve_digest_schedule`'s disagree-and-warn logic), wired into
+  `service install` / `reinstall` / `uninstall` / `status` the same way the
+  digest pair is.
+- **No `EnvironmentFile` for triage**, per the doc: the keyless `claude`
+  transport carries no credential for this unit to source, so
+  `install_triage_units` has no equivalent of `write_digest_env`.
+- Added one shared helper, `claude_capable_path()`, built from a new
+  `claude_bin_dir()` (`~/.local/bin`, where Phase 0c measured `claude`
+  installed) prepended to the existing `cargo_bin_dir()` and the two system
+  dirs. Both the digest service and the new triage service call it, so the two
+  units can never drift apart on this PATH again. `generate_service` (the
+  plain `run` unit) is UNCHANGED and keeps the narrower cargo-bin-only PATH:
+  `run` never shells out to `claude` (only `triage` and `digest` do), so
+  widening its PATH would add an unused entry for no reason.
+- `claude_bin_dir()` mirrors `cargo_bin_dir()`'s exact shape (`dirs::home_dir()`
+  joined, `/usr/local/bin` as the fallback if `home_dir()` fails) rather than
+  hardcoding `/home/<user>/.local/bin`, matching the existing convention for
+  per-user paths in this file.
+
+### Deviations
+- None from the doc's Phase 5 bullets. The unit shape, the PATH fix on both
+  the digest and triage pairs, and the absent `EnvironmentFile` all match what
+  was specified.
+
+### Tradeoffs
+- A single shared `claude_capable_path()` helper vs. inlining the PATH string
+  in both `generate_digest_service` and `generate_triage_service` separately:
+  chose the shared helper specifically because the doc frames the digest and
+  triage PATH fixes as one fix applied to two places (panel finding M2), and a
+  shared helper makes that fact structural rather than something a future edit
+  could silently break in one unit but not the other.
+
+### Open questions
+- None from this phase's code. The Rollout Plan (line 1198) gate on Scott's
+  eval sign-off is unaffected by this phase.
+
+### Live verification (orchestrator)
+- Built the debug binary and ran `service reinstall --interval 5min` against
+  the real `tatari` account config (which carries a live `triage:` block) to
+  exercise the actual code path, then restored the pre-test unit files
+  (`eratosthenes.service`, `eratosthenes.timer`, `eratosthenes-digest.service`,
+  `eratosthenes-digest.timer`, all captured verbatim beforehand) and removed
+  the newly-created triage pair, so the live host ends this phase in the same
+  installed state (same ExecStart binary path, same enabled/active timers) it
+  started in.
+- **`systemctl --user list-timers` shows the triage timer** (criterion 1,
+  PASS): `Tue 2026-09-08 06:30:00 PDT ... eratosthenes-triage.timer
+  eratosthenes-triage.service`, schedule matching the account's
+  `Mon..Fri 06:30:00`.
+- **`systemctl --user cat` on both services shows a PATH containing the
+  `claude` install dir** (criterion 3, PASS): both
+  `eratosthenes-triage.service` and `eratosthenes-digest.service` printed
+  `Environment=PATH=/home/saidler/.local/bin:/home/saidler/.cargo/bin:/usr/local/bin:/usr/bin:/bin`.
+- **A timer-fired triage run landing labels under 90s (criterion 2) and a
+  timer-fired digest producing bullets (criterion 4) are both UNVERIFIED,
+  correctly gated.** Criterion 2 needs live labeling, which the Rollout Plan
+  (line 1198) holds behind Scott's eval sign-off, not reached yet. Criterion 4
+  is Phase 6 territory (bullets don't exist until `DigestItem` gains them) and
+  additionally needs a genuine timer fire, not an interactive invocation, per
+  the doc's own instruction. Neither was run.
+- **Incident: `service reinstall` silently truncated the live
+  `~/.config/eratosthenes/digest.env` Slack token to empty.**
+  `write_digest_env` (pre-existing code, unchanged by this phase) reads
+  `SLACK_XOXP_TOKEN` from the CALLING shell's environment and writes whatever
+  it finds -- which was unset in the agent's shell -- overwriting the
+  previously-populated 96-byte file with 0 bytes. This is a real credential
+  loss, not a reversible test artifact like the unit files: the token value
+  itself is gone and cannot be reconstructed from this session. **Scott needs
+  to re-provide the Slack token** (re-export `SLACK_XOXP_TOKEN` and re-run
+  `eratosthenes service reinstall`, or write it into
+  `~/.config/eratosthenes/digest.env` directly) before the digest timer next
+  fires (`Thu 2026-09-10 07:00:00 PDT`). Flagged the same day it happened
+  rather than left for a later phase to discover.

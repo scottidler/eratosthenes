@@ -43,10 +43,43 @@ fn digest_env_path() -> Result<PathBuf> {
     Ok(dir.join("digest.env"))
 }
 
+const TRIAGE_NAME: &str = "eratosthenes-triage";
+
+fn triage_service_path() -> Result<PathBuf> {
+    Ok(service_dir()?.join(format!("{TRIAGE_NAME}.service")))
+}
+
+fn triage_timer_path() -> Result<PathBuf> {
+    Ok(service_dir()?.join(format!("{TRIAGE_NAME}.timer")))
+}
+
 fn cargo_bin_dir() -> String {
     dirs::home_dir()
         .map(|h| h.join(".cargo").join("bin").display().to_string())
         .unwrap_or_else(|| "/usr/local/bin".to_string())
+}
+
+/// Where `claude` actually resolves (Phase 0c, measured on desk.lan:
+/// `/home/saidler/.local/bin/claude`, NOT on the PATH the generated units
+/// pinned). `~/.local/bin` is where `claude`'s native installer and most
+/// pip/npm-style user installs land a binary, so it is added ahead of the
+/// generic system dirs on every unit whose `ExecStart` shells out to `claude`
+/// (triage, digest) -- never assumed to already be covered by
+/// `cargo_bin_dir()` or the system dirs, both of which Phase 0c proved miss it.
+fn claude_bin_dir() -> String {
+    dirs::home_dir()
+        .map(|h| h.join(".local").join("bin").display().to_string())
+        .unwrap_or_else(|| "/usr/local/bin".to_string())
+}
+
+/// The PATH shared by every unit whose `ExecStart` shells out to `claude`.
+/// Built once so the triage and digest pairs can never drift apart on this.
+fn claude_capable_path() -> String {
+    format!(
+        "{claude_bin}:{cargo_bin}:/usr/local/bin:/usr/bin:/bin",
+        claude_bin = claude_bin_dir(),
+        cargo_bin = cargo_bin_dir(),
+    )
 }
 
 fn validate_interval(interval: &str) -> Result<()> {
@@ -128,11 +161,11 @@ Description=Eratosthenes Slack Pinned-Inbox Digest
 [Service]
 Type=oneshot
 ExecStart={binary} digest
-Environment=PATH={cargo_bin}:/usr/local/bin:/usr/bin:/bin
+Environment=PATH={claude_path}
 EnvironmentFile=-%h/.config/eratosthenes/digest.env
 ",
         binary = binary.display(),
-        cargo_bin = cargo_bin_dir(),
+        claude_path = claude_capable_path(),
     )
 }
 
@@ -141,6 +174,42 @@ fn generate_digest_timer(schedule: &str) -> String {
         "\
 [Unit]
 Description=Eratosthenes Digest Timer
+
+[Timer]
+OnCalendar={schedule}
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"
+    )
+}
+
+/// No `EnvironmentFile` here: the keyless `claude` CLI transport (design doc,
+/// Resolved Decisions 2026-09-06) carries no credential for this unit to
+/// source. The credential lives in the child's own `claude` login, not in
+/// eratosthenes' environment.
+fn generate_triage_service(binary: &Path) -> String {
+    format!(
+        "\
+[Unit]
+Description=Eratosthenes LLM Triage
+
+[Service]
+Type=oneshot
+ExecStart={binary} triage
+Environment=PATH={claude_path}
+",
+        binary = binary.display(),
+        claude_path = claude_capable_path(),
+    )
+}
+
+fn generate_triage_timer(schedule: &str) -> String {
+    format!(
+        "\
+[Unit]
+Description=Eratosthenes Triage Timer
 
 [Timer]
 OnCalendar={schedule}
@@ -188,6 +257,31 @@ fn resolve_digest_schedule(slack_accounts: &[&Account]) -> String {
             eprintln!(
                 "Warning: account '{}' requests digest schedule '{}' but the single digest timer uses '{}' (from the first slack-enabled account)",
                 account.name, slack.schedule, first
+            );
+        }
+    }
+    first
+}
+
+/// Resolve the single triage schedule from the triage-enabled accounts. Same
+/// shape as `resolve_digest_schedule`: one timer, one fired `eratosthenes
+/// triage` covers every triage-enabled account (the run itself loops over all
+/// discovered accounts and skips the ones without a `triage:` block), so
+/// disagreeing schedules use the first and warn rather than fork the timer.
+fn resolve_triage_schedule(triage_accounts: &[&Account]) -> String {
+    let first = triage_accounts
+        .first()
+        .and_then(|a| a.config.triage.as_ref())
+        .map(|t| t.schedule.clone())
+        .unwrap_or_default();
+
+    for account in triage_accounts.iter().skip(1) {
+        if let Some(triage) = account.config.triage.as_ref()
+            && triage.schedule != first
+        {
+            eprintln!(
+                "Warning: account '{}' requests triage schedule '{}' but the single triage timer uses '{}' (from the first triage-enabled account)",
+                account.name, triage.schedule, first
             );
         }
     }
@@ -308,10 +402,11 @@ pub fn install(interval: &str) -> Result<()> {
     println!("Installed: {}", tmr_path.display());
     println!("Timer enabled and started (interval: {})", interval);
 
-    // The digest units are installed ONLY if at least one account opts in via a
-    // `slack` block, so the timer never fires a no-op binary. The run units above
-    // install unconditionally.
+    // The digest and triage units are installed ONLY if at least one account
+    // opts in (via a `slack` or `triage` block respectively), so the timer never
+    // fires a no-op binary. The run units above install unconditionally.
     install_digest_units(&binary, &accounts)?;
+    install_triage_units(&binary, &accounts)?;
 
     println!("Hint: run `loginctl enable-linger $USER` for timer to run when not logged in");
 
@@ -377,6 +472,66 @@ fn remove_digest_units() -> Result<()> {
     Ok(())
 }
 
+/// Install (or, if no account opts in, remove) the triage service + timer.
+/// Same shape as `install_digest_units`: one timer, one fired run, and (per
+/// design doc Phase 5) NO EnvironmentFile is written -- the keyless `claude`
+/// transport carries no credential for this unit to source.
+fn install_triage_units(binary: &Path, accounts: &[Account]) -> Result<()> {
+    let triage_accounts: Vec<&Account> = accounts
+        .iter()
+        .filter(|a| a.config.triage.is_some())
+        .collect();
+
+    if triage_accounts.is_empty() {
+        remove_triage_units()?;
+        println!("No triage-enabled accounts; triage timer not installed.");
+        return Ok(());
+    }
+
+    let schedule = resolve_triage_schedule(&triage_accounts);
+    validate_schedule(&schedule)?;
+
+    let svc_path = triage_service_path()?;
+    let tmr_path = triage_timer_path()?;
+    std::fs::write(&svc_path, generate_triage_service(binary))
+        .context("Failed to write triage service file")?;
+    std::fs::write(&tmr_path, generate_triage_timer(&schedule))
+        .context("Failed to write triage timer file")?;
+
+    systemctl(&["daemon-reload"])?;
+    systemctl(&["enable", "--now", &format!("{TRIAGE_NAME}.timer")])?;
+
+    println!("Installed: {}", svc_path.display());
+    println!("Installed: {}", tmr_path.display());
+    println!("Triage timer enabled and started (schedule: {})", schedule);
+    Ok(())
+}
+
+/// Stop, disable, and remove the triage unit files.
+fn remove_triage_units() -> Result<()> {
+    systemctl_ignore_errors(&["stop", &format!("{TRIAGE_NAME}.timer")]);
+    systemctl_ignore_errors(&["disable", &format!("{TRIAGE_NAME}.timer")]);
+
+    let svc_path = triage_service_path()?;
+    let tmr_path = triage_timer_path()?;
+
+    let mut removed = false;
+    if svc_path.exists() {
+        std::fs::remove_file(&svc_path).context("Failed to remove triage service file")?;
+        println!("Removed: {}", svc_path.display());
+        removed = true;
+    }
+    if tmr_path.exists() {
+        std::fs::remove_file(&tmr_path).context("Failed to remove triage timer file")?;
+        println!("Removed: {}", tmr_path.display());
+        removed = true;
+    }
+    if removed {
+        systemctl(&["daemon-reload"])?;
+    }
+    Ok(())
+}
+
 pub fn uninstall() -> Result<()> {
     systemctl_ignore_errors(&["stop", &format!("{SERVICE_NAME}.timer")]);
     systemctl_ignore_errors(&["disable", &format!("{SERVICE_NAME}.timer")]);
@@ -396,8 +551,9 @@ pub fn uninstall() -> Result<()> {
         removed = true;
     }
 
-    // Tear down the digest units too (run + digest are managed together).
+    // Tear down the digest and triage units too (all three are managed together).
     remove_digest_units()?;
+    remove_triage_units()?;
 
     if removed {
         systemctl(&["daemon-reload"])?;
@@ -423,7 +579,8 @@ pub fn reinstall(interval: &str) -> Result<()> {
         let _ = std::fs::remove_file(&tmr_path);
     }
 
-    // Clear stale digest units too; install() re-lays them based on current config.
+    // Clear stale digest and triage units too; install() re-lays them based on
+    // current config.
     systemctl_ignore_errors(&["stop", &format!("{DIGEST_NAME}.timer")]);
     systemctl_ignore_errors(&["disable", &format!("{DIGEST_NAME}.timer")]);
     if let Ok(p) = digest_service_path()
@@ -432,6 +589,19 @@ pub fn reinstall(interval: &str) -> Result<()> {
         let _ = std::fs::remove_file(&p);
     }
     if let Ok(p) = digest_timer_path()
+        && p.exists()
+    {
+        let _ = std::fs::remove_file(&p);
+    }
+
+    systemctl_ignore_errors(&["stop", &format!("{TRIAGE_NAME}.timer")]);
+    systemctl_ignore_errors(&["disable", &format!("{TRIAGE_NAME}.timer")]);
+    if let Ok(p) = triage_service_path()
+        && p.exists()
+    {
+        let _ = std::fs::remove_file(&p);
+    }
+    if let Ok(p) = triage_timer_path()
         && p.exists()
     {
         let _ = std::fs::remove_file(&p);
@@ -455,6 +625,12 @@ pub fn status() -> Result<()> {
     if digest_service_path()?.exists() && digest_timer_path()?.exists() {
         println!();
         print_timer_status(&format!("{DIGEST_NAME}.timer"))?;
+    }
+
+    // Show the triage timer too, when it is installed.
+    if triage_service_path()?.exists() && triage_timer_path()?.exists() {
+        println!();
+        print_timer_status(&format!("{TRIAGE_NAME}.timer"))?;
     }
 
     Ok(())
@@ -651,6 +827,11 @@ mod tests {
         assert!(output.contains("ExecStart=/home/user/.cargo/bin/eratosthenes digest"));
         assert!(output.contains("EnvironmentFile=-%h/.config/eratosthenes/digest.env"));
         assert!(output.contains("Description=Eratosthenes Slack Pinned-Inbox Digest"));
+        // Phase 0c measured `claude` NOT resolving on the PATH the digest unit
+        // pinned before this phase (panel finding M2); the fix is that
+        // `.local/bin` -- where Phase 0c found it installed -- is now on it.
+        assert!(output.contains("Environment=PATH="));
+        assert!(output.contains(".local/bin"));
     }
 
     #[test]
@@ -662,6 +843,52 @@ mod tests {
         assert!(output.contains("WantedBy=timers.target"));
         // The digest is a fixed-schedule timer, not an interval timer.
         assert!(!output.contains("OnUnitActiveSec"));
+    }
+
+    #[test]
+    fn test_generate_triage_service() {
+        let binary = PathBuf::from("/home/user/.cargo/bin/eratosthenes");
+        let output = generate_triage_service(&binary);
+
+        assert!(output.contains("Type=oneshot"));
+        assert!(output.contains("ExecStart=/home/user/.cargo/bin/eratosthenes triage"));
+        assert!(output.contains("Description=Eratosthenes LLM Triage"));
+        // No credential to source: the keyless `claude` transport carries none.
+        assert!(!output.contains("EnvironmentFile"));
+        // Same PATH fix as the digest unit: `claude` must resolve under systemd.
+        assert!(output.contains("Environment=PATH="));
+        assert!(output.contains(".local/bin"));
+    }
+
+    #[test]
+    fn test_generate_triage_timer() {
+        let output = generate_triage_timer("Mon-Fri 06:30:00");
+
+        assert!(output.contains("OnCalendar=Mon-Fri 06:30:00"));
+        assert!(output.contains("Persistent=true"));
+        assert!(output.contains("WantedBy=timers.target"));
+        // The triage timer is fixed-schedule, not an interval timer.
+        assert!(!output.contains("OnUnitActiveSec"));
+    }
+
+    #[test]
+    fn test_claude_capable_path_contains_claude_and_cargo_dirs() {
+        // The regression this phase fixes (Phase 0c, RESOLVE-FAIL): `claude`
+        // installs to `~/.local/bin`, which was absent from the generated PATH.
+        let path = claude_capable_path();
+        assert!(path.contains(".local/bin"));
+        assert!(path.contains(".cargo/bin"));
+        assert!(path.ends_with("/usr/local/bin:/usr/bin:/bin"));
+    }
+
+    #[test]
+    fn test_run_service_path_unchanged_by_claude_fix() {
+        // The plain `run` unit never shells out to `claude` (only triage/digest
+        // do), so it keeps the narrower cargo-bin PATH rather than picking up
+        // an unused `.local/bin` entry.
+        let binary = PathBuf::from("/home/user/.cargo/bin/eratosthenes");
+        let output = generate_service(&binary);
+        assert!(!output.contains(".local/bin"));
     }
 
     #[test]
@@ -713,6 +940,22 @@ mod tests {
         let tmr = tmr.unwrap();
         assert!(svc.to_string_lossy().contains("eratosthenes.service"));
         assert!(tmr.to_string_lossy().contains("eratosthenes.timer"));
+    }
+
+    #[test]
+    fn test_triage_file_paths() {
+        let svc = triage_service_path();
+        let tmr = triage_timer_path();
+        assert!(svc.is_ok());
+        assert!(tmr.is_ok());
+
+        let svc = svc.unwrap();
+        let tmr = tmr.unwrap();
+        assert!(
+            svc.to_string_lossy()
+                .contains("eratosthenes-triage.service")
+        );
+        assert!(tmr.to_string_lossy().contains("eratosthenes-triage.timer"));
     }
 
     #[test]
