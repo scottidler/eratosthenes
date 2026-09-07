@@ -5,7 +5,7 @@ use std::process::Command;
 
 use eratosthenes::cfg::account::{Account, discover_accounts};
 use eratosthenes::cfg::config::{AuthConfig, Config, xdg_config_dir};
-use eratosthenes::cfg::shellexpand;
+use eratosthenes::cfg::expand_tilde;
 
 const SERVICE_NAME: &str = "eratosthenes";
 
@@ -279,15 +279,8 @@ pub fn install(interval: &str) -> Result<()> {
         println!("Found accounts: {}", names.join(", "));
 
         for account in &accounts {
-            let token_path_str = shellexpand(
-                account
-                    .config
-                    .auth
-                    .token_cache_path()
-                    .to_str()
-                    .unwrap_or_default(),
-            );
-            if !Path::new(&token_path_str).exists() {
+            let token_path = expand_tilde(account.config.auth.token_cache_path());
+            if !token_path.exists() {
                 eprintln!(
                     "Warning: no token cache for '{}'. Run `eratosthenes auth login {}` first.",
                     account.name, account.name
@@ -492,8 +485,8 @@ pub fn stop() -> Result<()> {
 }
 
 pub fn auth_status(account_name: &str, auth: &AuthConfig) -> Result<()> {
-    let token_path_str = shellexpand(auth.token_cache_path().to_str().unwrap_or_default());
-    let token_path = Path::new(&token_path_str);
+    let token_path = expand_tilde(auth.token_cache_path());
+    let token_path = token_path.as_path();
 
     println!("Account: {}", account_name);
     println!("Token cache: {}", token_path.display());
@@ -723,15 +716,15 @@ mod tests {
     }
 
     #[test]
-    fn test_shellexpand_tilde() {
-        let expanded = shellexpand("~/some/path");
-        assert!(!expanded.starts_with("~/"));
-        assert!(expanded.ends_with("/some/path"));
+    fn test_expand_tilde_tilde() {
+        let expanded = expand_tilde("~/some/path");
+        assert!(!expanded.starts_with("~"));
+        assert!(expanded.ends_with("some/path"));
     }
 
     #[test]
-    fn test_shellexpand_no_tilde() {
-        let expanded = shellexpand("/absolute/path");
-        assert_eq!(expanded, "/absolute/path");
+    fn test_expand_tilde_no_tilde() {
+        let expanded = expand_tilde("/absolute/path");
+        assert_eq!(expanded, std::path::PathBuf::from("/absolute/path"));
     }
 }

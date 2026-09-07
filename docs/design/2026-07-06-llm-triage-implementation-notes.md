@@ -503,3 +503,56 @@ orchestrator's and is recorded here.
   `docs/eval/llm-triage-eval.md`. Two-consecutive-live-runs (criterion 1 of
   Phase 4's own success criteria) therefore stays UNVERIFIED by design, not by
   obstruction.
+
+## Tilde expansion: corrected to the in-house convention (orchestrator)
+
+Supersedes the `shellexpand` decision recorded under "Phase 4 live
+verification". Scott pointed out the repos already have a convention and the
+first fix did not follow it.
+
+### Design decisions
+- `expand_tilde` in `src/cfg/mod.rs`, shape copied from **otto**
+  (`otto/src/executor/layout.rs:52`), which is the in-house home-rolled
+  version. It uses `Path::strip_prefix("~")`, which matches on path
+  COMPONENTS: bare `~` expands, and `~otheruser` correctly passes through. The
+  previous eratosthenes helpers used a naive `strip_prefix("~/")` string match
+  that handled neither case.
+- No new crate. second-brain's `expand_tilde`
+  (`vault/src/paths.rs:68`) wraps the `shellexpand` crate, but `dirs` is
+  already a dependency here, so copying otto's implementation adds nothing.
+- **Expansion moved to LOAD time**, via `deserialize_tilde_pathbuf` and
+  `deserialize_tilde_pathbuf_opt` serde wrappers, following second-brain's
+  precedent. The earlier use-time fix was the wrong convention. Load-time also
+  means `config show` prints the resolved path, which an operator can act on.
+
+### Deviations
+- None from the design doc. This is convention alignment on a defect fix.
+
+### Tradeoffs
+- Load-time vs use-time expansion: load-time makes every consumer correct by
+  construction instead of each call site remembering. The cost is that
+  `config show` no longer echoes the YAML verbatim, which is the better
+  behavior for a path that must resolve.
+
+### Open questions
+- Cross-repo: second-brain still carries the `shellexpand` crate for a
+  function otto implements without it. Consolidating is a separate change in a
+  separate repo, NOT done here.
+
+### Findings
+- **THREE hand-rolled copies existed in this repo**, not one:
+  `src/service.rs`, `src/gmail/auth.rs:62`, and the one added during the first
+  fix. All three are now deleted in favor of the single `cfg::expand_tilde`.
+  The first fix missed the `auth.rs` copy entirely.
+- **A SECOND latent bug surfaced: `voice_profile` was never expanded by
+  anything.** `src/cfg/triage.rs:58` is `Option<PathBuf>` read straight from
+  YAML as `~/Claude/writing/VOICE.md`, and Phase 7 opens it directly. It would
+  have failed to find the voice profile at drafting time. Now expanded at load.
+  Phase 1's `test_triage_overrides` had asserted the literal `~` value, i.e.
+  the test encoded the bug; it now asserts the expanded path.
+- `creds_path` (`src/cfg/config.rs:43`) also expands at load now, making the
+  auth call sites' manual expansion redundant.
+- Verified after the refactor: `config show` prints
+  `Claude binary: /home/saidler/.local/bin/claude`, and
+  `eratosthenes triage --dry-run` exits 0 in 102.45s with
+  `50 threads classified, 0 labeled, 0 skipped (dry run)`.

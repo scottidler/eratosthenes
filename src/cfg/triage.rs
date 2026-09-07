@@ -26,7 +26,10 @@ pub struct TriageBucket {
 pub struct TriageConfig {
     /// Path to the `claude` binary. Unset -> resolved on PATH at call time
     /// (Phase 4/5); Phase 1 only carries the config value.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::cfg::deserialize_tilde_pathbuf_opt"
+    )]
     pub claude_binary: Option<PathBuf>,
 
     /// systemd OnCalendar string driving the triage timer. REQUIRED when this
@@ -54,7 +57,10 @@ pub struct TriageConfig {
 
     /// Path to Scott's voice profile, consumed by draft prompts only
     /// (Phase 7). No default: drafting is skipped loudly if unset.
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::cfg::deserialize_tilde_pathbuf_opt"
+    )]
     pub voice_profile: Option<PathBuf>,
 
     /// Classification taxonomy. Defaults to the five-bucket set shipped in
@@ -208,9 +214,16 @@ buckets:
         assert_eq!(config.body_chars, 2000);
         assert_eq!(config.classify_model, "claude-opus-5");
         assert_eq!(config.draft_model, "claude-opus-5");
+        // `~` is expanded at LOAD time by `cfg::deserialize_tilde_pathbuf_opt`.
+        // Phase 7 opens this path directly, so a literal `~` here would mean the
+        // voice profile is never found.
         assert_eq!(
             config.voice_profile,
-            Some(PathBuf::from("~/Claude/writing/VOICE.md"))
+            Some(
+                dirs::home_dir()
+                    .expect("home dir")
+                    .join("Claude/writing/VOICE.md")
+            )
         );
         assert_eq!(config.buckets.len(), 1);
         assert_eq!(config.buckets[0].name, "noise");

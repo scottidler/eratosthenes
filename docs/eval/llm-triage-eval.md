@@ -1,9 +1,9 @@
 # LLM Triage Eval: 50-thread dry-run sample
 
-**Date:** 2026-09-06  
-**Binary:** eratosthenes at c6221ac + shellexpand fix  
-**Model:** claude-haiku-4-5-20251001 via the keyless `claude` CLI transport (2.1.263)  
-**Command:** `eratosthenes triage --dry-run`  
+**Date:** 2026-09-06
+**Binary:** eratosthenes at c6221ac + shellexpand fix
+**Model:** claude-haiku-4-5-20251001 via the keyless `claude` CLI transport (2.1.263)
+**Command:** `eratosthenes triage --dry-run`
 **Mutations:** zero (tool reported `50 threads classified, 0 labeled, 0 skipped (dry run)`)
 
 ## Measurement

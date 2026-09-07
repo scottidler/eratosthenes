@@ -15,8 +15,8 @@ pub async fn build_authenticator(
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     >,
 > {
-    let secret_path = shellexpand(config.client_secret_path().to_str().unwrap_or_default());
-    let token_path = shellexpand(config.token_cache_path().to_str().unwrap_or_default());
+    let secret_path = config.client_secret_path().to_string_lossy().to_string();
+    let token_path = config.token_cache_path().to_string_lossy().to_string();
 
     let secret = read_application_secret(&secret_path)
         .await
@@ -51,19 +51,10 @@ pub async fn get_token(
 }
 
 pub async fn logout(config: &AuthConfig) -> Result<()> {
-    let token_path = shellexpand(config.token_cache_path().to_str().unwrap_or_default());
+    let token_path = config.token_cache_path().to_string_lossy().to_string();
     if std::path::Path::new(&token_path).exists() {
         std::fs::remove_file(&token_path).context("Failed to remove token cache")?;
         log::info!("Token cache removed: {}", token_path);
     }
     Ok(())
-}
-
-fn shellexpand(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest).to_string_lossy().to_string();
-    }
-    path.to_string()
 }

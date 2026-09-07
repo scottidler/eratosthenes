@@ -40,6 +40,7 @@ pub fn xdg_data_dir() -> Option<PathBuf> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct AuthConfig {
+    #[serde(deserialize_with = "crate::cfg::deserialize_tilde_pathbuf")]
     pub creds_path: PathBuf,
     #[serde(default = "default_callback_port")]
     pub callback_port: u16,
