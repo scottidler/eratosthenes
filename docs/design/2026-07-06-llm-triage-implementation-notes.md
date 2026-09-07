@@ -212,3 +212,101 @@ Implemented on 2026-09-06 against v0.3.0, host desk.lan. `otto ci` green.
   `Config::validate` (alongside `validate_move_position`) rather than as a
   runtime behavior. Not added here: it is config validation, which is Phase 1
   territory, and adding it now would reject configs that load today.
+
+## Phase 3: Bucket labels + state-filters (config, dotfiles repo)
+
+No eratosthenes source changed this phase; the deliverable is
+`scottidler/dotfiles` `HOME/.config/eratosthenes/tatari.yml`
+(committed separately in that repo).
+
+### Design decisions
+- Added five `state-filters` entries, one per `llm/*` bucket in
+  `src/cfg/triage.rs`'s default taxonomy: `keep-needs-reply` (`ttl: Keep`),
+  `age-fyi-work`, `age-recruiting`, `age-receipts`, `age-noise` (all
+  `action: Purgatory`). Names are literal, chosen to match the doc's own
+  success-criterion text (`[state:age-noise]`, `protected by
+  'keep-needs-reply'`) rather than the existing file's Title-Case style
+  (`Starred`, `Cull`), since `evaluate_thread`/`apply_state_action` print
+  `state_filter.name` verbatim (`src/engine.rs:916`, `:1007`) and the
+  criterion names the filters exactly.
+- `keep-needs-reply` placed immediately after `Important`, ahead of every
+  TTL/Cull entry, per the doc's ordering constraint (Keep-first, config
+  order, first-match-wins in `evaluate_thread`).
+- The four TTL bucket entries placed AFTER the Keep block but BEFORE `Cull`,
+  with a comment explaining why: `Cull` matches every `INBOX`-labeled thread
+  regardless of other labels (`StateFilter::matches_labels`,
+  `src/cfg/state.rs`), so a bucket entry placed after it would never fire on
+  a thread that still carries `INBOX` (which every freshly-classified bucket
+  thread does, per the doc's Data Model: classification only adds a bucket
+  label, it does not move the thread out of the inbox). This is the exact
+  hazard the design doc calls out at line 165-166 ("Cull matches ALL inbox
+  threads... so bucket labels MUST get their own state-filter entries or
+  they age on the default rail").
+- `action: Purgatory` (not a new stage) for all four bucket entries: reuses
+  the existing `INBOX -> Purgatory -> Oblivion` ladder from `Cull`/`Purge`
+  instead of introducing a parallel one. Keeps `derive_stages` unchanged
+  (still `[INBOX, Purgatory, Oblivion]`) and needs no engine change, matching
+  this phase's scope (Phase 4 owns the engine).
+- Per-bucket TTL values are a config knob the doc explicitly leaves
+  unspecified ("Each bucket's TTL is a config knob", doc line 167; "llm/noise
+  -> short TTL, etc.", line 224) beyond "needs-reply protected, noise
+  shortest". Chose: `fyi-work` 3d read / 7d unread (transient work
+  notifications, same read/unread split as `Cull`), `recruiting` 3d flat,
+  `receipts` 7d flat (kept a bit longer for reference), `noise` 1d flat
+  (shortest, per the doc's own "short TTL" language). These are Scott's to
+  retune; flagged below as an open question rather than silently assumed
+  correct forever.
+
+### Deviations
+- **Label-creation half of this phase was NOT attempted, per explicit
+  orchestrator instruction.** The doc's Phase 3 bullet also calls for
+  creating the `llm/*` labels in the live work Gmail account via one-off
+  `gws` calls. Both `gws gmail users labels create` and `gws gmail users
+  drafts create` are denied by this session's permission classifier (writes
+  blocked, reads unaffected); no alternate route was attempted, per
+  instruction. This is a bootstrap-convenience step only: the design doc
+  states the engine ensures `llm/*` labels exist itself from Phase 4 onward
+  ("Labels: the engine ensures `llm/*` labels exist at run start
+  (`labels.create`, idempotent, fail loudly). No operator label step.", doc
+  line 252), so nothing here is blocked on it. Deferred to Phase 4.
+- Filter naming (`age-noise`, `keep-needs-reply`, lowercase-kebab) diverges
+  from the pre-existing file's Title-Case names (`Starred`, `Cull`, `Purge`).
+  Not a spec gap: the doc's own success criterion fixes these exact strings
+  as the expected `[state:...]` log-line content, so matching the file's
+  prior style would have failed the criterion instead of the doc.
+
+### Tradeoffs
+- One `action: Purgatory` ladder shared by `Cull` and all four bucket
+  filters vs. a dedicated `Bucket-Purgatory` stage per bucket (or per
+  bucket-group). Chose the shared ladder: it needs zero engine changes,
+  keeps `derive_stages` a two-hop ladder, and the existing `Purge` entry
+  (`Purgatory -> Oblivion`, flat 3d) already generalizes over "how a thread
+  got into Purgatory". The cost is that a `llm/receipts` thread and a
+  same-age plain-INBOX thread become indistinguishable once both land in
+  Purgatory; accepted because nothing downstream currently needs to tell
+  them apart.
+- Flat TTLs (`age-recruiting`, `age-receipts`, `age-noise`) vs. `read`/
+  `unread` splits (`age-fyi-work`, matching `Cull`) for all four. Chose flat
+  for three of four: recruiting/receipts/noise are catch-all buckets Scott
+  is unlikely to leave "unread but seen" the way an actionable fyi-work
+  notification might be, so the read/unread distinction buys little; kept
+  it for `fyi-work` specifically because that bucket is the one most likely
+  to contain something worth reading before it ages.
+
+### Open questions
+- **The four numeric TTL values (3d/7d unread for fyi-work, 3d for
+  recruiting, 7d for receipts, 1d for noise) are this implementer's choice,
+  not specified anywhere in the design doc.** Scott should confirm or retune
+  them; they are easy to change (YAML edit, no code).
+- **Success criterion 2 is UNVERIFIED, not passing and not failing.** The
+  doc's stated Phase 3 success criteria are (1) `config validate` passes and
+  (2) engine `--dry-run` output contains a `[state:age-noise]` line for a
+  hand-labeled `llm/noise` test thread and a `protected by
+  'keep-needs-reply'` line for a hand-labeled `llm/needs-reply` thread.
+  Criterion 1 is verified true (`config validate` output recorded below).
+  Criterion 2 requires hand-labeling live Gmail threads with `llm/noise` and
+  `llm/needs-reply`, which requires the same blocked Gmail-write path as
+  label creation above. Not attempted, not faked, not weakened: reported
+  here as UNVERIFIED with this reason, for Phase 4 (or a follow-up manual
+  step) to close out once `gws` writes or the engine's own label-ensure are
+  available.
