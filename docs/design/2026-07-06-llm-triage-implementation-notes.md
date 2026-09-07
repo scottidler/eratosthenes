@@ -310,3 +310,143 @@ No eratosthenes source changed this phase; the deliverable is
   here as UNVERIFIED with this reason, for Phase 4 (or a follow-up manual
   step) to close out once `gws` writes or the engine's own label-ensure are
   available.
+
+## Phase 4: Triage engine
+
+Implemented 2026-09-06 against v0.3.0 on top of Phase 3 (`ecaacf6`). Scope set
+by the orchestrator: code and tests only. Live verification, the 50-thread
+eval table, and the two timeout measurements the doc's success criteria demand
+are the orchestrator's and are STILL OUTSTANDING (see Open questions).
+
+New modules, all under `src/triage/`:
+- `body.rs` -- MIME walk (text/plain preferred anywhere in the tree),
+  html->text fallback, quoted-reply and signature stripping, char-safe
+  truncation.
+- `thread.rs` -- the `format=full` thread/message shape, the extended header
+  projection, self-detection against the account's own address.
+- `claude.rs` -- the keyless subprocess transport: the seven-flag hardened
+  argv, `env_clear()` + allowlist, stdin/stdout/stderr as temp FILES, tokio
+  timeout with explicit kill AND wait, tolerant envelope parse, structured
+  failure classes.
+- `classify.rs` -- the prompt (taxonomy folded in from config), the stdin
+  payload with the per-thread newest-first char budget, the strict response
+  parse.
+- `mod.rs` + `tests.rs` -- candidate selection, the cap, plan-then-apply
+  mutations, the run loop.
+Plus `search_message_refs`, `get_thread_full` and `profile_email` on
+`GmailClient`, and the `triage [accounts...] [--dry-run]` subcommand.
+
+### Design decisions
+- **Dry-run is enforced by the PLAN, not by a branch in the write loop** --
+  `plan_labels` / `plan_writes` (`src/triage/mod.rs`) both return empty under
+  `--dry-run`, so the apply loops have nothing to apply. A guard inside the
+  loop is one careless edit away from a dry run that writes; an empty plan is
+  not. Both are pinned by tests that first assert the non-dry-run case is
+  non-empty, so the tests bite.
+- **Triage's `--dry-run` is STRICTER than `run --dry-run`** -- `run` creates
+  missing labels during a dry run and says so; triage creates nothing. The
+  doc's API Design says "zero mutations" and Phase 4's dry run is the eval
+  gate's instrument, pointed at a live mailbox before anyone trusts it.
+- **`TriageThread`/`TriageMessage` are separate types from
+  `GmailThread`/`GmailMessage`** -- the aging engine re-fetches every inbox
+  thread at `format=metadata` every 5 minutes, and adding an
+  always-`None` body field to its type would put a triage concern in that hot
+  path. `get_thread_full` returns the raw API thread and triage parses it.
+- **Header lookups are case-insensitive** (`TriageMessage::header`) -- servers
+  emit both `Message-ID` and `Message-Id`, and a case-sensitive map silently
+  returns `None` for half of them. `TRIAGE_HEADERS` is a projection, not a
+  request filter: `format=full` returns every header, so the list bounds what
+  triage KEEPS rather than what it asks for.
+- **Bucket labels are created Shown, `llm/seen` Hidden** -- same reasoning as
+  v0.3.0's `Triaged` marker: the marker lands on nearly every message and
+  would otherwise put a chip on all of them plus a sidebar row.
+- **Candidate recency is bought with one metadata get per candidate MESSAGE,
+  before the cap** -- `messages.list` returns no date, and the doc forbids
+  relying on its undocumented ordering. Capping first would mean capping on
+  that ordering, which is the environmental assumption this design refuses.
+- **One retry is on the CALL, not the thread** -- a schema miss is the model,
+  not the data. A per-thread retry would multiply one batched call back into N.
+  Individual bad entries (unknown bucket, unknown id, silence about a thread)
+  are per-thread SKIPS with a loud log; a skipped thread stays unseen and is
+  retried next run.
+- **The child's scratch files are deleted by a `Drop` guard on every path** --
+  they hold work-mail bodies; a leaked `/tmp` file turns a transient prompt
+  payload into an indefinite one.
+- **`FailureClass` is a typed enum with a human string per variant**, and every
+  `ClaudeFailure` renders the resolved version AND the floor. Phase 6's banner
+  needs the CLASS (doc, Resolved Decisions: auth vs transport), so the class
+  is produced here rather than re-derived from an error string later.
+
+### Deviations
+- **`claude --version` is resolved ONCE per run, not per call.** The doc says
+  "log the resolved version on every call". A run makes exactly one classify
+  call today, so this is the same thing in practice, and per-call resolution
+  would double the subprocess count for no information. The version is carried
+  on `ClaudeCli` and named in every failure, which is the property the doc
+  actually leans on.
+- **The version probe uses a pipe (`Command::output()`), the classify call does
+  not.** The no-pipe rule exists to avoid deadlock on a large payload; the
+  version probe's output is a single short line read to EOF. The payload path
+  is files, as specified.
+- **`plan_write` is a separate seam from `execute`.** The doc describes one
+  `threads.modify` per thread and nothing about structure; splitting the
+  decision (pure, tested) from the API call (thin) is the repo's own
+  plan-then-write idiom from v0.3.0 (`plan_filter_writes` ->
+  `apply_planned_write`). Same effect, correct seam.
+- **The cap's loud log is produced by a pure `cap_message` function** rather
+  than being formatted inline at the `warn!` site. Same output, but the
+  content of the loud line is then testable, which is what the phase's test
+  requirement is actually about.
+- **The `triage:` block in `dotfiles/HOME/.config/eratosthenes/tatari.yml` is
+  a GAP IN THE DESIGN DOC that this phase closed.** No phase adds a live
+  triage block: Phase 1 ships the schema and the commented example, Phase 3
+  adds only state-filters, and Phase 5's timer installs only when at least one
+  account HAS a `triage:` block. Without this, Phase 5 would install nothing
+  and Phase 6 would see no triage config. Added in a separate dotfiles commit,
+  using the taxonomy and defaults from `src/cfg/triage.rs` with an explicit
+  `schedule` (required, no default).
+
+### Tradeoffs
+- **N metadata gets to sort candidates vs. trusting `messages.list` order.**
+  Chose the gets: at ~10 threads/day the cost is noise, and the alternative is
+  exactly the undocumented-ordering assumption the doc rejects. The cost only
+  becomes real in a runaway (500 candidates -> 500 cheap gets before the cap
+  bites), and that case already logs loudly.
+- **Hand-rolled html->text vs. an html parser dependency.** Chose hand-rolled:
+  the consumer is an LLM that needs the words, not the document tree, and the
+  path is a FALLBACK most mail never takes (text/plain wins whenever it
+  exists). A parser dep would be carried by every build for that minority.
+- **Quote stripping by heuristic vs. keeping quoted chains.** Chose stripping:
+  the quoted chain is the previous messages, which are already in the payload
+  under their own ids, so keeping it spends the char budget twice on the same
+  text. The cost is a heuristic that can over-cut -- a prose line ending in
+  "wrote:" under 120 chars is treated as an attribution line. Bounded and
+  tested; the classifier still sees the subject and every other message.
+- **Skipping a thread the model ignored vs. defaulting it to the catch-all
+  bucket.** Chose skip: an unlabeled thread stays unseen and is retried, which
+  is recoverable, where a wrong `llm/noise` label starts a TTL clock on a
+  thread nobody classified.
+
+### Open questions
+- **Live verification is OUTSTANDING and belongs to the orchestrator.** This
+  phase was scoped to code and tests; the tool was never run against the live
+  Gmail account. Phase 4's stated success criteria still need: two consecutive
+  live runs (first labels, second a journal-verified no-op), the 50-thread
+  eval table at `docs/eval/llm-triage-eval.md` signed off at <= 5/50
+  disagreements, and the wall-clock measurement of a full 50-thread triage run
+  plus a 10-thread digest bullet pass, each timeout raised if it is not at
+  least 2x its measured duration.
+- **The 300s triage timeout is still PROVISIONAL** (`TRIAGE_TIMEOUT`,
+  `src/triage/claude.rs`). Phase 0c's 2.87s single call bears on neither
+  value; only the live 50-thread run above can confirm or move it.
+- **Phase 3's UNVERIFIED criterion is now unblocked but still unverified.**
+  Phase 3 could not hand-label live threads (Gmail writes were denied), so its
+  `[state:age-noise]` / `protected by 'keep-needs-reply'` criterion was left
+  open. A real `eratosthenes triage` run now creates the `llm/*` labels and
+  applies them, which is the cheapest way to close it -- worth doing in the
+  same session as the live verification above.
+- **The dotfiles `triage:` schedule is this implementer's choice:**
+  `Mon..Fri 06:30:00`, the doc's own illustrative value, chosen because it
+  lands 30 minutes BEFORE the existing digest (`Mon,Thu 07:00:00`) -- so on a
+  digest day the buckets are fresh when the digest reads them, rather than a
+  day stale. Scott should confirm the cadence; it is a YAML edit.

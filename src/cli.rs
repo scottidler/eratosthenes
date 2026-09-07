@@ -53,6 +53,22 @@ pub enum Command {
         mark_only: bool,
     },
 
+    /// Classify new inbox threads into llm/* bucket labels with one LLM call
+    Triage {
+        /// Account(s) to triage (default: all discovered)
+        #[arg(num_args = 0..)]
+        accounts: Vec<String>,
+
+        /// Dry run - full classify pass, prints the thread -> bucket table,
+        /// performs ZERO Gmail mutations
+        ///
+        /// Stricter than `run --dry-run`, which creates missing labels: this is
+        /// the eval gate's instrument and must be safe to point at a live
+        /// mailbox.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Post the pinned-inbox (Starred + Important) digest to Slack
     Digest {
         /// Account(s) to post a digest for (default: all discovered)

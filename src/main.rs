@@ -97,6 +97,48 @@ async fn cmd_run(cli: &Cli, names: Vec<String>, dry_run: bool, mark_only: bool) 
     Ok(())
 }
 
+async fn cmd_triage(cli: &Cli, names: Vec<String>, dry_run: bool) -> Result<()> {
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
+    let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+    logging::setup(&level, &account_names)?;
+
+    // Sequential and independent per account, aggregating failures at the end,
+    // exactly like cmd_digest: one account's expired `claude` login must not
+    // stop another account from being triaged.
+    let multi = accounts.len() > 1;
+    let mut errors: Vec<String> = Vec::new();
+    for account in accounts {
+        let name = account.name;
+        let config = account.config;
+
+        let result: Result<()> = logging::ACCOUNT
+            .scope(name.clone(), async {
+                if config.triage.is_none() {
+                    println!("[{}] no triage config; skipping triage", name);
+                    info!("[{}] skipping triage (no triage block)", name);
+                    return Ok(());
+                }
+                eratosthenes::triage(&name, &config, dry_run, multi).await
+            })
+            .await;
+
+        if let Err(e) = result {
+            eprintln!("[{}] FAILED: {:#}", name, e);
+            errors.push(format!("{}: {:#}", name, e));
+        }
+    }
+
+    if !errors.is_empty() {
+        eyre::bail!(
+            "{} account(s) failed:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
 async fn cmd_digest(cli: &Cli, names: Vec<String>) -> Result<()> {
     let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
     let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
@@ -256,6 +298,7 @@ async fn main() -> Result<()> {
 
     let cmd = Cli::command()
         .mut_subcommand("run", |cmd| cmd.after_help(&account_help))
+        .mut_subcommand("triage", |cmd| cmd.after_help(&account_help))
         .mut_subcommand("digest", |cmd| cmd.after_help(&account_help))
         .mut_subcommand("auth", |cmd| {
             cmd.mut_subcommand("login", |cmd| cmd.after_help(&account_help))
@@ -280,6 +323,9 @@ async fn main() -> Result<()> {
             dry_run,
             mark_only,
         }) => cmd_run(&cli, accounts.clone(), *dry_run, *mark_only).await,
+        Some(Command::Triage { accounts, dry_run }) => {
+            cmd_triage(&cli, accounts.clone(), *dry_run).await
+        }
         Some(Command::Digest { accounts }) => cmd_digest(&cli, accounts.clone()).await,
         Some(Command::Auth(opts)) => match &opts.command {
             AuthCommand::Login { account } => cmd_auth_login(&cli, account.clone()).await,

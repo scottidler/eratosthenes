@@ -103,7 +103,7 @@ impl GmailThread {
     }
 }
 
-fn parse_address_header(value: Option<&String>) -> Vec<String> {
+pub(crate) fn parse_address_header(value: Option<&String>) -> Vec<String> {
     let Some(raw) = value else {
         return vec![];
     };

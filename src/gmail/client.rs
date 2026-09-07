@@ -10,6 +10,13 @@ use crate::gmail::rate::{RateLimiter, with_retry};
 
 type Hub = Gmail<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>>;
 
+/// A `messages.list` hit: the message id plus the thread it belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageRef {
+    pub id: String,
+    pub thread_id: String,
+}
+
 pub struct GmailClient {
     hub: Hub,
     limiter: RateLimiter,
@@ -68,7 +75,17 @@ impl GmailClient {
 
     pub async fn search_messages(&self, query: &str) -> Result<Vec<String>> {
         debug!("search_messages: query={}", query);
-        let mut all_ids = Vec::new();
+        let refs = self.search_message_refs(query).await?;
+        Ok(refs.into_iter().map(|r| r.id).collect())
+    }
+
+    /// `messages.list` keeping the `threadId` each hit carries. Triage groups
+    /// candidate MESSAGES into distinct THREADS, and re-deriving that grouping
+    /// with a `messages.get` per hit would be a round trip for data the list
+    /// response already returned.
+    pub async fn search_message_refs(&self, query: &str) -> Result<Vec<MessageRef>> {
+        debug!("search_message_refs: query={}", query);
+        let mut all_refs: Vec<MessageRef> = Vec::new();
         let mut page_token: Option<String> = None;
 
         loop {
@@ -92,8 +109,8 @@ impl GmailClient {
 
             if let Some(messages) = result.messages {
                 for msg in messages {
-                    if let Some(id) = msg.id {
-                        all_ids.push(id);
+                    if let (Some(id), Some(thread_id)) = (msg.id, msg.thread_id) {
+                        all_refs.push(MessageRef { id, thread_id });
                     }
                 }
             }
@@ -104,8 +121,37 @@ impl GmailClient {
             }
         }
 
-        debug!("search_messages({}) -> {} results", query, all_ids.len());
-        Ok(all_ids)
+        debug!(
+            "search_message_refs({}) -> {} results",
+            query,
+            all_refs.len()
+        );
+        Ok(all_refs)
+    }
+
+    /// The authenticated account's own address, via `users.getProfile`.
+    /// Triage's self-detection (is the newest message Scott's own reply?)
+    /// compares `From` against it, and hard-coding it in config would be a
+    /// second source of truth for something the token already knows.
+    pub async fn profile_email(&self) -> Result<String> {
+        debug!("profile_email");
+        let profile = with_retry(&self.limiter, "users.getProfile", || async {
+            self.limiter.acquire(1).await;
+            self.hub
+                .users()
+                .get_profile("me")
+                .add_scope(GMAIL_SCOPE)
+                .doit()
+                .await
+                .map(|(_, p)| p)
+                .context("users.getProfile failed")
+        })
+        .await?;
+
+        profile
+            .email_address
+            .map(|e| e.to_lowercase())
+            .ok_or_else(|| eyre!("users.getProfile returned no email address"))
     }
 
     pub async fn get_message(&self, id: &str) -> Result<GmailMessage> {
@@ -258,6 +304,30 @@ impl GmailClient {
             id: thread.id.ok_or_else(|| eyre!("thread missing id"))?,
             messages,
         })
+    }
+
+    /// `threads.get` at `format=full`, which is the only format that carries
+    /// message BODIES. Deliberately separate from `get_thread`: the aging
+    /// engine stays on `format=metadata` (cheaper, and its quota cost is paid
+    /// on every inbox thread every 5 minutes), and only triage's small capped
+    /// candidate set pays for full payloads. Returns the raw API thread because
+    /// body extraction is a MIME walk over `MessagePart`, which
+    /// `GmailMessage::from_api` deliberately does not model.
+    pub async fn get_thread_full(&self, id: &str) -> Result<google_gmail1::api::Thread> {
+        log::trace!("get_thread_full: id={}", id);
+        with_retry(&self.limiter, "threads.get (full)", || async {
+            self.limiter.acquire(10).await;
+            self.hub
+                .users()
+                .threads_get("me", id)
+                .format("full")
+                .add_scope(GMAIL_SCOPE)
+                .doit()
+                .await
+                .map(|(_, t)| t)
+                .context(format!("threads.get({}, full) failed", id))
+        })
+        .await
     }
 
     pub async fn modify_message(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {

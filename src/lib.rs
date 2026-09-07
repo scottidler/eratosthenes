@@ -7,6 +7,7 @@ pub mod digest;
 pub mod engine;
 pub mod gmail;
 pub mod slack;
+pub mod triage;
 
 use crate::cfg::config::{Config, load_config};
 use crate::cfg::state::StateAction;
@@ -190,4 +191,20 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         important_set.len()
     );
     Ok(())
+}
+
+/// Classify one account's new inbox threads into `llm/*` bucket labels.
+/// A no-op for an account with no `triage:` block; the caller skips those
+/// before authenticating, and `triage::execute` re-checks.
+pub async fn triage(account: &str, config: &Config, dry_run: bool, multi: bool) -> Result<()> {
+    debug!("triage: account={}, dry_run={}", account, dry_run);
+
+    let prefix = if multi {
+        format!("[{}] ", account)
+    } else {
+        String::new()
+    };
+
+    let mut client = build_gmail_client(config, &prefix).await?;
+    triage::execute(&mut client, config, &prefix, dry_run).await
 }
