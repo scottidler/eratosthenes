@@ -135,7 +135,14 @@ async fn ensure_labels(client: &mut GmailClient, config: &Config) -> Result<()> 
 
     let hub = client.hub().clone();
     for name in &needed {
-        create_label_if_missing(&hub, &mut client.resolver, name, LabelVisibility::Shown).await?;
+        create_label_if_missing(
+            &hub,
+            &client.limiter,
+            &mut client.resolver,
+            name,
+            LabelVisibility::Shown,
+        )
+        .await?;
     }
 
     // The marker must be in the resolver before any action folds its ID into an add-list:
@@ -144,6 +151,7 @@ async fn ensure_labels(client: &mut GmailClient, config: &Config) -> Result<()> 
     // `ensure_labels` is the first thing `execute` does, so this ordering already holds.
     create_label_if_missing(
         &hub,
+        &client.limiter,
         &mut client.resolver,
         &config.marker_label,
         LabelVisibility::Hidden,

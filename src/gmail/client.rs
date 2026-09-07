@@ -36,7 +36,12 @@ pub struct MessageRef {
 
 pub struct GmailClient {
     hub: Hub,
-    limiter: RateLimiter,
+    /// Public for the same reason `resolver` is: `create_label_if_missing` is a
+    /// free function that needs the SHARED bucket while holding `&mut resolver`,
+    /// and disjoint field borrows are what make that possible. A private field
+    /// behind an accessor would be a second immutable borrow of `self` and would
+    /// not compile at either call site.
+    pub limiter: RateLimiter,
     pub resolver: LabelResolver,
     metadata_headers: Vec<String>,
 }

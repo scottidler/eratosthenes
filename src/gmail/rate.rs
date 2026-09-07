@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, Instant, sleep, timeout};
 
 const MAX_TOKENS: u32 = 15000;
 const REFILL_PER_SEC: u32 = 250;
@@ -52,9 +52,7 @@ impl RateLimiter {
     }
 
     pub async fn backoff(&self, attempt: u32) {
-        let base = 1u64 << attempt.min(6);
-        let jitter = base / 4;
-        let wait = base.min(MAX_BACKOFF_SECS).saturating_add(jitter);
+        let wait = backoff_secs(attempt);
         log::warn!(
             "Rate limited, backing off for {}s (attempt {})",
             wait,
@@ -64,12 +62,41 @@ impl RateLimiter {
     }
 }
 
+/// The backoff wait for one attempt, extracted as a pure function so the sleep
+/// and the worst-case arithmetic below cannot disagree about it.
+fn backoff_secs(attempt: u32) -> u64 {
+    let base = 1u64 << attempt.min(6);
+    let jitter = base / 4;
+    base.min(MAX_BACKOFF_SECS).saturating_add(jitter)
+}
+
 const MAX_RETRIES: u32 = 5;
+
+/// Per-request ceiling on ONE Gmail API call.
+///
+/// The transport under this had no bound of any kind, which meant a Gmail call
+/// could not fail, it could only hang: a black-holed connection during
+/// `threads.list` or `drafts.create` wedged the run forever, and the retry
+/// machinery below never saw an error to classify. Generous on purpose -- it is
+/// a hang detector, not a latency target, and the largest call here fetches one
+/// full thread.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Planted in a timeout's error text and matched by `is_retryable`, which
+/// classifies by substring over the whole context chain. A named const keeps
+/// the producer and the matcher from drifting apart; two bare literals in two
+/// files would not.
+pub const TIMEOUT_MARKER: &str = "transport timeout";
 
 /// Classify an error as a transient Gmail rate/availability failure worth
 /// retrying. The 429/503 details live in the SOURCE of a `.context()`-wrapped
 /// error, so the whole chain must be inspected (`{:#}`), not just `to_string()`
 /// which renders only the top context and would never see the code or reason.
+///
+/// A transport timeout is retryable: it is precisely the transient class this
+/// function exists for. Note that this multiplies the worst-case wall clock by
+/// `MAX_RETRIES`, which is why the unit-level bound has to be derived from
+/// `worst_case_call_duration()` and not from `REQUEST_TIMEOUT` alone.
 pub fn is_retryable(report: &eyre::Report) -> bool {
     let chain = format!("{report:#}");
     chain.contains("429")
@@ -77,6 +104,18 @@ pub fn is_retryable(report: &eyre::Report) -> bool {
         || chain.contains("rate")
         || chain.contains("RESOURCE_EXHAUSTED")
         || chain.contains("concurrent")
+        || chain.contains(TIMEOUT_MARKER)
+}
+
+/// The real ceiling on one `with_retry` call: every attempt timing out, plus
+/// every backoff between them. This is the number a `TimeoutStartSec` must be
+/// derived from -- `REQUEST_TIMEOUT` alone understates it by the retry factor,
+/// and sizing a unit bound below this would SIGKILL a run that was about to
+/// succeed on its last attempt.
+pub fn worst_case_call_duration() -> Duration {
+    let attempts = REQUEST_TIMEOUT * MAX_RETRIES;
+    let backoffs: u64 = (0..MAX_RETRIES).map(backoff_secs).sum();
+    attempts + Duration::from_secs(backoffs)
 }
 
 pub async fn with_retry<F, Fut, T>(
@@ -89,7 +128,24 @@ where
     Fut: std::future::Future<Output = eyre::Result<T>>,
 {
     for attempt in 0..MAX_RETRIES {
-        match f().await {
+        // The timeout is what puts the TRANSPORT inside this retry loop. An
+        // unbounded call yields no error, so `is_retryable` never runs and the
+        // backoff below never fires: the run just stops, forever. Turning
+        // elapsed time into a marked error is the whole point.
+        //
+        // The limiter's `acquire` sits inside `f` and so inside this bound. It
+        // is a local token bucket sized 15000 at 250/s against costs of at most
+        // 50, so its wait is sub-second next to `REQUEST_TIMEOUT`.
+        let outcome = match timeout(REQUEST_TIMEOUT, f()).await {
+            Ok(result) => result,
+            Err(_) => Err(eyre::eyre!(
+                "{}: {} returned nothing within {}s",
+                TIMEOUT_MARKER,
+                op_name,
+                REQUEST_TIMEOUT.as_secs()
+            )),
+        };
+        match outcome {
             Ok(val) => return Ok(val),
             Err(e) => {
                 if is_retryable(&e) {
@@ -157,5 +213,100 @@ mod tests {
             .context("threads.get(abc123) failed")
             .unwrap_err();
         assert!(!is_retryable(&report));
+    }
+
+    /// The marker has to survive being wrapped in context, because that is how
+    /// `with_retry`'s caller will have wrapped it by the time anyone reads it.
+    #[test]
+    fn test_is_retryable_classifies_a_transport_timeout_through_context() {
+        use eyre::Context;
+        let source = eyre::eyre!(
+            "{}: threads.list returned nothing within 30s",
+            TIMEOUT_MARKER
+        );
+        let report = Err::<(), _>(source)
+            .context("listing candidate threads failed")
+            .unwrap_err();
+        assert!(!report.to_string().contains(TIMEOUT_MARKER));
+        assert!(is_retryable(&report));
+    }
+
+    /// A hang is the failure mode an unbounded transport actually has, and the
+    /// one the old code could not see. Virtual time, so this costs no wall
+    /// clock while still exercising the REAL `REQUEST_TIMEOUT`.
+    #[tokio::test(start_paused = true)]
+    async fn test_with_retry_times_out_a_hanging_call_and_retries_it() {
+        use std::sync::atomic::AtomicU32;
+
+        let limiter = RateLimiter::new();
+        let attempts = AtomicU32::new(0);
+
+        let result: eyre::Result<()> = with_retry(&limiter, "threads.list", || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            async {
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        })
+        .await;
+
+        let err = result.expect_err("a call that never answers must not succeed");
+        assert!(format!("{err:#}").contains("after 5 retries"), "{err:#}");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            MAX_RETRIES,
+            "every attempt should have been made"
+        );
+    }
+
+    /// A call that answers is not slowed down by the bound.
+    #[tokio::test(start_paused = true)]
+    async fn test_with_retry_passes_through_a_call_that_answers() {
+        let limiter = RateLimiter::new();
+        let value = with_retry(&limiter, "threads.get", || async { Ok(7u32) })
+            .await
+            .unwrap();
+        assert_eq!(value, 7);
+    }
+
+    /// A NON-retryable error still returns immediately: adding the timeout must
+    /// not have turned every failure into five attempts.
+    #[tokio::test(start_paused = true)]
+    async fn test_with_retry_does_not_retry_a_permanent_error() {
+        use std::sync::atomic::AtomicU32;
+
+        let limiter = RateLimiter::new();
+        let attempts = AtomicU32::new(0);
+
+        let result: eyre::Result<()> = with_retry(&limiter, "threads.get", || {
+            attempts.fetch_add(1, Ordering::Relaxed);
+            async { Err(eyre::eyre!("thread missing id")) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    /// `backoff_secs` is the shared derivation; if it drifts from what
+    /// `backoff` sleeps, `worst_case_call_duration` silently lies.
+    #[test]
+    fn test_backoff_secs_is_the_documented_ladder() {
+        let ladder: Vec<u64> = (0..MAX_RETRIES).map(backoff_secs).collect();
+        assert_eq!(ladder, vec![1, 2, 5, 10, 20]);
+    }
+
+    /// The number a unit-level `TimeoutStartSec` must be derived from. Pinned
+    /// so that changing `REQUEST_TIMEOUT` or `MAX_RETRIES` forces a look at
+    /// whatever was sized against it.
+    #[test]
+    fn test_worst_case_call_duration_includes_the_retry_factor() {
+        let expected = REQUEST_TIMEOUT * MAX_RETRIES + Duration::from_secs(1 + 2 + 5 + 10 + 20);
+        assert_eq!(worst_case_call_duration(), expected);
+        assert_eq!(worst_case_call_duration(), Duration::from_secs(188));
+        assert!(
+            worst_case_call_duration() > REQUEST_TIMEOUT,
+            "a bound sized from REQUEST_TIMEOUT alone would kill a run about to succeed"
+        );
     }
 }

@@ -409,9 +409,15 @@ async fn ensure_triage_labels(
 
     let hub = client.hub().clone();
     for (name, visibility) in missing {
-        create_label_if_missing(&hub, &mut client.resolver, &name, visibility)
-            .await
-            .with_context(|| format!("ensuring triage label '{}'", name))?;
+        create_label_if_missing(
+            &hub,
+            &client.limiter,
+            &mut client.resolver,
+            &name,
+            visibility,
+        )
+        .await
+        .with_context(|| format!("ensuring triage label '{}'", name))?;
     }
     Ok(())
 }

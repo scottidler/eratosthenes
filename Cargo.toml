@@ -35,4 +35,10 @@ yup-oauth2 = "12.1.2"
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# `test-util` (NOT in tokio's "full") is what gives tests virtual time. The
+# transport-timeout tests exercise the real 30s REQUEST_TIMEOUT and the real
+# backoff ladder; without a paused clock they would cost 188s of wall time
+# each, and a shortened test-only timeout would not be testing the constant
+# that ships.
+tokio = { version = "1.50.0", features = ["full", "test-util"] }
 # For build.rs if needed

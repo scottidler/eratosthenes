@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bytes::Bytes;
 use eyre::{Context, Result, eyre};
 use http_body_util::{BodyExt, Full};
@@ -5,6 +7,18 @@ use log::{debug, warn};
 use serde::Deserialize;
 
 const POST_MESSAGE_URL: &str = "https://slack.com/api/chat.postMessage";
+
+/// Per-request ceiling on the Slack post, covering the request AND the body
+/// read: `into_body().collect()` is a second await on the network and a stalled
+/// response body hangs just as completely as a stalled request.
+///
+/// Same defect as the Gmail path had (`gmail::rate::REQUEST_TIMEOUT`): the
+/// hyper client applies no timeout, so this call could not fail, only hang, and
+/// it would have hung the whole digest unit. Tighter than Gmail's 30s because
+/// this is one small JSON POST, not a thread fetch. No retry here on purpose --
+/// the digest is idempotent-ish but not idempotent, and a retried post risks a
+/// double message; a missed digest is the better failure.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// HTTP client over the SAME hyper + hyper-rustls stack the Gmail client uses,
 /// so there is no second TLS/crypto provider and no `reqwest` dependency.
@@ -53,16 +67,9 @@ impl HttpSlackPoster {
             )
         })?;
 
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .context("Failed to load native TLS roots for Slack client")?
-            .https_or_http()
-            .enable_http1()
-            .build();
-
         let http =
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(connector);
+                .build(crate::https_connector()?);
 
         Ok(Self { token, http })
     }
@@ -96,19 +103,31 @@ impl SlackPoster for HttpSlackPoster {
             .body(Full::new(Bytes::from(body)))
             .context("Failed to build Slack request")?;
 
-        let resp = self
-            .http
-            .request(req)
-            .await
-            .context("Slack chat.postMessage request failed")?;
-
-        let status = resp.status();
-        let bytes = resp
-            .into_body()
-            .collect()
-            .await
-            .context("Failed to read Slack response body")?
-            .to_bytes();
+        // One bound over BOTH awaits: the request and the body read are each a
+        // network wait, and bounding only the first leaves the same hang one
+        // step later.
+        let (status, bytes) = tokio::time::timeout(REQUEST_TIMEOUT, async {
+            let resp = self
+                .http
+                .request(req)
+                .await
+                .context("Slack chat.postMessage request failed")?;
+            let status = resp.status();
+            let bytes = resp
+                .into_body()
+                .collect()
+                .await
+                .context("Failed to read Slack response body")?
+                .to_bytes();
+            Ok::<_, eyre::Report>((status, bytes))
+        })
+        .await
+        .map_err(|_| {
+            eyre!(
+                "Slack chat.postMessage returned nothing within {}s",
+                REQUEST_TIMEOUT.as_secs()
+            )
+        })??;
 
         if !status.is_success() {
             let preview = String::from_utf8_lossy(&bytes);

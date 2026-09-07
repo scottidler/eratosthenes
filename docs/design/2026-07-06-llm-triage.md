@@ -1273,13 +1273,52 @@ Decisions where an answered question belongs.
 - **Subprocess timeout: SETTLED, no new dep.** `tokio::time::timeout` around
   the child, then explicit `kill()` AND `wait()` -- eratosthenes already
   depends on `tokio = { features = ["full"] }`, so `wait-timeout` (clyde's
-  choice) buys nothing here. The in-process bound does NOT cover a child that
-  ignores SIGTERM, so the generated units also get `TimeoutStartSec`, set to
-  the transport timeout plus 60s. **Provisional values, to be confirmed by
-  measurement in Phase 0c and Phase 4, not adopted on faith:** 300s for a
-  triage run at the 50-thread cap, 120s for a digest bullet pass at the
-  10-thread AC size. Clyde's 900s is for a ~500KB report render and is the
-  wrong shape to copy.
+  choice) buys nothing here.
+
+  > **CORRECTED 2026-09-07 (audit C1).** This bullet continued: "The in-process
+  > bound does NOT cover a child that ignores SIGTERM, so the generated units
+  > also get `TimeoutStartSec`, set to the transport timeout plus 60s," with
+  > provisional values of 300s for triage and 120s for a digest bullet pass.
+  >
+  > **The premise is false.** The code never sends SIGTERM to the child.
+  > `src/triage/claude.rs` calls `child.start_kill()`, which is
+  > `std::process::Child::kill()`, which is SIGKILL on unix (tokio 1.50.0
+  > `process/mod.rs:1247`, and its own doc comment says so). SIGKILL cannot be
+  > ignored, so the failure mode this decision was written for does not exist.
+  > Orphaned grandchildren, the one real gap the in-process bound cannot close,
+  > are handled by systemd's default `KillMode=control-group` on unit stop, and
+  > not by `TimeoutStartSec` at all.
+  >
+  > The arithmetic was also written for a unit that makes ONE transport call.
+  > That holds for digest; triage makes one classify call plus up to
+  > `max-threads` draft calls, so "transport timeout + 60s" (360s) would SIGKILL
+  > a healthy triage run at its second draft. This is the same "one number doing
+  > two unrelated jobs" error caught above for the 120s collision, and missed
+  > here.
+  >
+  > **The real unbounded wait was the HTTP transport, which this doc never
+  > examined.** `hyper_util`'s legacy client sets no request, response, or
+  > connect timeout, and `HttpsConnectorBuilder::build()` supplies a default
+  > `HttpConnector` with none either. Every Gmail call and the Slack post could
+  > not fail, only hang, and a hang is invisible to `is_retryable` because it
+  > never produces an error to classify. Fixed at the transport instead: see
+  > `gmail::rate::REQUEST_TIMEOUT` (30s per call, inside the one `with_retry`
+  > chokepoint that all 13 Gmail calls pass through), `CONNECT_TIMEOUT` (10s,
+  > shared connector), and `slack::REQUEST_TIMEOUT` (15s over both the request
+  > and the body read).
+  >
+  > `TimeoutStartSec` is therefore NOT the mechanism that satisfies this
+  > section's intent, and remains unimplemented deliberately. It is now only a
+  > coarse backstop against a future unbounded await, and sizing it needs a
+  > measured healthy-run ceiling for a DRAFTING triage run, which nobody has
+  > taken. `gmail::rate::worst_case_call_duration()` (188s per call: five
+  > attempts plus the backoff ladder) is the per-call derivation any such number
+  > must start from. The theoretical whole-run worst case is ~6.8h, which is
+  > dominated by the case where every call times out five times, i.e. a run that
+  > is failing rather than one that is slow: a bound sized for it protects
+  > nothing.
+
+  Clyde's 900s is for a ~500KB report render and is the wrong shape to copy.
   **Naming, because `120` was doing two unrelated jobs** (panel R5-B3, and the
   R4 clarification caused it rather than curing it): the DIGEST TRANSPORT
   TIMEOUT is 120s, and Phase 5's "under 120s at the 50-thread cap" is a TRIAGE

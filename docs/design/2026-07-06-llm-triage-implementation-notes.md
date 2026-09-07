@@ -1079,3 +1079,94 @@ classification pass), S2 (the no-send guard is a source lint, not a capability
 restriction -- the OAuth scope is full `https://mail.google.com/`), S3 (3-7
 bullets is a happy-path guarantee). C2 is closed by this entry: the
 `expand-tilde` crate WAS adopted, superseding the earlier "No new crate" note.
+
+## Post-audit remediation (2026-09-07)
+
+### C4 and C3: closed
+
+`body-chars` is now a hard cap. `truncate` cut to `max` and THEN appended a
+12-char marker, so every truncated body overshot the config number by 12. The
+marker now comes out of the budget, matching `digest::bullets::cap_bullet`,
+which had it right.
+
+That made an unmarkable sliver reachable in `budget_messages`: a remainder
+smaller than the marker produced a bare fragment that reads to the model as a
+COMPLETE short message. `MIN_MARKED_FRAGMENT_CHARS` names that floor and the
+budget loop stops at it, with the newest message exempt so a `body-chars`
+configured below the floor still yields the message the thread is about rather
+than an empty list. Two Phase 4 tests asserted the old overshoot and were
+rewritten.
+
+The digest's subject and sender were the last unbounded fields: bullets and
+asks are capped where they are built, these were not. One 50k-char subject ate
+the whole `BUDGET`, drove the shrink ladder to its floor, and shed every other
+thread -- a 124-byte digest reading `... +N more`. Both are capped now, and a
+test asserts both caps sit ABOVE the fixture's real-mail figures so ordinary
+mail is untouched.
+
+### C1: the finding was real, the prescription was wrong
+
+C1 said `TimeoutStartSec` was settled in the doc and implemented nowhere. True.
+It should stay that way. The doc's stated premise -- "the in-process bound does
+not cover a child that ignores SIGTERM" -- is false: `start_kill()` is SIGKILL,
+which cannot be ignored (verified in the vendored tokio 1.50.0 source, not from
+memory). Orphaned grandchildren, the one real gap, are covered by systemd's
+default `KillMode=control-group`. And "transport timeout + 60s" assumes a unit
+makes one transport call, which is true of digest and false of triage, so the
+doc-literal 360s would have SIGKILLed a healthy drafting run at its second
+draft. The design doc bullet is corrected in place with this reasoning.
+
+**What was actually unbounded: the HTTP transport.** Nobody had looked.
+`hyper_util`'s legacy client applies no request, response, or connect timeout,
+and `HttpsConnectorBuilder::build()` hands it a default `HttpConnector` with
+none either. So every Gmail call and the Slack post could not fail, only hang,
+and the existing retry layer was powerless: a hang never produces an error for
+`is_retryable` to classify, so the backoff never fired. The run simply stopped,
+forever, with no log line and no failed unit.
+
+Fixed at the transport, where the bound belongs:
+
+- `gmail::rate::REQUEST_TIMEOUT` (30s) wraps `f().await` inside `with_retry`.
+  That is a single chokepoint covering all 13 Gmail calls, and an elapsed
+  timeout is turned into an error carrying `TIMEOUT_MARKER`, which
+  `is_retryable` matches -- so the transport now sits INSIDE the retry and
+  backoff machinery that already existed.
+- `CONNECT_TIMEOUT` (10s) on a hand-built `HttpConnector`, shared by the Gmail
+  and Slack paths via `crate::https_connector()` so they cannot drift.
+  `enforce_http(false)` is mandatory there and is not decoration: hyper-rustls's
+  own `build()` does it, because `HttpConnector` otherwise rejects every `https`
+  URI.
+- `slack::REQUEST_TIMEOUT` (15s) over the request AND the body read. Bounding
+  only the request would leave the identical hang one await later. Deliberately
+  NOT retried: a retried post risks a double digest, and a missed digest is the
+  better failure.
+
+**Two findings C1 never named, found while fixing it:**
+
+1. `create_label_if_missing` called `.doit()` directly, bypassing `with_retry`
+   entirely. It was the one mutation in the binary with neither a retry nor a
+   timeout: it could hang forever, and a 429 on it failed the whole run instead
+   of backing off. Now routed through the same helper. Making
+   `GmailClient::limiter` public is what allows it, for the same disjoint-field
+   -borrow reason `resolver` is already public.
+2. `HttpSlackPoster` had the identical unbounded-transport defect as the Gmail
+   path, so the digest unit had two ways to hang, not one.
+
+**`TimeoutStartSec` stays unimplemented, deliberately.** With per-call bounds in
+place no call can hang, so the correctness gap is closed. A unit-level bound is
+now only defense-in-depth against a future unbounded await, and sizing it needs
+a measured healthy-run ceiling for a DRAFTING triage run, which nobody has taken
+(drafting is gated on the eval sign-off). `worst_case_call_duration()` (188s:
+five 30s attempts plus the 1+2+5+10+20s backoff ladder) is the per-call
+derivation such a number must start from, pinned by a test so changing
+`REQUEST_TIMEOUT` or `MAX_RETRIES` forces a look at whatever was sized against
+it. The theoretical whole-run worst case is ~6.8h and is dominated by the case
+where every call times out five times -- a run that is failing, not slow. A
+bound sized for that protects nothing, which is exactly why the number has to
+come from measurement rather than arithmetic.
+
+**Testing note.** The transport-timeout tests use `#[tokio::test(start_paused =
+true)]`, which needs tokio's `test-util` feature (NOT in `full`), added as a
+dev-dependency. Virtual time exercises the REAL 30s constant and the REAL
+backoff ladder at zero wall-clock cost; a shortened test-only timeout would not
+be testing the constant that ships.

@@ -20,9 +20,42 @@ use eyre::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::Duration;
 
 pub fn load(config_path: &Path) -> Result<Config> {
     load_config(config_path).context("Failed to load configuration")
+}
+
+/// Ceiling on establishing a TCP connection, distinct from the per-request
+/// ceilings in `gmail::rate` and `slack`. A connect hang is the black-hole case
+/// (a SYN into a void) and should fail fast; a request that has already
+/// connected may legitimately take longer.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The shared HTTPS connector for BOTH outbound paths, Gmail and Slack.
+///
+/// Built by hand rather than via `HttpsConnectorBuilder::build()` for one
+/// reason: that convenience method hands the client a default `HttpConnector`
+/// with NO connect timeout, and `hyper_util`'s legacy client adds no request,
+/// response, or connect timeout of its own. The result was that every Gmail
+/// call and the Slack post could not fail, only hang. Shared rather than
+/// duplicated so the two paths cannot drift apart on the bound.
+///
+/// `enforce_http(false)` is not optional: `HttpConnector` rejects any
+/// non-`http` scheme by default and would refuse every `https` URI here.
+/// hyper-rustls's own `build()` does exactly this, for exactly this reason.
+pub(crate) fn https_connector()
+-> Result<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>> {
+    let mut http = hyper_util::client::legacy::connect::HttpConnector::new();
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    http.enforce_http(false);
+
+    Ok(hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .context("Failed to load native TLS roots")?
+        .https_or_http()
+        .enable_http1()
+        .wrap_connector(http))
 }
 
 pub fn init_tls() -> Result<()> {
@@ -39,14 +72,8 @@ async fn build_gmail_client(config: &Config, prefix: &str) -> Result<gmail::clie
         .context("OAuth2 authentication failed")?;
 
     let hub = google_gmail1::Gmail::new(
-        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new()).build(
-            hyper_rustls::HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .context("Failed to load native TLS roots")?
-                .https_or_http()
-                .enable_http1()
-                .build(),
-        ),
+        hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+            .build(https_connector()?),
         auth,
     );
 

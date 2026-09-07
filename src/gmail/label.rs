@@ -1,3 +1,4 @@
+use crate::gmail::rate::{RateLimiter, with_retry};
 use eyre::{Context, Result};
 use std::collections::HashMap;
 
@@ -84,10 +85,18 @@ impl LabelVisibility {
     }
 }
 
+/// Create `name` unless the resolver already knows it, returning its label ID.
+///
+/// Goes through `with_retry` like every other Gmail call in the binary. It used
+/// to call `.doit()` directly, which made it the ONE mutation here with neither
+/// a retry nor a timeout: it could hang forever, and a 429 on it failed the
+/// whole run instead of backing off. Nothing about label creation earned that
+/// exemption; it was an oversight, not a decision.
 pub async fn create_label_if_missing(
     hub: &google_gmail1::Gmail<
         hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     >,
+    limiter: &RateLimiter,
     resolver: &mut LabelResolver,
     name: &str,
     visibility: LabelVisibility,
@@ -97,20 +106,28 @@ pub async fn create_label_if_missing(
     }
 
     log::info!("Creating missing label: {} ({:?})", name, visibility);
-    let label = google_gmail1::api::Label {
-        name: Some(name.to_string()),
-        label_list_visibility: Some(visibility.label_list().to_string()),
-        message_list_visibility: Some(visibility.message_list().to_string()),
-        ..Default::default()
-    };
 
-    let (_, created) = hub
-        .users()
-        .labels_create(label, "me")
-        .add_scope(crate::gmail::auth::GMAIL_SCOPE)
-        .doit()
-        .await
-        .context(format!("Failed to create label '{}'", name))?;
+    // The `Label` is built inside the closure, not hoisted: `with_retry` calls
+    // this once per attempt and the request builder consumes the value.
+    let created = with_retry(limiter, "labels.create", || async {
+        limiter.acquire(5).await;
+        let label = google_gmail1::api::Label {
+            name: Some(name.to_string()),
+            label_list_visibility: Some(visibility.label_list().to_string()),
+            message_list_visibility: Some(visibility.message_list().to_string()),
+            ..Default::default()
+        };
+
+        let (_, created) = hub
+            .users()
+            .labels_create(label, "me")
+            .add_scope(crate::gmail::auth::GMAIL_SCOPE)
+            .doit()
+            .await
+            .context(format!("Failed to create label '{}'", name))?;
+        Ok(created)
+    })
+    .await?;
 
     let id = created
         .id
