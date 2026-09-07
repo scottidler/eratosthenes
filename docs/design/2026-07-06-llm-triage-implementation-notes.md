@@ -1009,3 +1009,73 @@ post. Full findings in `docs/design/2026-07-06-llm-triage-shakedown.md`.
   `SLACK_XOXP_TOKEN` re-provisioning, the `max-threads: 50` cap) are all
   recorded with an owner and next action in the shakedown report and are
   Scott's calls, not open design questions.
+
+## Implementation audit round 7 (2026-09-07): M1 and M2 fixed
+
+### Design decisions
+- **M1, the ladder fixed point.** A `Move` is now only "fired" when it would
+  actually change the thread. `plan_state_move` removes `INBOX` ONLY when the
+  thread carries it, and adds the destination ONLY when the thread lacks it, so
+  a thread already at its destination plans `add=[] remove=[]`.
+  `PlannedMove::is_noop()` names that, `apply_state_action` returns
+  `Result<bool>` for whether it acted, and `evaluate_thread` keeps walking the
+  filter list when it did not.
+- Chose fall-through over reordering the config. Putting `Purge` first would
+  fix this instance and leave the general trap in place for the next bucket
+  filter someone adds.
+
+### Deviations
+- `apply_state_action`'s signature changed from `Result<()>` to `Result<bool>`.
+  The doc did not anticipate it; the fall-through cannot be expressed without it.
+
+### Tradeoffs
+- A no-op filter is still MATCHED and evaluated every run, just not written.
+  That costs a few comparisons per thread per run and keeps the filter list
+  declarative. The alternative -- making bucket filters stop matching once moved
+  -- would mean stripping the bucket label, which is the exact bug Phase 2 fixed.
+
+### Open questions
+- None. Both must-fix items are closed.
+
+### What was actually wrong
+
+**M1: a bucket-labeled thread could never leave Purgatory, and rewrote itself
+every 5 minutes forever.** Phase 2 made a Move preserve the filter's match
+labels (correct). Phase 3 added four filters matching `llm/*` that Move to
+Purgatory. Together: `age-noise` moves the thread to Purgatory, `llm/noise`
+survives by design, so next run `age-noise` MATCHES AGAIN, its TTL still fires
+(`last_activity` never moved), `evaluate_thread` returned `Ok(true)` and stopped
+-- so `Purge` (`Purgatory -> Oblivion`, `tatari.yml:158`, AFTER the bucket
+filters at `:144`) was never reached. Oblivion was dead config for every
+triaged thread, and each thread cost one `threads.modify` per aging run forever,
+because `plan_state_move` pushed `INBOX` into `remove` unconditionally so the
+plan was never empty.
+
+The old code's own doc comment claimed "a filter that moves a thread to the
+stage it already occupies is a no-op instead of a self-cancelling write." It was
+not: the unconditional `INBOX` removal made it a real write every time. The
+comment described the intent; the code did something else.
+
+The Phase 2 tests did not bite -- two of them ASSERTED the unconditional
+`INBOX` removal, and nothing exercised a second run. Both were updated to the
+precise behavior, each keeping the property it was really guarding (stage shed;
+destination never removed). Three regression tests added, including
+`test_purge_still_advances_a_thread_a_bucket_filter_parked_in_purgatory`, which
+pins ladder TERMINATION rather than a single plan's shape.
+
+**M2: live mailbox data was committed.** `6febb31` was made with a bare
+`git add -A` and swept in 8 untracked scratch files, including `inbox.txt`
+(417 thread ids) and two ndjson files holding verbatim Gmail API responses with
+message snippets from the live work mailbox. Never pushed. The commit was
+amended (now `8efddc2`) to contain only its 3 intended files; the scratch files
+are untracked and still on disk. `.gitignore` gained `*.txt` and `*.ndjson` so
+the same mistake cannot recur.
+
+### Audit findings NOT addressed here
+C1 (`TimeoutStartSec` settled in the doc, never implemented), C3 (no per-line
+subject cap in the digest), C4 (`body-chars` overshoots by the 12-char
+truncation marker), S1 (the `llm/seen` write window spans the whole ~90s
+classification pass), S2 (the no-send guard is a source lint, not a capability
+restriction -- the OAuth scope is full `https://mail.google.com/`), S3 (3-7
+bullets is a happy-path guarantee). C2 is closed by this entry: the
+`expand-tilde` crate WAS adopted, superseding the earlier "No new crate" note.

@@ -896,7 +896,7 @@ async fn evaluate_thread<C: Clock>(
 
         match state_filter.evaluate_ttl(last_activity, is_read, clock)? {
             Some(action) => {
-                apply_state_action(
+                let acted = apply_state_action(
                     client,
                     thread,
                     &thread_labels,
@@ -907,7 +907,9 @@ async fn evaluate_thread<C: Clock>(
                     dry_run,
                 )
                 .await?;
-                return Ok(true);
+                if acted {
+                    return Ok(true);
+                }
             }
             None => {
                 if state_filter.ttl == Ttl::Keep {
@@ -930,6 +932,16 @@ async fn evaluate_thread<C: Clock>(
 struct PlannedMove {
     add: Vec<String>,
     remove: Vec<String>,
+}
+
+impl PlannedMove {
+    /// Nothing to add and nothing to remove: the thread already occupies the
+    /// destination stage. Writing this would be a `threads.modify` that changes
+    /// nothing, and -- worse -- treating it as "the filter fired" ends filter
+    /// evaluation, so every later filter (notably `Purge`) is never reached.
+    fn is_noop(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
+    }
 }
 
 /// Plan the label writes a `Move` implies, as DATA: no Gmail calls, so the semantics are
@@ -957,7 +969,7 @@ fn plan_state_move(
     let dest_label = Label::new(dest);
 
     let mut remove: Vec<Label> = Vec::new();
-    if dest_label != Label::Inbox {
+    if dest_label != Label::Inbox && thread_labels.contains(&Label::Inbox) {
         remove.push(Label::Inbox);
     }
     for stage in stages {
@@ -969,7 +981,7 @@ fn plan_state_move(
 
     // An empty destination is the `action:`-less default: age the thread out of the inbox
     // and out of its stage, with nowhere to land. Adding "" would be a Gmail 400.
-    let add = if dest.is_empty() {
+    let add = if dest.is_empty() || thread_labels.contains(&dest_label) {
         Vec::new()
     } else {
         vec![resolve_label_id(resolver, dest)]
@@ -993,7 +1005,7 @@ async fn apply_state_action(
     action: &StateAction,
     prefix: &str,
     dry_run: bool,
-) -> Result<()> {
+) -> Result<bool> {
     debug!(
         "{}apply_state_action: filter={}, thread={}, action={:?}, stages={:?}, dry_run={}",
         prefix, state_filter.name, thread.id, action, stages, dry_run
@@ -1002,6 +1014,20 @@ async fn apply_state_action(
     match action {
         StateAction::Move(dest) => {
             let planned = plan_state_move(thread_labels, stages, dest, &client.resolver);
+
+            // The thread is already at `dest`. Report NOT-ACTED so the caller keeps
+            // walking the filter list: a bucket filter like `llm/noise -> Purgatory`
+            // still MATCHES a thread it already moved (the bucket label is a match
+            // criterion and survives by design, Phase 2), and if that counted as
+            // firing, `Purge` (`Purgatory -> Oblivion`) would never be evaluated and
+            // the thread would be rewritten every run, forever.
+            if planned.is_noop() {
+                debug!(
+                    "{}[state:{}] thread {} already at '{}', no-op; continuing to later filters",
+                    prefix, state_filter.name, thread.id, dest,
+                );
+                return Ok(false);
+            }
 
             debug!(
                 "{}[state:{}] thread {} -> {} (add={:?}, remove={:?})",
@@ -1013,6 +1039,7 @@ async fn apply_state_action(
                     .modify_thread(&thread.id, &planned.add, &planned.remove)
                     .await?;
             }
+            Ok(true)
         }
         StateAction::Delete => {
             debug!(
@@ -1022,10 +1049,9 @@ async fn apply_state_action(
             if !dry_run {
                 client.trash_thread(&thread.id).await?;
             }
+            Ok(true)
         }
     }
-
-    Ok(())
 }
 
 fn build_active_threads_query(state_filters: &[StateFilter]) -> String {
@@ -1782,10 +1808,11 @@ mod tests {
         );
 
         assert_eq!(planned.add, vec!["Label_8".to_string()]);
-        assert_eq!(
-            planned.remove,
-            vec!["INBOX".to_string(), "Label_7".to_string()]
-        );
+        // This thread is NOT in INBOX, so INBOX is not in the plan. Removing it
+        // unconditionally is what made a no-op look like a real write and broke the
+        // ladder (implementation audit M1, 2026-09-07). What this test actually
+        // guards is that the CURRENT stage is shed and the destination added.
+        assert_eq!(planned.remove, vec!["Label_7".to_string()]);
     }
 
     /// Existing shape 2, the bare catch-all: a filter with no `labels:` at all still
@@ -1854,8 +1881,16 @@ mod tests {
             &state_resolver(),
         );
 
-        assert_eq!(planned.add, vec!["Label_7".to_string()]);
+        // The thread already carries Purgatory, so there is nothing to add. The
+        // property this test guards -- the destination is never REMOVED -- still
+        // holds, and the thread is still pulled out of the inbox it is sitting in.
+        assert!(planned.add.is_empty(), "add={:?}", planned.add);
         assert_eq!(planned.remove, vec!["INBOX".to_string()]);
+        assert!(
+            !planned.remove.contains(&"Label_7".to_string()),
+            "destination must never be removed: {:?}",
+            planned.remove
+        );
     }
 
     /// An `action:`-less filter has an empty Move destination: age the thread out of the
@@ -1874,6 +1909,82 @@ mod tests {
         assert_eq!(
             planned.remove,
             vec!["INBOX".to_string(), "Label_7".to_string()]
+        );
+    }
+
+    /// THE FIXED-POINT REGRESSION (implementation audit, 2026-09-07).
+    ///
+    /// A `llm/noise -> Purgatory` filter still MATCHES a thread it already moved,
+    /// because the bucket label is a match criterion and survives by design
+    /// (Phase 2). Before this fix `plan_state_move` pushed `INBOX` into `remove`
+    /// unconditionally, so the plan was never empty, the filter "fired" every run,
+    /// `evaluate_thread` returned early, and `Purge` was never reached: the thread
+    /// was rewritten every 5 minutes forever and Oblivion was dead config.
+    #[test]
+    fn test_state_move_is_a_true_noop_once_the_thread_is_at_the_destination() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            // Already moved: carries the bucket label AND the destination, no INBOX.
+            &labels_of(&["UNREAD", "llm/noise", "Purgatory"]),
+            &stages,
+            "Purgatory",
+            &state_resolver(),
+        );
+
+        assert!(
+            planned.add.is_empty(),
+            "destination already held, nothing to add: {:?}",
+            planned.add
+        );
+        assert!(
+            planned.remove.is_empty(),
+            "thread is not in INBOX and is already at its destination, \
+             so nothing may be removed: {:?}",
+            planned.remove
+        );
+        assert!(
+            planned.is_noop(),
+            "this must report as a no-op so evaluate_thread keeps walking to Purge"
+        );
+    }
+
+    /// INBOX is only shed when the thread actually carries it. Removing it
+    /// unconditionally is what made the no-op above look like a real write.
+    #[test]
+    fn test_state_move_does_not_remove_inbox_when_the_thread_is_not_in_it() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            &labels_of(&["UNREAD", "Purgatory"]),
+            &stages,
+            "Oblivion",
+            &state_resolver(),
+        );
+
+        assert!(
+            !planned.remove.contains(&"INBOX".to_string()),
+            "thread was not in INBOX: {:?}",
+            planned.remove
+        );
+    }
+
+    /// The ladder must TERMINATE: a thread parked in Purgatory by a bucket filter
+    /// is still advanced to Oblivion by `Purge`. This is the property M1 broke.
+    #[test]
+    fn test_purge_still_advances_a_thread_a_bucket_filter_parked_in_purgatory() {
+        let stages = derive_stages(&ladder_filters());
+        let parked = labels_of(&["UNREAD", "llm/noise", "Purgatory"]);
+
+        // The bucket filter that put it there is now inert.
+        let bucket = plan_state_move(&parked, &stages, "Purgatory", &state_resolver());
+        assert!(bucket.is_noop(), "bucket filter must no longer fire");
+
+        // ...so Purge gets its turn, and it moves.
+        let purge = plan_state_move(&parked, &stages, "Oblivion", &state_resolver());
+        assert!(!purge.is_noop(), "Purge must still act on a parked thread");
+        assert!(
+            purge.remove.contains(&"Label_7".to_string()),
+            "Purge sheds the Purgatory stage: {:?}",
+            purge.remove
         );
     }
 
