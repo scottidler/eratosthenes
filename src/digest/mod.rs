@@ -27,6 +27,23 @@ const SIGNATURE: &str = ":giga-claude:";
 /// reads the typed field and never re-parses this marker back out of a string.
 const ASK_MARKER: &str = "*Reply needed:*";
 
+/// Per-line caps, in CHARS, on the two fields that arrive straight from a
+/// message header and are therefore attacker-controlled and unbounded. Bullets
+/// and asks are capped where they are built (`bullets::MAX_BULLET_CHARS`);
+/// these were not (audit C3), so ONE pathological subject could eat the whole
+/// `BUDGET`, drive the shrink ladder to its floor, and collapse its section to
+/// a bare `... +N more` -- a 50k-char subject yielded a 124-byte digest.
+///
+/// Applied BEFORE `escape_mrkdwn`, so the cap counts the characters a reader
+/// sees. Escaping can still expand a capped field up to 5x (`&` -> `&amp;`),
+/// which is bounded and small next to `BUDGET`.
+const MAX_SUBJECT_CHARS: usize = 120;
+const MAX_SENDER_CHARS: usize = 40;
+
+/// Counted INSIDE the caps above, for the reason `bullets`' marker is: the cap
+/// is what the budget arithmetic assumes.
+const LINE_TRUNCATION_MARKER: &str = "...";
+
 /// Section header emoji + title, and the word used in the count line, in
 /// DISPLAY order: most actionable first.
 const SECTIONS: [(&str, &str); 3] = [
@@ -291,13 +308,28 @@ fn bullet_lines(item: &DigestItem, cap: usize) -> String {
     out
 }
 
+/// Hard cap in CHARS with the marker counted inside it. Same shape as
+/// `bullets::cap_bullet`, kept separate because the caps differ per field.
+fn cap_chars(text: &str, max: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let marker = LINE_TRUNCATION_MARKER.chars().count();
+    if max <= marker {
+        return text.chars().take(max).collect();
+    }
+    let head: String = text.chars().take(max - marker).collect();
+    format!("{}{}", head.trim_end(), LINE_TRUNCATION_MARKER)
+}
+
 fn line(item: &DigestItem, browser_index: u8) -> String {
     let date = item.date.format("%b %d");
-    let sender = escape_mrkdwn(&item.sender);
+    let sender = escape_mrkdwn(&cap_chars(&item.sender, MAX_SENDER_CHARS));
     let subject = if item.subject.trim().is_empty() {
         "(no subject)".to_string()
     } else {
-        escape_mrkdwn(&item.subject)
+        escape_mrkdwn(&cap_chars(&item.subject, MAX_SUBJECT_CHARS))
     };
     let url = format!(
         "https://mail.google.com/mail/u/{}/#all/{}",

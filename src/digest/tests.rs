@@ -629,3 +629,66 @@ fn test_ladder_terminates_when_everything_must_be_shed() {
     assert!(out.contains("... +"));
     assert!(out.trim_end().ends_with(SIGNATURE));
 }
+
+/// Audit C3: the subject arrives from a message header, so it is unbounded and
+/// attacker-controlled. Cap it in CHARS with the marker inside the cap.
+#[test]
+fn test_line_caps_a_pathological_subject() {
+    let it = item(Pin::Starred, 1_000, "A", &"S".repeat(50_000), "t1");
+    let rendered = line(&it, 0);
+    let shown = rendered
+        .rsplit_once('|')
+        .expect("link display text")
+        .1
+        .trim_end_matches('>');
+    assert_eq!(shown.chars().count(), MAX_SUBJECT_CHARS);
+    assert!(shown.ends_with(LINE_TRUNCATION_MARKER), "{}", shown);
+}
+
+#[test]
+fn test_line_caps_a_pathological_sender() {
+    let it = item(Pin::Starred, 1_000, &"N".repeat(5_000), "subj", "t1");
+    let rendered = line(&it, 0);
+    let sender = rendered
+        .split_once("` *")
+        .expect("sender field")
+        .1
+        .split_once("* <")
+        .expect("sender field end")
+        .0;
+    assert_eq!(sender.chars().count(), MAX_SENDER_CHARS);
+    assert!(sender.ends_with(LINE_TRUNCATION_MARKER), "{}", sender);
+}
+
+/// The consequence the cap exists to prevent: uncapped, ONE 50k-char subject
+/// blew `BUDGET` on its own, drove the ladder to its floor, and shed every
+/// other thread -- a 124-byte digest reading `... +N more`. Capped, all ten
+/// threads still render.
+#[test]
+fn test_a_pathological_subject_does_not_collapse_the_digest() {
+    let mut items: Vec<DigestItem> = (0..9)
+        .map(|i| fixture_item(i, Pin::Starred, false, 3))
+        .collect();
+    let mut poison = fixture_item(9, Pin::Starred, false, 3);
+    poison.subject = "S".repeat(50_000);
+    items.push(poison);
+
+    let out = format(&items, 0, None);
+    assert!(out.len() <= BUDGET, "over budget: {} chars", out.len());
+    assert!(!out.contains("... +"), "threads were shed:\n{}", out);
+    for i in 0..9 {
+        let id = std::format!("{:016x}", i);
+        assert!(out.contains(&id), "thread {} missing:\n{}", id, out);
+    }
+}
+
+/// Both caps sit ABOVE the real-mail figures the budget arithmetic assumes, so
+/// the cap is a backstop against pathology, not a routine truncation of
+/// ordinary mail. Asserted rather than trusted, because tightening either
+/// constant under the fixture would silently start clipping normal subjects.
+#[test]
+fn test_line_caps_exceed_the_fixture_figures() {
+    let it = fixture_item(0, Pin::Starred, false, 0);
+    assert!(it.sender.chars().count() < MAX_SENDER_CHARS);
+    assert!(it.subject.chars().count() < MAX_SUBJECT_CHARS);
+}

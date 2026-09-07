@@ -12,6 +12,13 @@ use log::trace;
 /// classifier as a complete message that simply ended mid-sentence.
 pub const TRUNCATION_MARKER: &str = "\n[truncated]";
 
+/// The smallest budget that can carry a MARKED fragment. Below it, `truncate`
+/// can only cut bare, and an unmarked sliver reads as a COMPLETE short message
+/// -- so a caller spending a budget message-by-message should stop rather than
+/// emit one. ASCII marker, so `len()` is the char count (asserted in tests)
+/// and this stays a `const`.
+pub const MIN_MARKED_FRAGMENT_CHARS: usize = TRUNCATION_MARKER.len() + 1;
+
 /// Walk a message payload and return its text, preferring `text/plain` over
 /// `text/html` ANYWHERE in the tree. Preference is by mime type, not by
 /// position: `multipart/alternative` puts the html sibling last about as often
@@ -217,11 +224,22 @@ fn is_quote_boundary(trimmed: &str) -> bool {
 /// Truncate to `max` CHARACTERS, not bytes: `body-chars` is a config number a
 /// human picked, and a byte cut would split a multi-byte character and panic
 /// on the slice.
+///
+/// `max` is a HARD cap on the returned length. An earlier version cut to `max`
+/// and THEN appended the marker, so every truncated body overshot the config
+/// number by the marker's length (audit C4) and a per-thread budget spent
+/// message-by-message could overshoot once per cut. The marker is now paid for
+/// out of the budget, matching `digest::bullets::shrink`.
 pub fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
-    let head: String = text.chars().take(max).collect();
+    let marker = TRUNCATION_MARKER.chars().count();
+    // No room to both cut and mark: a bare cut is the only thing that fits.
+    if max <= marker {
+        return text.chars().take(max).collect();
+    }
+    let head: String = text.chars().take(max - marker).collect();
     format!("{}{}", head.trim_end(), TRUNCATION_MARKER)
 }
 
@@ -367,8 +385,32 @@ mod tests {
 
     #[test]
     fn test_truncate_marks_the_cut() {
+        let out = truncate(&"a".repeat(40), 20);
+        let keep = 20 - TRUNCATION_MARKER.chars().count();
+        assert_eq!(out, format!("{}{}", "a".repeat(keep), TRUNCATION_MARKER));
+    }
+
+    /// Audit C4: `max` is a hard cap, so the marker comes out of the budget
+    /// rather than being added on top of it.
+    #[test]
+    fn test_truncate_never_exceeds_max() {
+        for max in 1..=64 {
+            let out = truncate(&"x".repeat(500), max);
+            assert!(
+                out.chars().count() <= max,
+                "max={} produced {} chars",
+                max,
+                out.chars().count()
+            );
+        }
+    }
+
+    /// A budget smaller than the marker cannot carry one, so it cuts bare
+    /// rather than blowing the cap to make room for the annotation.
+    #[test]
+    fn test_truncate_below_marker_length_cuts_bare() {
         let out = truncate("abcdefghij", 4);
-        assert_eq!(out, format!("abcd{}", TRUNCATION_MARKER));
+        assert_eq!(out, "abcd");
     }
 
     /// Char-based, so a multi-byte body cannot panic on a byte-boundary slice.
@@ -376,5 +418,33 @@ mod tests {
     fn test_truncate_is_char_safe() {
         let out = truncate("ααααα", 2);
         assert!(out.starts_with("αα"), "got: {}", out);
+    }
+}
+
+#[cfg(test)]
+mod fragment_floor_tests {
+    use super::*;
+
+    /// `MIN_MARKED_FRAGMENT_CHARS` is built from `len()`, which is only the
+    /// char count while the marker stays ASCII.
+    #[test]
+    fn test_marker_is_ascii_so_len_is_the_char_count() {
+        assert_eq!(TRUNCATION_MARKER.len(), TRUNCATION_MARKER.chars().count());
+        assert_eq!(
+            MIN_MARKED_FRAGMENT_CHARS,
+            TRUNCATION_MARKER.chars().count() + 1
+        );
+    }
+
+    /// The floor is exactly the point where a cut can still be announced.
+    #[test]
+    fn test_at_the_floor_the_cut_is_marked_and_below_it_is_not() {
+        let long = "z".repeat(500);
+        let at = truncate(&long, MIN_MARKED_FRAGMENT_CHARS);
+        assert!(at.contains("[truncated]"), "{}", at);
+        assert!(at.chars().count() <= MIN_MARKED_FRAGMENT_CHARS);
+
+        let below = truncate(&long, MIN_MARKED_FRAGMENT_CHARS - 1);
+        assert!(!below.contains("[truncated]"), "{}", below);
     }
 }

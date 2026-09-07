@@ -10,7 +10,7 @@ use log::{debug, trace, warn};
 use serde::{Deserialize, Serialize};
 
 use crate::cfg::triage::TriageBucket;
-use crate::triage::body::truncate;
+use crate::triage::body::{MIN_MARKED_FRAGMENT_CHARS, truncate};
 use crate::triage::thread::TriageThread;
 
 /// One thread as the classifier sees it.
@@ -132,6 +132,23 @@ fn budget_messages(
     let mut out: Vec<PayloadMessage> = Vec::new();
 
     for msg in thread.newest_first() {
+        // A remainder too small to carry the truncation marker cannot produce a
+        // fragment that ANNOUNCES itself as one, and an unmarked sliver reads to
+        // the model as a complete short message. Audit C4 made `body-chars` a
+        // hard cap (the marker is now paid for out of the budget rather than
+        // added past it), which makes that reachable, so stop here -- the same
+        // answer the exhausted-budget case already gave.
+        //
+        // The NEWEST message is exempt: it is the one the thread is about, and
+        // a bare sliver of it beats an empty message list when `body-chars` is
+        // configured smaller than the floor.
+        if !out.is_empty() && remaining < MIN_MARKED_FRAGMENT_CHARS {
+            trace!(
+                "budget_messages: thread={}, stopping with {} chars left (below the marked-fragment floor of {})",
+                thread.id, remaining, MIN_MARKED_FRAGMENT_CHARS
+            );
+            break;
+        }
         if remaining == 0 {
             break;
         }
@@ -343,7 +360,9 @@ mod tests {
             ],
         );
 
-        let json = build_payload(&[t], 60, "me@x.com").unwrap();
+        // 80, not 60: the newest message costs 50, and the 30 left over must
+        // clear the marked-fragment floor for the oldest to be kept AND marked.
+        let json = build_payload(&[t], 80, "me@x.com").unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let messages = parsed["threads"][0]["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 2, "both messages fit partially");
@@ -360,6 +379,49 @@ mod tests {
             "oldest is marked: {}",
             oldest
         );
+        assert!(
+            oldest.chars().count() <= 30,
+            "the oldest fragment stays inside what is left of the budget: {}",
+            oldest.chars().count()
+        );
+    }
+
+    /// Audit C4 follow-on: a remainder below the marked-fragment floor is not
+    /// spent on an unmarked sliver, which would read as a complete short
+    /// message. The message is dropped instead, as an exhausted budget does.
+    #[test]
+    fn test_build_payload_drops_a_fragment_too_small_to_mark() {
+        let t = thread(
+            "t1",
+            vec![
+                api_message("m1", "t1", 1_000, vec![], &"o".repeat(50), &[]),
+                api_message("m2", "t1", 2_000, vec![], &"n".repeat(50), &[]),
+            ],
+        );
+
+        let budget = 50 + MIN_MARKED_FRAGMENT_CHARS - 1;
+        let json = build_payload(&[t], budget, "me@x.com").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let messages = parsed["threads"][0]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "the unmarkable oldest fragment is gone");
+        assert_eq!(messages[0]["body"].as_str().unwrap(), "n".repeat(50));
+    }
+
+    /// The newest message is exempt from the floor: a `body-chars` configured
+    /// below it must still yield the message the thread is about, bare cut and
+    /// all, rather than an empty message list.
+    #[test]
+    fn test_build_payload_never_drops_the_newest_to_the_floor() {
+        let t = thread(
+            "t1",
+            vec![api_message("m1", "t1", 1_000, vec![], &"n".repeat(50), &[])],
+        );
+
+        let json = build_payload(&[t], 4, "me@x.com").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let messages = parsed["threads"][0]["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 1, "the newest message survives any budget");
+        assert_eq!(messages[0]["body"].as_str().unwrap(), "nnnn");
     }
 
     #[test]
