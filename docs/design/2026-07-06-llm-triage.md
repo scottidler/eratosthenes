@@ -2,7 +2,7 @@
 
 **Author:** Scott Idler
 **Date:** 2026-07-06
-**Status:** Approved
+**Status:** Implemented
 **Review Passes Completed:** 5/5 (2026-07-06, against v0.2.11)
 **Amended:** 2026-09-06 against v0.3.0, in three passes.
 Pass 1 (pre-panel): Phase 6 rescoped from a one-line summary to 3-7 bullets,
@@ -908,6 +908,49 @@ eratosthenes triage [accounts...] [--dry-run]
       **Observed on main (2026-09-06):** FAILS, as expected pre-build.
       `rg -n 'drafts|Drafts' src/` returns zero matches: no draft-creation
       path exists, and no send-path grep test exists to pass.
+
+## Acceptance Criteria: post-build verification (2026-09-07)
+
+Run after Phase 8, against the built binary at `b3db90d`. Nothing below is
+assumed: a criterion that could not be executed says why.
+
+| # | criterion | result |
+|---|---|---|
+| 1 | `triage --dry-run` prints a thread -> bucket table, exits 0, zero mutations | **PASS** |
+| 2 | timer-fired run applies exactly one `llm/*` bucket + `llm/seen`; rerun is a no-op | **UNVERIFIED** |
+| 3 | `llm/noise` leaves INBOX on TTL; `llm/needs-reply` survives | **UNVERIFIED** |
+| 4 | digest renders three sections with 3-7 bullets, marked ask, budget, degradation line | **UNVERIFIED live** |
+| 5 | exactly one threaded draft; Sent unchanged; send-path grep test exists and passes | **PARTIAL** |
+
+- **(1) PASS.** Run three times this session. Latest (Phase 8 shakedown): exit 0,
+  2m33s, `Triage: 50 threads classified, 0 labeled, 0 skipped (dry run)`. On
+  `main` before this work the same command exited 2 with
+  `error: unrecognized subcommand 'triage'`.
+- **(2) and (3) UNVERIFIED, by the plan's own gate, not by omission.** Both
+  require a LIVE labeling run. The Rollout Plan (line 1198) states Phase 4 runs
+  `--dry-run` only until the eval gate passes, and the eval gate is Scott's
+  sign-off on `docs/eval/llm-triage-eval.md` (<= 5/50 disagreements), which has
+  not happened. (3) additionally needs real elapsed time: the fastest bucket TTL
+  is 1d.
+- **(4) UNVERIFIED LIVE.** The rendering, the 3-7 bullet range, the 80-char cap,
+  the marked ask, the one-section-per-thread rule, the shrink ladder under
+  BUDGET=10000, and the failure-class banner are all covered by passing tests,
+  including a ladder test proven to bite against the pre-Phase-6 renderer. What
+  is NOT observed is a real Slack post. Blocked twice over: the digest is
+  eval-gated like (2), and `SLACK_XOXP_TOKEN` was destroyed on 2026-09-07 (see
+  the INCIDENT entry in the implementation notes) and must be re-provided.
+- **(5) PARTIAL.** The send-path guard EXISTS and PASSES, and its bite is
+  demonstrated: injecting a real compiling `drafts_send(...)` into
+  `src/gmail/client.rs` made it fail with
+  `Found 1 send call(s): src/gmail/client.rs:538: drafts_send(`, and removing it
+  restored green. Structurally there is no send path in `src/`. What is NOT
+  observed is a draft actually landing inside its target thread in the Gmail UI:
+  the Phase 0(a) probe was blocked by the permission layer and no
+  `drafts.create` has ever run from this host. Tracked at
+  https://github.com/scottidler/eratosthenes/issues/1
+
+**No criterion FAILED.** Four of five are gated on two things outside the code:
+Scott's eval sign-off, and one live draft-threading check.
 
 ## Resolved Decisions
 
