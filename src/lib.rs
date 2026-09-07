@@ -117,14 +117,38 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         })
         .collect();
 
-    let starred_ids = client
-        .list_threads(&format!("in:inbox is:starred{}", stage_exclusions))
+    // A pin is thread-scoped here: ANY starred message makes the whole thread
+    // starred, even one that is not itself in the inbox. That is why the pin and
+    // the inbox membership are two SEPARATE queries intersected by thread id,
+    // rather than one `in:inbox is:starred` query.
+    //
+    // Gmail applies a conjunction of message-level predicates to the SAME
+    // message, then returns the thread if any one message satisfies the whole
+    // thing. So `in:inbox is:starred` misses a thread whose only star sits on a
+    // SENT reply while its other messages are the ones in the inbox -- which is
+    // exactly what happens when you reply to a thread and star your own reply.
+    // Gmail's own Starred view uses the single predicate and shows it; the
+    // digest must agree with that view.
+    let inbox_ids = client
+        .list_threads(&format!("in:inbox{}", stage_exclusions))
         .await
-        .context("listing starred threads")?;
-    let important_ids = client
-        .list_threads(&format!("in:inbox is:important{}", stage_exclusions))
+        .context("listing inbox threads")?;
+    let inbox_set: HashSet<String> = inbox_ids.into_iter().collect();
+
+    let starred_ids: Vec<String> = client
+        .list_threads(&format!("is:starred{}", stage_exclusions))
         .await
-        .context("listing important threads")?;
+        .context("listing starred threads")?
+        .into_iter()
+        .filter(|id| inbox_set.contains(id))
+        .collect();
+    let important_ids: Vec<String> = client
+        .list_threads(&format!("is:important{}", stage_exclusions))
+        .await
+        .context("listing important threads")?
+        .into_iter()
+        .filter(|id| inbox_set.contains(id))
+        .collect();
 
     let starred_set: HashSet<String> = starred_ids.iter().cloned().collect();
     let important_set: HashSet<String> = important_ids.iter().cloned().collect();
