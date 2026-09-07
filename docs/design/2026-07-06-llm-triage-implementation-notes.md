@@ -450,3 +450,56 @@ Plus `search_message_refs`, `get_thread_full` and `profile_email` on
   lands 30 minutes BEFORE the existing digest (`Mon,Thu 07:00:00`) -- so on a
   digest day the buckets are fresh when the digest reads them, rather than a
   day stale. Scott should confirm the cadence; it is a YAML edit.
+
+## Phase 4 live verification (orchestrator)
+
+Phase 4's code landed in `c6221ac` (delegated). Live verification was the
+orchestrator's and is recorded here.
+
+### Design decisions
+- Fixed the tilde bug with the repo's OWN `shellexpand`, promoted from a
+  private fn in `src/service.rs` to `pub fn` in `src/cfg/mod.rs`, rather than
+  adding the `shellexpand` crate. `gmail/auth.rs` already expands its
+  credential paths this way; the triage transport now matches that precedent,
+  and `service.rs` uses the shared one instead of its own copy.
+- Expansion happens at USE time in `ClaudeCli::resolve`, not at deserialize
+  time, because that is where `gmail::auth` does it.
+
+### Deviations
+- None from the doc. The tilde fix is a defect repair, not a design change.
+
+### Tradeoffs
+- Expanding at use time keeps `config show` printing what the YAML literally
+  says. Expanding at load would print the resolved path, arguably more honest,
+  but would diverge from the auth precedent. Chose precedent.
+
+### Open questions
+- None from this pass. The eval sign-off is Scott's and is tracked below.
+
+### Live findings
+- **BUG FOUND AND FIXED: `claude-binary: ~/.local/bin/claude` never resolved.**
+  `~` is shell syntax; handed to `Command::new` verbatim it fails NotFound.
+  The first live dry-run failed with
+  `claude not found: ~/.local/bin/claude did not resolve`. CI could not have
+  caught this: every test supplies an absolute path or a bare name. Only a run
+  against the real config found it.
+- **Dry-run PASSES.** Second run: exit 0, 111.16s, 50 threads classified,
+  and the tool's own summary line reads
+  `Triage: 50 threads classified, 0 labeled, 0 skipped (dry run)` -- zero
+  mutations, which is acceptance criterion 1's substance.
+- **Candidate pool is 401 threads, so the `max-threads: 50` cap BITES on every
+  run today** and says so loudly, as designed. Draining 401 at 50/run is worth
+  a look before the timer is enabled.
+- **Timing gate PASSES for triage.** 111.16s measured against the 300s
+  provisional timeout is 2.70x, clearing the doc's >= 2x threshold. No
+  amendment needed. The 10-thread digest bullet pass is NOT measured; that
+  path ships in Phase 6 and its 120s timeout stays unconfirmed until then.
+- **Acceptance criterion 1 is now satisfiable and was re-run:**
+  `eratosthenes triage --dry-run` prints a thread -> bucket table and exits 0
+  with zero Gmail mutations. It exited 2 on main before this phase.
+- **Live labeling runs are NOT done, and are correctly gated.** The doc's
+  Rollout Plan (line 1198) says Phase 4 runs `--dry-run` only until the eval
+  gate passes. The eval gate needs Scott's sign-off on
+  `docs/eval/llm-triage-eval.md`. Two-consecutive-live-runs (criterion 1 of
+  Phase 4's own success criteria) therefore stays UNVERIFIED by design, not by
+  obstruction.

@@ -264,8 +264,12 @@ impl ClaudeCli {
         configured: Option<&Path>,
         call_timeout: Duration,
     ) -> Result<Self, ClaudeFailure> {
+        // `claude-binary: ~/.local/bin/claude` is the natural thing to write in
+        // YAML, but `~` is shell syntax: handed to `Command::new` verbatim it
+        // fails NotFound. Expand it the same way `gmail::auth` expands its
+        // credential paths.
         let binary = configured
-            .map(|p| p.to_path_buf())
+            .map(|p| PathBuf::from(crate::cfg::shellexpand(&p.to_string_lossy())))
             .unwrap_or_else(|| PathBuf::from("claude"));
         debug!("ClaudeCli::resolve: binary={}", binary.display());
 

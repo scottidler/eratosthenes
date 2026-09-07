@@ -5,15 +5,7 @@ use std::process::Command;
 
 use eratosthenes::cfg::account::{Account, discover_accounts};
 use eratosthenes::cfg::config::{AuthConfig, Config, xdg_config_dir};
-
-fn shellexpand(path: &str) -> String {
-    if let Some(rest) = path.strip_prefix("~/")
-        && let Some(home) = dirs::home_dir()
-    {
-        return home.join(rest).to_string_lossy().to_string();
-    }
-    path.to_string()
-}
+use eratosthenes::cfg::shellexpand;
 
 const SERVICE_NAME: &str = "eratosthenes";
 
