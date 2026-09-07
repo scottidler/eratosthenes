@@ -615,6 +615,22 @@ eratosthenes triage [accounts...] [--dry-run]
     reading makes every fixture off by one per ask-bearing thread
     (panel R5-C3). Rendered under the digest line as Slack `mrkdwn` list items,
     indented so the thread line stays scannable.
+
+    > **CLARIFIED 2026-09-07 (audit S3).** 3-7 is a TARGET and a budgeting
+    > assumption, not a guarantee. It is the prompt's instruction and the
+    > number the `BUDGET` arithmetic is sized against; it is not enforceable,
+    > because nothing can compel a model to return three bullets.
+    > `digest::bullets` caps the UPPER bound at `MAX_BULLETS` and renders
+    > whatever came back below it, logging a warning at
+    > `src/digest/bullets.rs:152` when a thread comes back thin. That is the
+    > correct behavior: a thread with less to say should read as a thread with
+    > less to say.
+    >
+    > Round 8 noted a real asymmetry here and deliberately left it: a bullet
+    > pass that FAILED gets a visible banner, while a pass that merely came
+    > back thin gets only a log line. Promoting a thin pass to a banner was
+    > rejected because it would fire on threads that genuinely have little in
+    > them, turning a normal digest into one that looks degraded.
   - **EVERY pinned thread gets bullets**, in all three sections, not just
     Needs Reply (Scott, 2026-09-06: "bullets for every").
   - **The ask goes FIRST when there is one**, and must be visibly marked as an
@@ -891,7 +907,8 @@ eratosthenes triage [accounts...] [--dry-run]
       Neither label exists: `rg -n 'llm/' src/` returns zero matches, so no
       state-filter can key off `llm/noise` or protect `llm/needs-reply`.
 - [ ] The Mon/Thu digest contains Needs Reply | Starred | Important sections
-      with 3-7 bullets under EVERY pinned thread and working deep links,
+      with bullets under EVERY pinned thread (3-7 as a target, never a
+      guarantee: see the CLARIFIED note under Phase 6) and working deep links,
       within the char budget; a thread that asks Scott for something renders
       that ask as a marked FIRST bullet and a pure-FYI thread renders no
       marked bullet; with the `claude` CLI unavailable it still posts, minus
