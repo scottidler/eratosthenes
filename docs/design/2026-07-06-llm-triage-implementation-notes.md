@@ -958,3 +958,54 @@ checked-in tests, not derived by hand.
   them as the same request; nothing here has watched it happen.
 - `service install|reinstall` is NOT run by this phase, and must not be: the
   2026-09-07 incident in this file destroyed a live credential that way.
+
+## Phase 8: Shakedown + docs true-up
+
+Prior phase commit: `11f28ef`. Docs and README/example.yml true-up only; no
+code changes, no live labeling, no `service install`/`reinstall`, no Slack
+post. Full findings in `docs/design/2026-07-06-llm-triage-shakedown.md`.
+
+### Design decisions
+- The shakedown report lives as its own file
+  (`docs/design/2026-07-06-llm-triage-shakedown.md`) rather than inline in
+  this notes file, so its fixed/accepted/ticketed table can be read and
+  linked on its own -- this notes file stays a narrative log, the shakedown
+  report stays a checklist.
+- The design doc itself (`docs/design/2026-07-06-llm-triage.md`) was left
+  completely unedited, including its own "Observed on main (2026-09-06)"
+  Acceptance Criteria annotations, which predate every phase and were never
+  updated by Phases 1-7 either. Re-verifying those five criteria against
+  live labeling/timer/Slack behavior is exactly the work this phase was told
+  NOT to do (eval-gated); the shakedown report states plainly which of the
+  five are unverified and why, rather than editing frozen doc text to imply
+  a verification that didn't happen.
+- One genuinely open engineering risk -- Phase 0(a)'s live threaded-draft
+  probe never ran, so draft-in-thread placement is unproven -- got a real
+  GitHub issue (https://github.com/scottidler/eratosthenes/issues/1) rather
+  than "accepted", since it is neither resolved nor already owned by an
+  existing tracker (unlike the eval-sign-off items, which
+  `docs/eval/llm-triage-eval.md` already tracks, and the Slack-token
+  incident, which the INCIDENT entry above already tracks with a remedy).
+
+### Deviations
+- None beyond what's already recorded in the shakedown report's Findings
+  section (README/example.yml gaps found and fixed; no scope changes to the
+  triage feature itself).
+
+### Tradeoffs
+- Pasted a representative excerpt of the real `triage --dry-run` output into
+  README (first several rows + the summary lines) rather than the full
+  50-row table, to keep the README example readable while still being
+  literal, unedited command output; the full run is captured in the
+  shakedown report's command list and was actually executed, not invented.
+- Added an `llm/*` `state-filters` example to `eratosthenes.example.yml`
+  modeled directly on the live `tatari.yml` (same bucket names, same TTLs,
+  same precede-Cull ordering) rather than inventing a simpler placeholder,
+  since the example's own comment already promised this exact content and a
+  fabricated-but-different example would just re-break the same promise.
+
+### Open questions
+- None. The outstanding items (Phase 0(a) probe, eval sign-off gate,
+  `SLACK_XOXP_TOKEN` re-provisioning, the `max-threads: 50` cap) are all
+  recorded with an owner and next action in the shakedown report and are
+  Scott's calls, not open design questions.

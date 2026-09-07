@@ -11,12 +11,17 @@ Starred and Important threads with `ttl: Keep` so they stay put.
 - `eratosthenes run [accounts...]` - run the inbox-zero engine (default command).
   - `--dry-run` - no message or thread changes; missing labels may still be created.
   - `--mark-only` - one-shot marker backfill (see below); applies no Star/Flag/Move.
+- `eratosthenes triage [accounts...]` - classify new inbox threads into `llm/*`
+  bucket labels with one LLM call (see [Triage](#triage) below).
+  - `--dry-run` - full classify pass, prints the thread -> bucket table, zero
+    Gmail mutations. Stricter than `run --dry-run`.
 - `eratosthenes digest [accounts...]` - post the pinned-inbox (Needs Reply +
   Starred + Important) digest to Slack.
 - `eratosthenes auth login|logout|status` - manage OAuth2 tokens.
 - `eratosthenes config validate|show` - inspect resolved config.
 - `eratosthenes service install|uninstall|reinstall|status|start|stop` - manage
-  the systemd user timers (run + digest).
+  the systemd user timers (run + digest + triage, the latter two installed
+  only for accounts that opt in via a `slack:`/`triage:` block respectively).
 
 ## Configuration
 
@@ -56,6 +61,69 @@ HANDLE (post-match, post-claim, deduped by message id) and issues zero
 how a wrongly-frozen message gets found and hand-cleared. Mail that arrives
 while the timer is stopped is stamped and never starred - keep the window
 short.
+
+### Triage
+
+Add an optional `triage` block to any account to enable it (design doc:
+[`docs/design/2026-07-06-llm-triage.md`](docs/design/2026-07-06-llm-triage.md)):
+
+```yaml
+triage:
+  schedule: "Mon-Fri 06:30:00"   # REQUIRED systemd OnCalendar; controls the triage timer
+  max-threads: 50                # per-run candidate cap; the remainder is picked up next run
+  classify-model: claude-haiku-4-5-20251001
+  draft-model: claude-sonnet-5
+  voice-profile: ~/Claude/writing/VOICE.md
+```
+
+- KEYLESS by construction: classification and drafting shell out to the
+  locally installed `claude` CLI, which owns its own auth. The config holds no
+  Anthropic API key.
+- Every candidate thread (INBOX, not yet carrying `llm/seen`) gets exactly one
+  `llm/*` bucket label plus `llm/seen` in one batched LLM call. The
+  five default buckets (`needs-reply`, `fyi-work`, `recruiting`, `receipts`,
+  `noise`) are configurable; see `eratosthenes.example.yml` for the full
+  `buckets:` block and the matching `state-filters` needed to age each one.
+- `needs-reply` threads whose newest real message isn't already answered (no
+  Sent reply, no existing DRAFT) get one threaded reply draft written in
+  Scott's voice into Gmail Drafts. Nothing is ever sent: a build-time grep
+  test (`tests/no_send_guard.rs`) fails the build if a `messages_send` /
+  `drafts_send` call appears anywhere under `src/`.
+- Hitting `max-threads` logs loudly and never truncates silently; the
+  remainder is classified on the next run.
+
+`eratosthenes triage --dry-run` runs the full classify pass with **zero Gmail
+mutations** (no labels created, no `llm/seen` written) - stricter than `run
+--dry-run`, which may still create missing labels. Actually run against the
+live `tatari` account (2026-09-07):
+
+```
+$ eratosthenes triage --dry-run
+Connecting to Gmail...
+[dry-run] label 'llm/seen' does not exist yet
+max-threads cap HIT: 402 candidate threads, classifying the newest 50, 352 left unseen for the next run (raise max-threads if this repeats)
+1a07c73974fbf453     fyi-work       What did Forrester find about Zero Trust adoption?
+1a07c61e7b9e2276     fyi-work       Daily Proactive Checklist for Tatari 07 Sep 2026
+1a07c5ecbfb90ff1     receipts       [Domain renewing automatically] Your domain tataritest.com will be automatically renewed
+1a077734d9d7ae50     recruiting     Director – GPU Stack Unified Build & Release Platform at AMD: up to $370K/year
+1a06fef65919263a     needs-reply    Avinash Basani submitted a take home test for Senior Data Platform Engineer
+1a06eceedb8b46a2     noise          How the Brooklyn Nets save 150+ hours a month with Expensify
+... (50 rows total)
+Triage: 50 threads classified, 0 labeled, 0 skipped (dry run)
+```
+
+`eratosthenes config validate` reports the resolved triage config alongside
+message-filters and state-filters (real output, same account):
+
+```
+Triage: configured, schedule 'Mon..Fri 06:30:00'
+  Buckets: 5 defined
+    - needs-reply -> llm/needs-reply
+    - fyi-work -> llm/fyi-work
+    - recruiting -> llm/recruiting
+    - receipts -> llm/receipts
+    - noise -> llm/noise
+```
 
 ### Slack digest
 
@@ -120,3 +188,20 @@ export SLACK_XOXP_TOKEN=xoxp-...        # in the environment service install see
 eratosthenes service reinstall          # lays down run + digest units
 eratosthenes digest                      # verify a manual post
 ```
+
+### Triage timer
+
+`eratosthenes service install` lays down the triage service + timer **only if
+at least one account has a `triage` block**, firing on that account's
+`triage.schedule`. If more than one triage-enabled account requests a
+different schedule, the first one wins and a warning names the discarded
+account.
+
+`service reinstall` is required to pick up the triage timer on a config that
+predates it - `service status` on this host currently shows only
+`eratosthenes.timer` and `eratosthenes-digest.timer` (real output, 2026-09-07);
+the triage timer is not yet installed, because a reinstall is deliberately
+withheld until Scott's eval sign-off (`docs/eval/llm-triage-eval.md`) clears
+live labeling. `service reinstall` in the meantime is destructive to any
+already-issued OAuth token cache in this environment - see the implementation
+notes' INCIDENT entry before running it.

@@ -167,6 +167,44 @@ state-filters:
       label: Important
       ttl: Keep
 
+  # ---- llm/* bucket filters (OPTIONAL, only if `triage:` above is enabled) --
+  # One state-filter per bucket, keyed to that bucket's label. These MUST
+  # precede Cull below: Cull matches every INBOX thread on its own TTL
+  # regardless of label, so a bucket filter placed after it never gets a
+  # chance to apply its own (tighter or looser) TTL first. `llm/seen`
+  # deliberately gets no state-filter of its own.
+
+  # needs-reply is fully protected until answered. The engine removes
+  # llm/needs-reply once a reply goes out, at which point the thread falls
+  # through to Cull like anything else.
+  - keep-needs-reply:
+      label: llm/needs-reply
+      ttl: Keep
+
+  - age-fyi-work:
+      label: llm/fyi-work
+      ttl:
+        read: 3d
+        unread: 7d
+      action: Purgatory
+
+  - age-recruiting:
+      label: llm/recruiting
+      ttl: 3d
+      action: Purgatory
+
+  # Kept a bit longer than the other buckets for reference.
+  - age-receipts:
+      label: llm/receipts
+      ttl: 7d
+      action: Purgatory
+
+  # Ages off fastest of all buckets.
+  - age-noise:
+      label: llm/noise
+      ttl: 1d
+      action: Purgatory
+
   # Cull the inbox: read mail after 7d, unread after 21d -> move to Purgatory.
   - Cull:
       ttl:
