@@ -34,6 +34,12 @@ pub const SEEN_LABEL: &str = "llm/seen";
 /// what makes a rerun a no-op.
 pub const CANDIDATE_QUERY: &str = "in:inbox -label:llm/seen";
 
+/// The bucket whose threads become the digest's Needs Reply section. Matched by
+/// bucket NAME so the Gmail label itself stays config: an account that renames
+/// `llm/needs-reply` keeps its section, and an account with no such bucket
+/// simply has no Needs Reply section.
+pub const NEEDS_REPLY_BUCKET: &str = "needs-reply";
+
 /// A candidate message reduced to what the client-side sort needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateMessage {

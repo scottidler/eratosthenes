@@ -695,3 +695,141 @@ secrets but none is named for this var; not decrypted or inspected here.
 Live verification of an install/reinstall path runs against real credentials
 and real units. Capture and restore is not enough when a step is destructive
 rather than overwriting-with-equivalent.
+
+## Phase 6: Digest enrichment
+
+Prior phase commit: `7fb5f3a`. Code and tests only; no live Slack post, no
+`service install`, no version bump. All numbers below are MEASURED from the
+checked-in tests, not derived by hand.
+
+### Design decisions
+- `DigestItem` gains `ask: Option<String>` and `bullets: Vec<String>` as two
+  separate fields (`src/digest/mod.rs`), and the `*Reply needed:*` marker is
+  applied at RENDER time in `bullet_lines`. The ladder reads `item.ask`; it
+  never parses a marker back out of a string. This is the doc's M3 finding
+  taken literally.
+- Ask semantics: an ask-bearing thread renders its ask line PLUS up to 7
+  summary bullets, i.e. up to 8 lines. The rung-2 bullet cap applies to
+  SUMMARY bullets only; the ask always renders.
+- New module `src/digest/bullets.rs` holds the whole summarization contract as
+  pure functions: `build_prompt`, `parse_response`, `cap_bullet`, `banner`.
+  Same shape as `src/triage/classify.rs`, so the contract is testable without a
+  subprocess or a mailbox.
+- The bullet pass REUSES `triage::classify::build_payload` for the stdin
+  payload rather than defining a second one. The classifier's payload
+  (`account`, per-thread `id`/`subject`/`messages` with `from_account_owner`)
+  is exactly what a summarizer needs, and one payload builder means one place
+  where mail content can leave the process.
+- Transport is `triage::claude::ClaudeCli` unchanged: same hardened seven-flag
+  argv, same built environment, same keyless auth. The digest holds no
+  credential either. Only the timeout differs: `bullets::DIGEST_TIMEOUT` is
+  120s, with a test asserting it is NOT `TRIAGE_TIMEOUT` (300s), because the
+  doc records two review rounds lost to one number naming two subsystems.
+- `Pin` gains `NeedsReply` and carries a private `index()` that is
+  simultaneously the display order and the rung-3 actionability rank, so the
+  two can never drift apart.
+- Rung 3 sheds by actionability, least first: Important, then Starred, then
+  Needs Reply, each section with its own `... +N more`. The old
+  longest-section-first `s_show`/`i_show` loop is GONE, not tweaked.
+- The Needs Reply label is resolved from config by BUCKET NAME
+  (`triage::NEEDS_REPLY_BUCKET = "needs-reply"`), not hardcoded as
+  `llm/needs-reply`. Renaming the label in YAML keeps the section working; an
+  account whose taxonomy has no `needs-reply` bucket simply has no section.
+- The banner has two constructors: `banner(FailureClass)` for a `claude`
+  failure and `banner_reason(&str)` for a cause that is not one (the mailbox
+  refusing every pinned thread's body). A Gmail problem is never mislabeled as
+  a transport failure of a subprocess that was never spawned.
+- Bullets are EXPECTED only when `config.triage` is `Some`. A Slack-enabled
+  account with no `triage:` block gets `banner = None` at the call site in
+  `src/lib.rs::digest`, so an un-enriched digest is structurally incapable of
+  emitting a degradation line.
+
+### Deviations
+- **The Needs Reply query is `label:<bucket-label>` intersected with the inbox
+  set, not the doc's literal `in:inbox label:llm/needs-reply`.** Same effect,
+  correct seam: the doc's own pin-semantics bullet forbids the conjunctive
+  form because Gmail evaluates it against a SINGLE message, and a bucket label
+  is as message-scoped as a star. Implemented the same way `is:starred` and
+  `is:important` already are.
+- **The digest header line now lists all three counts**
+  (`*Pinned inbox digest* - N needs reply, S starred, I important`), and the
+  empty-set line likewise. The doc did not specify the header; leaving it at
+  two counts would have hidden the new section's total. Five existing
+  assertions were updated for the new text.
+- **Step (b)/(c) of the doc's sequencing were done in one edit**, not two
+  commits: the typed fields, the renderer and the ladder all land together.
+  The RECORDED OBSERVATION the doc asks for was still produced, by
+  temporarily patching `format` back to the pre-Phase-6 drop-trailing-items
+  loop and running the AC (2) test against it -- see Evidence below.
+- **A second Gmail fetch per pinned thread.** The digest's own fetch is
+  metadata-only and bullets need BODIES, so `enrich_digest` re-fetches the
+  pinned set at `format=full`. Not in the doc; unavoidable given the existing
+  seams.
+- **The bullet pass gets ONE attempt, no retry**, where the classifier retries
+  once. An unusable answer lands in the banner and the digest still posts; the
+  classifier retries because a failed classify writes no labels at all.
+- **README updated** for the third section and the bullets. Not called for by
+  the phase, but the README described a two-section digest that no longer
+  exists.
+
+### Tradeoffs
+- Second `format=full` fetch vs. threading bodies through the existing
+  metadata path: chose the extra fetch. The pinned set is tens of threads, and
+  the alternative puts a triage concern into `GmailMessage`, which the aging
+  engine runs over every inbox thread every five minutes.
+- A uniform global bullet cap at rung 2 vs. per-thread shrinking: chose
+  uniform. It satisfies "a thread must never lose its ask bullet while another
+  thread still shows a descriptive one" by construction rather than by a rule
+  that has to be enforced and tested per pair.
+- `*Reply needed:*` chosen over the doc's other candidate `*Action:*`. It is
+  the LONGER marker (101 rendered chars vs 95), so the budget arithmetic is
+  pinned at its worst case, and it matches Scott's own words.
+- Truncation marker `...` counted INSIDE the 80-char cap rather than appended
+  past it. `triage::body::TRUNCATION_MARKER` ("\n[truncated]") was rejected
+  outright: a newline inside a Slack list item breaks the item.
+- `MIN_BULLETS` is prompt-only and logged when missed. Rust cannot invent a
+  bullet the model did not return, and dropping a thread for having two
+  bullets instead of three would lose information to enforce a style rule.
+
+### Open questions
+- **The `triage:` block must reach the digest's config for bullets to appear.**
+  Bullets are gated on `config.triage.is_some()` for the SAME account the
+  digest runs for. If the work account has `slack:` but the `triage:` block
+  lives elsewhere, that digest posts un-enriched and, correctly, without a
+  banner. Worth confirming against the live `tatari.yml` before the Phase 6
+  live check.
+- **Section emoji `:speech_balloon:` for Needs Reply is a guess.** The doc
+  never named one (its simulator used a placeholder `:action:`, which is not a
+  standard Slack emoji). Trivially changeable; it costs ~10 chars of budget.
+- **Live verification is the orchestrator's**, per this phase's brief: no
+  Slack post and no `service install/reinstall` was run here. The doc's
+  "with `claude` forced unresolvable the digest still posts, complete minus
+  bullets, and exits 0" is covered in-process by the `NotFound` banner test
+  but is NOT proven end to end.
+
+### Evidence
+- `otto ci`: green. 224 lib + 19 + 5 + 4 tests pass; clippy clean at
+  `-D warnings`; `cargo fmt --check` clean; lint clean.
+- AC (1), `test_ac1_ten_mixed_threads_with_seven_bullets_render_whole_under_budget`:
+  10 threads as 3 Needs Reply / 4 Starred / 3 Important, 5 of them ask-bearing,
+  7 bullets each at the 80-char cap. Rendered length **7850** against `BUDGET`
+  10000. Every thread, every bullet, every ask marker present; no `... +N more`.
+- Fixture sizing asserted, not assumed: `test_fixture_line_is_123_chars_including_the_newline`
+  pins the rendered line at 122 chars plus its newline, the figure the doc's
+  measured sweep used.
+- AC (2), `test_ac2_seventy_mixed_threads_drive_the_ladder_to_rung_three`:
+  70 threads as 20 / 25 / 25, 35 ask-bearing spread across all three sections,
+  7 bullets each. Measured rung-2 floor **12316** > `BUDGET` 10000, so rung 3
+  fires. Final body **9834**, with **53 of 70** threads rendered: all 20 Needs
+  Reply and all 25 Starred intact, 17 Important shed behind a single
+  `... +17 more`. Zero descriptive bullets survive; every rendered ask-bearing
+  thread still carries its ask; every rendered pure-FYI thread renders its
+  digest line alone.
+- **Step (b), the recorded observation that the test bites.** `format` was
+  temporarily patched back to the pre-Phase-6 behavior (render with full
+  bullets, drop trailing items from the LONGEST section) and AC (2) run
+  against it. It FAILED on the first ladder assertion, and the failure output
+  shows why the old loop is wrong for bullets: it kept **all 7 descriptive
+  bullets on 11 surviving threads and deleted 59 whole threads** to make room.
+  The patch was reverted and AC (2) re-run: pass. Nothing of the experiment
+  remains in the tree.

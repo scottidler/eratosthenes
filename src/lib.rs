@@ -11,9 +11,13 @@ pub mod triage;
 
 use crate::cfg::config::{Config, load_config};
 use crate::cfg::state::StateAction;
+use crate::cfg::triage::TriageConfig;
+use crate::digest::{DigestItem, bullets};
 use crate::slack::SlackPoster;
+use crate::triage::claude::ClaudeCli;
+use crate::triage::thread::TriageThread;
 use eyre::{Context, Result};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -136,6 +140,33 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         .context("listing inbox threads")?;
     let inbox_set: HashSet<String> = inbox_ids.into_iter().collect();
 
+    // Needs Reply is the triage layer's own bucket, so the section exists only
+    // for an account that has a `triage:` block. Resolved by bucket NAME: the
+    // Gmail label is config, and hardcoding `llm/needs-reply` here would make
+    // renaming it in YAML silently empty the section.
+    let needs_reply_label: Option<String> = config
+        .triage
+        .as_ref()
+        .and_then(|t| {
+            t.buckets
+                .iter()
+                .find(|b| b.name == triage::NEEDS_REPLY_BUCKET)
+        })
+        .map(|b| b.label.clone());
+
+    // Queried and intersected exactly like the pins above, for the same reason:
+    // a conjunctive `in:inbox label:...` is evaluated against a single message.
+    let needs_reply_ids: Vec<String> = match needs_reply_label.as_deref() {
+        Some(label) => client
+            .list_threads(&format!("label:{}{}", label, stage_exclusions))
+            .await
+            .with_context(|| format!("listing '{}' threads", label))?
+            .into_iter()
+            .filter(|id| inbox_set.contains(id))
+            .collect(),
+        None => Vec::new(),
+    };
+
     let starred_ids: Vec<String> = client
         .list_threads(&format!("is:starred{}", stage_exclusions))
         .await
@@ -151,13 +182,19 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         .filter(|id| inbox_set.contains(id))
         .collect();
 
+    let needs_reply_set: HashSet<String> = needs_reply_ids.iter().cloned().collect();
     let starred_set: HashSet<String> = starred_ids.iter().cloned().collect();
     let important_set: HashSet<String> = important_ids.iter().cloned().collect();
 
-    // Fetch each unique thread once (a thread can be both starred and important).
+    // Fetch each unique thread once (a thread can be pinned by more than one of
+    // the three signals; it still gets exactly one digest line).
     let mut unique: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for id in starred_ids.iter().chain(important_ids.iter()) {
+    for id in needs_reply_ids
+        .iter()
+        .chain(starred_ids.iter())
+        .chain(important_ids.iter())
+    {
         if seen.insert(id.clone()) {
             unique.push(id.clone());
         }
@@ -171,13 +208,25 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         }
     }
 
-    let items = digest::build(&threads, &starred_set, &important_set);
-    let text = digest::format(&items, slack.browser_index);
+    let mut items = digest::build(&threads, &needs_reply_set, &starred_set, &important_set);
+
+    // Bullets are EXPECTED only when the account has a `triage:` block. Without
+    // one the digest posts un-enriched and carries NO banner: that is the
+    // feature working as designed, not a degraded run.
+    let banner: Option<String> = match config.triage.as_ref() {
+        Some(triage) if !items.is_empty() => enrich_digest(&client, triage, &mut items, &prefix)
+            .await?
+            .map(|reason| bullets::banner_reason(&reason)),
+        _ => None,
+    };
+
+    let text = digest::format(&items, slack.browser_index, banner.as_deref());
 
     debug!(
-        "digest: posting to channel={}, items={}",
+        "digest: posting to channel={}, items={}, degraded={}",
         slack.channel,
-        items.len()
+        items.len(),
+        banner.is_some()
     );
     poster
         .post(&slack.channel, &text)
@@ -185,12 +234,113 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         .context("posting digest to Slack")?;
 
     println!(
-        "{}Digest posted: {} starred, {} important",
+        "{}Digest posted: {} needs reply, {} starred, {} important",
         prefix,
+        needs_reply_set.len(),
         starred_set.len(),
         important_set.len()
     );
     Ok(())
+}
+
+/// Attach LLM bullets to the pinned items, in one batched `claude` call.
+///
+/// Returns the REASON the digest is degraded, or `None` when the items carry
+/// their bullets. Every LLM failure lands here as a reason rather than an
+/// error: the digest contract never depends on the Anthropic API, so the post
+/// always goes out, subjects and deep links intact.
+///
+/// Stateless: nothing is cached, so the bullets always describe the mailbox as
+/// it is at digest time.
+async fn enrich_digest(
+    client: &gmail::client::GmailClient,
+    triage: &TriageConfig,
+    items: &mut [DigestItem],
+    prefix: &str,
+) -> Result<Option<String>> {
+    debug!(
+        "{}enrich_digest: items={}, model={}",
+        prefix,
+        items.len(),
+        triage.classify_model
+    );
+
+    // Bullets need BODIES, and the digest's own fetch is metadata-only. A
+    // second, full fetch of the pinned set is the cost of that; the pinned set
+    // is tens of threads, not thousands.
+    let mut threads: Vec<TriageThread> = Vec::new();
+    for item in items.iter() {
+        match client.get_thread_full(&item.thread_id).await {
+            Ok(raw) => match TriageThread::from_api(raw) {
+                Ok(thread) => threads.push(thread),
+                Err(e) => warn!(
+                    "{}skipping unreadable thread {} in the bullet pass: {:#}",
+                    prefix, item.thread_id, e
+                ),
+            },
+            Err(e) => warn!(
+                "{}fetching thread {} at format=full failed: {:#}",
+                prefix, item.thread_id, e
+            ),
+        }
+    }
+    if threads.is_empty() {
+        warn!(
+            "{}no pinned thread could be read at format=full; posting without bullets",
+            prefix
+        );
+        return Ok(Some("thread bodies unreadable".to_string()));
+    }
+
+    let self_address = client
+        .profile_email()
+        .await
+        .context("resolving the account's own address")?;
+
+    // Summarization runs on `classify-model`, not `draft-model`: drafting is a
+    // different job with a different model.
+    let cli =
+        match ClaudeCli::resolve(triage.claude_binary.as_deref(), bullets::DIGEST_TIMEOUT).await {
+            Ok(cli) => cli,
+            Err(e) => {
+                warn!("{}bullet pass unavailable: {}", prefix, e);
+                return Ok(Some(e.class.as_str().to_string()));
+            }
+        };
+    info!(
+        "{}bullet pass: claude version={}, threads={}",
+        prefix,
+        cli.version(),
+        threads.len()
+    );
+
+    let prompt = bullets::build_prompt();
+    let payload = triage::classify::build_payload(&threads, triage.body_chars, &self_address)
+        .context("building the bullet payload")?;
+    let requested: Vec<String> = threads.iter().map(|t| t.id.clone()).collect();
+
+    let raw = match cli.invoke(&triage.classify_model, &prompt, &payload).await {
+        Ok(raw) => raw,
+        Err(e) => {
+            warn!("{}bullet pass failed: {}", prefix, e);
+            return Ok(Some(e.class.as_str().to_string()));
+        }
+    };
+
+    match bullets::parse_response(&raw, &requested) {
+        Ok(by_thread) => {
+            digest::attach_bullets(items, &by_thread);
+            Ok(None)
+        }
+        Err(e) => {
+            warn!("{}bullet response was unusable: {:#}", prefix, e);
+            Ok(Some(
+                crate::triage::claude::FailureClass::Protocol
+                    .as_str()
+                    .to_string(),
+            ))
+        }
+    }
 }
 
 /// Classify one account's new inbox threads into `llm/*` bucket labels.

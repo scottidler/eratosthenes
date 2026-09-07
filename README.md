@@ -11,8 +11,8 @@ Starred and Important threads with `ttl: Keep` so they stay put.
 - `eratosthenes run [accounts...]` - run the inbox-zero engine (default command).
   - `--dry-run` - no message or thread changes; missing labels may still be created.
   - `--mark-only` - one-shot marker backfill (see below); applies no Star/Flag/Move.
-- `eratosthenes digest [accounts...]` - post the pinned-inbox (Starred +
-  Important) digest to Slack.
+- `eratosthenes digest [accounts...]` - post the pinned-inbox (Needs Reply +
+  Starred + Important) digest to Slack.
 - `eratosthenes auth login|logout|status` - manage OAuth2 tokens.
 - `eratosthenes config validate|show` - inspect resolved config.
 - `eratosthenes service install|uninstall|reinstall|status|start|stop` - manage
@@ -73,11 +73,36 @@ slack:
 - The token is never stored in YAML; the config names an env var. A user token
   (`xoxp`) is used because the destination is your self-DM, which only your own
   token can post into. It needs the `chat:write` scope.
-- `eratosthenes digest` posts one message: two grouped sections (Starred,
-  Important) with per-item date / sender / subject, the subject deep-linked to
-  the Gmail thread. An empty pinned set posts a positive `Inbox clear` line.
+- `eratosthenes digest` posts one message: three grouped sections (Needs Reply,
+  Starred, Important) with per-item date / sender / subject, the subject
+  deep-linked to the Gmail thread. An empty pinned set posts a positive
+  `Inbox clear` line.
+- A thread appears exactly ONCE, in its highest section: Needs Reply beats
+  Starred beats Important. Needs Reply is the `triage:` block's `needs-reply`
+  bucket label intersected with the inbox, so the section only exists for an
+  account that has a `triage:` block.
 - Querying is at the thread level, so each thread is exactly one line even if it
   has several starred replies.
+
+#### Bullets
+
+An account with a `triage:` block also gets 3-7 summary bullets under every
+pinned thread, generated at digest time by the same keyless `claude` transport
+triage uses, on the `triage:` block's `classify-model`. Nothing is cached.
+
+- When the newest inbound message asks you for something, that ask renders as a
+  marked FIRST line (`*Reply needed:*`) above the bullets. It is a separate
+  field, not one of the 3-7 bullets.
+- No ask means no marker and no placeholder: the absence of the marker is the
+  signal.
+- Bullets are capped at 80 characters each, in the prompt and again in Rust.
+- Over the readability budget the digest sheds bullets before it sheds threads,
+  never drops an ask, and only then drops trailing threads least-actionable
+  first (Important, then Starred, then Needs Reply).
+- Any `claude` failure still posts the digest, subjects and deep links intact,
+  with a `bullets unavailable: <cause>` line naming the failure class. An
+  account with NO `triage:` block posts an un-enriched digest with no such line;
+  that is not a failure.
 
 ### Digest timer
 
