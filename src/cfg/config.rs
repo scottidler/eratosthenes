@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cfg::filter::{FilterAction, MessageFilter};
 use crate::cfg::state::{StateAction, StateFilter};
+use crate::cfg::triage::TriageConfig;
 
 /// XDG config dir, honoring `$XDG_CONFIG_HOME` and falling back to `$HOME/.config`.
 pub fn xdg_config_dir() -> Option<PathBuf> {
@@ -104,6 +105,11 @@ pub struct Config {
     /// Optional per-account Slack digest config. `digest` is a no-op if absent.
     #[serde(default)]
     pub slack: Option<SlackConfig>,
+
+    /// Optional per-account LLM triage config. `triage` is a no-op if absent: no
+    /// classify/draft timer is generated and the classify pass never runs.
+    #[serde(default)]
+    pub triage: Option<TriageConfig>,
 
     /// Label recording that a message-filter HANDLED a message. Every message-filter
     /// excludes it, so a handled message is never acted on again. Defaulted, so no
@@ -621,6 +627,69 @@ message-filters:
             "got: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_triage_absent_is_none() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+"#;
+
+        let config = parse_config(yaml).unwrap();
+        assert!(config.triage.is_none());
+    }
+
+    #[test]
+    fn test_triage_block_with_defaults() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+triage:
+  schedule: "Mon..Fri 06:30:00"
+"#;
+
+        let config = parse_config(yaml).unwrap();
+        let triage = config.triage.expect("triage block present");
+        assert_eq!(triage.schedule, "Mon..Fri 06:30:00");
+        assert_eq!(triage.max_threads, 50);
+        assert_eq!(triage.body_chars, 4000);
+        assert_eq!(triage.classify_model, "claude-haiku-4-5-20251001");
+        assert_eq!(triage.draft_model, "claude-sonnet-5");
+        assert_eq!(triage.buckets.len(), 5);
+    }
+
+    #[test]
+    fn test_triage_block_requires_schedule() {
+        // schedule has no serde default, same reasoning as slack.schedule: a
+        // silent weekday guess would clobber the installed timer.
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+triage:
+  max-threads: 10
+"#;
+
+        let result = parse_config(yaml);
+        assert!(result.is_err(), "missing schedule must be a hard error");
+    }
+
+    #[test]
+    fn test_triage_bucket_missing_label_names_bucket_and_field() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+triage:
+  schedule: "Mon..Fri 06:30:00"
+  buckets:
+    - name: noise
+      description: everything else
+"#;
+
+        let err = parse_config(yaml).expect_err("bucket missing label must fail to load");
+        let msg = format!("{}", err);
+        assert!(msg.contains("triage bucket 'noise'"), "got: {}", msg);
+        assert!(msg.contains("label"), "got: {}", msg);
     }
 
     #[test]

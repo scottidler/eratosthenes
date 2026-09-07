@@ -51,6 +51,67 @@ slack:
   #   *-*-* 09:00:00       - every day at 9am
   schedule: Mon,Thu 07:00:00
 
+# ---- triage (OPTIONAL) ------------------------------------------------------
+# LLM classification pass in front of the aging engine (design doc:
+# docs/design/2026-07-06-llm-triage.md). Present -> `eratosthenes triage`
+# buckets new inbox threads via Gmail labels, and `service install` lays down a
+# triage timer driven by `schedule` below. Omit the whole block to disable it.
+# KEYLESS by construction: the LLM call shells out to the locally installed
+# `claude` CLI, which owns its own auth. This config holds no Anthropic
+# credential.
+# triage:
+#   # Path to the `claude` binary. Optional; resolved on PATH if unset. A
+#   # systemd unit's PATH is not your shell's -- `service install` extends the
+#   # generated unit PATH to cover it (Phase 5).
+#   claude-binary: ~/.local/bin/claude
+#
+#   # REQUIRED (when this block is present), same reasoning as slack.schedule:
+#   # there is NO default, so a missing schedule fails to load rather than
+#   # silently guessing a cadence and clobbering the installed timer.
+#   schedule: "Mon..Fri 06:30:00"
+#
+#   # Per-run cap on candidate threads. Hitting it logs loudly and never
+#   # truncates silently; the remainder is picked up next run. Default: 50
+#   max-threads: 50
+#
+#   # Per-THREAD char budget for body extraction, newest messages first.
+#   # Default: 4000
+#   body-chars: 4000
+#
+#   # Model for the batched classify call. Default: claude-haiku-4-5-20251001
+#   classify-model: claude-haiku-4-5-20251001
+#
+#   # Model for reply-draft generation (Phase 7). Default: claude-sonnet-5
+#   draft-model: claude-sonnet-5
+#
+#   # Path to your voice profile, consumed by draft prompts only (Phase 7). No
+#   # default: drafting is skipped loudly if unset.
+#   voice-profile: ~/Claude/writing/VOICE.md
+#
+#   # Classification taxonomy: names, labels, and the descriptions that become
+#   # the classifier prompt. Adding a bucket = YAML edit. Each bucket label
+#   # needs a matching state-filters entry below (needs-reply -> Keep, etc.).
+#   # `label` is REQUIRED per bucket; a bucket missing it fails to load,
+#   # naming the offending bucket and field. Defaults to the five buckets
+#   # below if `buckets` is omitted entirely.
+#   buckets:
+#     - name: needs-reply
+#       label: llm/needs-reply
+#       description: a real human wrote to Scott and expects a reply or action
+#       draft: true
+#     - name: fyi-work
+#       label: llm/fyi-work
+#       description: work-relevant notifications -- AWS, security, CI, vendors
+#     - name: recruiting
+#       label: llm/recruiting
+#       description: LinkedIn, recruiters, job alerts
+#     - name: receipts
+#       label: llm/receipts
+#       description: invoices, payments, renewals, order confirmations
+#     - name: noise
+#       label: llm/noise
+#       description: everything else -- marketing, newsletters, social
+
 # ---- marker-label (OPTIONAL) -----------------------------------------------
 # The label a message-filter stamps on every message it HANDLES (whether or not
 # the action changed anything), so unstarring/un-flagging it later STICKS: the

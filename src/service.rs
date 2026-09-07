@@ -555,6 +555,17 @@ pub fn config_validate(account_name: &str, config: &Config) -> Result<()> {
         println!("  - {}", filter.name);
     }
     println!();
+    match &config.triage {
+        Some(triage) => {
+            println!("Triage: configured, schedule '{}'", triage.schedule);
+            println!("  Buckets: {} defined", triage.buckets.len());
+            for bucket in &triage.buckets {
+                println!("    - {} -> {}", bucket.name, bucket.label);
+            }
+        }
+        None => println!("Triage: not configured"),
+    }
+    println!();
     println!("Log level: {}", config.log_level);
 
     Ok(())
@@ -579,6 +590,41 @@ pub fn config_show(account_name: &str, config: &Config) -> Result<()> {
     println!("State filters: {}", config.state_filters.len());
     for filter in &config.state_filters {
         println!("  - {}", filter.name);
+    }
+    println!();
+    match &config.triage {
+        Some(triage) => {
+            println!("Triage: configured");
+            println!("  Schedule: {}", triage.schedule);
+            println!(
+                "  Claude binary: {}",
+                triage
+                    .claude_binary
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(resolved on PATH)".to_string())
+            );
+            println!("  Max threads: {}", triage.max_threads);
+            println!("  Body chars: {}", triage.body_chars);
+            println!("  Classify model: {}", triage.classify_model);
+            println!("  Draft model: {}", triage.draft_model);
+            println!(
+                "  Voice profile: {}",
+                triage
+                    .voice_profile
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(unset)".to_string())
+            );
+            println!("  Buckets: {}", triage.buckets.len());
+            for bucket in &triage.buckets {
+                println!(
+                    "    - {} -> {} (draft: {})",
+                    bucket.name, bucket.label, bucket.draft
+                );
+            }
+        }
+        None => println!("Triage: not configured"),
     }
 
     Ok(())

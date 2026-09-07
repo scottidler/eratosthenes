@@ -60,3 +60,74 @@ is recorded in the design doc under "Phase 0 results".
   the call that would send the drafts Phase 7 creates.
 - **Phase 5's PATH work is now load-bearing, not precautionary.** Phase 0c
   confirmed `claude` does not resolve on the generated unit PATH.
+
+## Phase 1: Config schema + validation
+
+Implemented on 2026-09-06 against v0.3.0, host desk.lan. `otto ci` green.
+
+### Design decisions
+- New file `src/cfg/triage.rs` holds `TriageConfig` and `TriageBucket`,
+  matching the one-struct(-family)-per-file convention already in `src/cfg/`
+  (`filter.rs`, `state.rs`, `label.rs`). Wired into `Config` as
+  `pub triage: Option<TriageConfig>` (`src/cfg/config.rs`), mirroring the
+  existing `Option<SlackConfig>` pattern exactly.
+- `schedule: String` carries NO `#[serde(default)]`, so a `triage:` block with
+  no `schedule` fails to deserialize with serde's own "missing field
+  `schedule`" — the identical mechanism already proven for
+  `slack.schedule` (`src/cfg/config.rs:75`, `test_slack_block_requires_schedule`).
+  No custom validator was needed for this rule; the absence of a default IS
+  the enforcement, deliberately, consistent with the design doc's own framing
+  ("no default, deliberately").
+- `buckets` gets a hand-rolled `deserialize_buckets` (`src/cfg/triage.rs`) that
+  walks the raw YAML sequence one entry at a time instead of deriving
+  `Vec<TriageBucket>` directly. A plain derive would surface only serde_yaml's
+  generic "missing field `label`" with no way to tell WHICH bucket failed when
+  several are present. The custom deserializer peeks the entry's `name` field
+  out of the raw `Value` before attempting the real parse, and folds it into
+  the error message (`"triage bucket '{name}': {serde error}"`), which is what
+  the success criterion ("naming the offending bucket and field") actually
+  requires. A bucket missing `name` itself falls back to `#<position>`
+  (1-indexed) so the error never goes anonymous.
+- `classify-model`, `draft-model`, `max-threads`, and `body-chars` all default
+  per the doc's stated values (`claude-haiku-4-5-20251001`, `claude-sonnet-5`,
+  `50`, `4000`). `buckets` itself defaults to the same five-bucket taxonomy
+  shown in the doc's Data Model / shipped in `eratosthenes.example.yml`
+  (needs-reply, fyi-work, recruiting, receipts, noise), so a bare `triage:`
+  block carrying only `schedule` still has a working taxonomy end to end —
+  matching the doc's description of those YAML values as "illustrative
+  defaults", read literally.
+- `config validate` and `config show` (`src/service.rs`) both grow a `Triage:`
+  section (configured/not-configured, schedule, bucket list, and — for `show`
+  — every other field) even though the pre-existing `slack` block was NOT
+  previously surfaced in either command. This phase's own success criteria
+  require `config validate|show` to cover the triage block explicitly, so
+  triage's coverage is now ahead of slack's rather than matching it; slack's
+  gap is pre-existing and out of scope here.
+
+### Deviations
+- None. The struct shape, field names, and defaults match the design doc's
+  Data Model section exactly; the only addition beyond the doc's literal text
+  is the per-bucket error-naming mechanism, which the doc's own Phase 1
+  success criterion requires but does not specify an implementation for.
+
+### Tradeoffs
+- Named-bucket error enrichment via a custom `deserialize_buckets` vs. a
+  post-load `Config::validate()` check (the pattern already used for
+  `marker_label` collisions in `config.rs`). Chose the deserializer: `label`
+  stays a required, non-`Option` `String` (honest typing — later phases can
+  rely on it being present without an `.expect()`), and the error fires at the
+  exact point of failure rather than requiring a second pass over an
+  already-parsed (but conceptually invalid) struct. The tradeoff is a few more
+  lines of `Value`-walking code, matching the same pattern already used by
+  `deserialize_named_filters` / `deserialize_named_states` in `config.rs`.
+- Bucket list defaulting to the full five-entry taxonomy vs. defaulting to an
+  empty list. An empty default would make a bare `triage: {schedule: ...}`
+  block load successfully but classify nothing (Phase 4 would batch-classify
+  zero buckets against a config with none defined). Defaulting to the shipped
+  taxonomy keeps "config validates" and "config does something sensible"
+  aligned, at the cost of the default living in two places (this file and
+  the example YAML) that must be kept in sync by hand if the doc's bucket set
+  ever changes.
+
+### Open questions
+- None.
