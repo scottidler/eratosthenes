@@ -131,3 +131,84 @@ Implemented on 2026-09-06 against v0.3.0, host desk.lan. `otto ci` green.
 
 ### Open questions
 - None.
+
+## Phase 2: Aging-engine Move semantics for labeled filters
+
+### Design decisions
+- Move label math extracted into a pure planner, `plan_state_move`
+  (`src/engine.rs`), returning a `PlannedMove { add, remove }` rather than
+  computed inline in `apply_state_action`. This follows the message-filter
+  precedent (`plan_filter_writes` -> `PlannedWrite`) already in this file:
+  the semantics are assertable as data with no `GmailClient`, which is the
+  only way the three filter-shape tests this phase requires can exist at all
+  (`apply_state_action` needs a live client and cannot be unit-tested).
+- `derive_stages` is computed ONCE per run in `execute_state_filters` and
+  threaded down as `stages: &[String]` through `evaluate_thread` into
+  `apply_state_action`, rather than recomputed per thread or rebuilt inside
+  the action. The stage ladder is a property of the config, not of a thread.
+- `evaluate_thread` also passes the `thread_labels` it already resolved into
+  `apply_state_action` instead of letting it re-resolve them off the thread.
+  One resolution per thread, and the planner takes resolved names as data.
+- `INBOX` is removed unconditionally on a Move (unless it IS the destination),
+  per the doc. Note it is normally redundant: `derive_stages` puts `INBOX`
+  first in the ladder, so a thread carrying `INBOX` sheds it via the stage
+  loop anyway. It bites only when the thread does not carry `INBOX`, where
+  the removal is a Gmail no-op. Kept because the doc specifies it and because
+  it makes the rule readable without knowing `derive_stages`' implicit stage.
+- The destination is never in the remove set, so a filter that moves a thread
+  to the stage it already occupies is a no-op instead of a self-cancelling
+  add+remove pair.
+- An empty Move destination (the `action:`-less `default_action`,
+  `StateAction::Move(String::new())`) now plans an EMPTY add list. The old
+  code resolved `""` and sent `add: [""]`, which is a Gmail 400. Unreachable
+  today for `Ttl::Keep` filters (they never produce an action), but reachable
+  for a TTL filter written without `action:`.
+
+### Deviations
+- The doc's success criterion "all three filter-shape tests pass and are
+  demonstrated to fail against the old remove-own-labels behavior" is only
+  satisfiable for TWO of the three shapes, and this was measured, not assumed.
+  A temporary side-by-side of the old rule against the new one printed:
+  stage-transition `Purgatory -> Oblivion` old `remove=[Purgatory]` vs new
+  `remove=[INBOX, Purgatory]` (differs); bucket `llm/noise -> Purgatory` old
+  `remove=[llm/noise]` vs new `remove=[INBOX]` (differs); bare catch-all
+  `Cull` old `remove=[INBOX]` vs new `remove=[INBOX]` (IDENTICAL). The bare
+  catch-all is precisely the shape where old and new agree by construction:
+  with no `labels:` the old rule fell back to `INBOX`, which is what the stage
+  rule now derives. That test is therefore a pure regression pin, and its bite
+  was demonstrated against mutations of the NEW code instead (see below).
+- Mutation results, all four mutations applied to `plan_state_move` and
+  reverted: (1) drop the unconditional `INBOX` removal -> the stage-transition
+  test fails; (2) remove every ladder stage whether or not the thread carries
+  it -> 5 of 7 fail; (3) drop the "never remove the destination" guard -> the
+  destination test fails; (4) strip every label the thread carries (the old
+  rule's spirit) -> 4 of 7 fail, including the bare catch-all. Every test
+  bites under at least one mutation.
+- `apply_state_action`'s signature gained TWO parameters, not one:
+  `thread_labels: &[Label]` and `stages: &[String]`. The doc anticipated
+  threading "`derive_stages`' output (or the filters themselves)"; the
+  resolved thread labels ride along for the same reason (the planner must be
+  pure, and the caller already has them).
+
+### Tradeoffs
+- Passing the derived stage list vs. passing the `state_filters` themselves.
+  Chose the stage list: `apply_state_action` has no business re-deriving a
+  ladder, and passing filters would let a future edit reintroduce
+  "remove the filter's own labels" without changing a signature.
+- Intersecting the ladder with the thread's CURRENT labels vs. removing every
+  ladder stage unconditionally. Unconditional removal would be one line
+  shorter and is harmless at the API level (removing an absent label is a
+  no-op), but it makes every Move write name labels the thread never had,
+  which is noise in `--dry-run` output and in the debug log, and it erases the
+  distinction the tests need in order to bite.
+- `PlannedMove` is a private struct rather than reusing `PlannedWrite`.
+  `PlannedWrite` carries `action: FilterAction` and an `ids` list, neither of
+  which a thread-level `modify_thread` has. Reuse would have meant a
+  `FilterAction` value that lies about what the write is.
+
+### Open questions
+- Empty Move destinations are now silently "archive to nowhere". If that is
+  never a legitimate config, it belongs as a load-time error in
+  `Config::validate` (alongside `validate_move_position`) rather than as a
+  runtime behavior. Not added here: it is config validation, which is Phase 1
+  territory, and adding it now would reject configs that load today.

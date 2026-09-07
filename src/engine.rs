@@ -817,6 +817,8 @@ async fn execute_state_filters(
     );
 
     let clock = crate::cfg::state::RealClock;
+    let stages = derive_stages(state_filters);
+    debug!("{}[state] stages={:?}", prefix, stages);
     let total = thread_ids.len();
     let mut transitioned = 0usize;
 
@@ -832,7 +834,17 @@ async fn execute_state_filters(
             thread_id
         );
         let thread = client.get_thread(thread_id).await?;
-        if evaluate_thread(client, &thread, state_filters, prefix, &clock, dry_run).await? {
+        if evaluate_thread(
+            client,
+            &thread,
+            state_filters,
+            &stages,
+            prefix,
+            &clock,
+            dry_run,
+        )
+        .await?
+        {
             transitioned += 1;
         }
     }
@@ -844,6 +856,7 @@ async fn evaluate_thread<C: Clock>(
     client: &GmailClient,
     thread: &GmailThread,
     state_filters: &[StateFilter],
+    stages: &[String],
     prefix: &str,
     clock: &C,
     dry_run: bool,
@@ -883,7 +896,17 @@ async fn evaluate_thread<C: Clock>(
 
         match state_filter.evaluate_ttl(last_activity, is_read, clock)? {
             Some(action) => {
-                apply_state_action(client, thread, state_filter, &action, prefix, dry_run).await?;
+                apply_state_action(
+                    client,
+                    thread,
+                    &thread_labels,
+                    state_filter,
+                    stages,
+                    &action,
+                    prefix,
+                    dry_run,
+                )
+                .await?;
                 return Ok(true);
             }
             None => {
@@ -902,53 +925,93 @@ async fn evaluate_thread<C: Clock>(
     Ok(false)
 }
 
+/// One intended `modify_thread(add, remove)` for a state-filter `Move`.
+#[derive(Debug, PartialEq)]
+struct PlannedMove {
+    add: Vec<String>,
+    remove: Vec<String>,
+}
+
+/// Plan the label writes a `Move` implies, as DATA: no Gmail calls, so the semantics are
+/// assertable without a live mailbox.
+///
+/// A state filter's `labels:` are MATCH CRITERIA, not the thread's location, and this used
+/// to remove them. That is only accidentally right for the two filter shapes that happen to
+/// scope on a stage (`INBOX -> Purgatory`, `Purgatory -> Oblivion`) and wrong for every
+/// other shape: an `llm/noise -> Purgatory` filter stripped `llm/noise`, left the thread
+/// sitting in the inbox, and destroyed the very classification that selected it -- so the
+/// next run reclassified it and stripped it again, forever, and the thread never aged.
+///
+/// A Move means "advance the thread one stage": remove `INBOX` plus every stage label
+/// (`derive_stages`) the thread currently carries, add the destination, remove nothing
+/// else. `INBOX` goes unconditionally -- a later-stage thread can be back in the inbox
+/// because a reply arrived, and leaving it there is the same stranding bug in a different
+/// costume. The destination is never removed, so a filter that moves a thread to the stage
+/// it already occupies is a no-op instead of a self-cancelling write.
+fn plan_state_move(
+    thread_labels: &[Label],
+    stages: &[String],
+    dest: &str,
+    resolver: &LabelResolver,
+) -> PlannedMove {
+    let dest_label = Label::new(dest);
+
+    let mut remove: Vec<Label> = Vec::new();
+    if dest_label != Label::Inbox {
+        remove.push(Label::Inbox);
+    }
+    for stage in stages {
+        let stage = Label::new(stage);
+        if stage != dest_label && thread_labels.contains(&stage) && !remove.contains(&stage) {
+            remove.push(stage);
+        }
+    }
+
+    // An empty destination is the `action:`-less default: age the thread out of the inbox
+    // and out of its stage, with nowhere to land. Adding "" would be a Gmail 400.
+    let add = if dest.is_empty() {
+        Vec::new()
+    } else {
+        vec![resolve_label_id(resolver, dest)]
+    };
+
+    PlannedMove {
+        add,
+        remove: remove
+            .iter()
+            .map(|l| resolve_label_id(resolver, l.to_gmail_id()))
+            .collect(),
+    }
+}
+
 async fn apply_state_action(
     client: &GmailClient,
     thread: &GmailThread,
+    thread_labels: &[Label],
     state_filter: &StateFilter,
+    stages: &[String],
     action: &StateAction,
     prefix: &str,
     dry_run: bool,
 ) -> Result<()> {
     debug!(
-        "{}apply_state_action: filter={}, thread={}, action={:?}, dry_run={}",
-        prefix, state_filter.name, thread.id, action, dry_run
+        "{}apply_state_action: filter={}, thread={}, action={:?}, stages={:?}, dry_run={}",
+        prefix, state_filter.name, thread.id, action, stages, dry_run
     );
 
     match action {
         StateAction::Move(dest) => {
-            let remove_labels: Vec<String> = state_filter
-                .labels
-                .iter()
-                .map(|l| {
-                    client
-                        .resolver
-                        .resolve_name(l.to_gmail_id())
-                        .unwrap_or(l.to_gmail_id())
-                        .to_string()
-                })
-                .collect();
-
-            let remove = if remove_labels.is_empty() {
-                vec!["INBOX".to_string()]
-            } else {
-                remove_labels
-            };
-
-            let dest_id = client
-                .resolver
-                .resolve_name(dest)
-                .unwrap_or(dest.as_str())
-                .to_string();
+            let planned = plan_state_move(thread_labels, stages, dest, &client.resolver);
 
             debug!(
-                "{}[state:{}] thread {} -> {}",
-                prefix, state_filter.name, thread.id, dest,
+                "{}[state:{}] thread {} -> {} (add={:?}, remove={:?})",
+                prefix, state_filter.name, thread.id, dest, planned.add, planned.remove,
             );
 
             if !dry_run {
-                let add = vec![dest_id];
-                client.modify_thread(&thread.id, &add, &remove).await?;
+                client
+                    .modify_thread(&thread.id, &planned.add, &planned.remove)
+                    .await?;
             }
         }
         StateAction::Delete => {
@@ -1663,6 +1726,183 @@ mod tests {
 
         let stages = derive_stages(&filters);
         assert_eq!(stages, vec!["INBOX"]);
+    }
+
+    /// A resolver holding the stage and bucket labels the state-filter tests move threads
+    /// between, i.e. what `ensure_labels` leaves registered before Phase 2 runs.
+    fn state_resolver() -> LabelResolver {
+        LabelResolver::from_api_labels(vec![
+            custom_label("Label_7", "Purgatory"),
+            custom_label("Label_8", "Oblivion"),
+            custom_label("Label_9", "llm/noise"),
+        ])
+    }
+
+    fn move_filter(name: &str, labels: &[&str], dest: &str) -> StateFilter {
+        StateFilter {
+            name: name.to_string(),
+            labels: labels.iter().map(|l| Label::new(l)).collect(),
+            ttl: Ttl::Days(chrono::Duration::days(3)),
+            action: StateAction::Move(dest.to_string()),
+        }
+    }
+
+    /// The production ladder (tatari.yml): Keep guards, an `INBOX` Cull into Purgatory,
+    /// Purgatory draining to Oblivion, plus the Phase 3 bucket shape that scopes on a
+    /// classification label instead of a stage.
+    fn ladder_filters() -> Vec<StateFilter> {
+        vec![
+            StateFilter {
+                name: "Starred".to_string(),
+                labels: vec![Label::Starred],
+                ttl: Ttl::Keep,
+                action: StateAction::Move(String::new()),
+            },
+            move_filter("Cull", &["INBOX"], "Purgatory"),
+            move_filter("age-noise", &["llm/noise"], "Purgatory"),
+            move_filter("Purge", &["Purgatory"], "Oblivion"),
+        ]
+    }
+
+    fn labels_of(names: &[&str]) -> Vec<Label> {
+        names.iter().map(|n| Label::new(n)).collect()
+    }
+
+    /// Existing shape 1, the stage transition: a thread sitting in Purgatory advances to
+    /// Oblivion, shedding `INBOX` and the stage it came from. Bites against the old
+    /// remove-own-labels behavior, which never removed `INBOX` here.
+    #[test]
+    fn test_state_move_stage_transition_sheds_inbox_and_the_current_stage() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            &labels_of(&["Purgatory", "UNREAD"]),
+            &stages,
+            "Oblivion",
+            &state_resolver(),
+        );
+
+        assert_eq!(planned.add, vec!["Label_8".to_string()]);
+        assert_eq!(
+            planned.remove,
+            vec!["INBOX".to_string(), "Label_7".to_string()]
+        );
+    }
+
+    /// Existing shape 2, the bare catch-all: a filter with no `labels:` at all still
+    /// removes `INBOX` and nothing else.
+    #[test]
+    fn test_state_move_bare_catch_all_removes_only_inbox() {
+        let filters = vec![move_filter("Cull", &[], "Purgatory")];
+        let stages = derive_stages(&filters);
+        let planned = plan_state_move(
+            &labels_of(&["INBOX", "UNREAD", "CATEGORY_FORUMS"]),
+            &stages,
+            "Purgatory",
+            &state_resolver(),
+        );
+
+        assert_eq!(planned.add, vec!["Label_7".to_string()]);
+        assert_eq!(planned.remove, vec!["INBOX".to_string()]);
+    }
+
+    /// Phase 2 success criterion, the new shape: an `llm/noise -> Purgatory` filter removes
+    /// `INBOX` and leaves `llm/noise` intact. Match labels are criteria, never removed --
+    /// the old behavior stripped `llm/noise` and left the thread in the inbox.
+    #[test]
+    fn test_state_move_leaves_the_bucket_label_intact() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            &labels_of(&["INBOX", "UNREAD", "llm/noise"]),
+            &stages,
+            "Purgatory",
+            &state_resolver(),
+        );
+
+        assert_eq!(planned.add, vec!["Label_7".to_string()]);
+        assert_eq!(planned.remove, vec!["INBOX".to_string()]);
+        assert!(
+            !planned.remove.contains(&"Label_9".to_string()),
+            "bucket label llm/noise must survive the move: {:?}",
+            planned.remove
+        );
+    }
+
+    /// A stage the thread does not carry is not removed: the plan touches the thread's
+    /// actual location, not the whole ladder.
+    #[test]
+    fn test_state_move_ignores_stages_the_thread_does_not_carry() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            &labels_of(&["INBOX"]),
+            &stages,
+            "Purgatory",
+            &state_resolver(),
+        );
+
+        assert_eq!(planned.remove, vec!["INBOX".to_string()]);
+    }
+
+    /// The destination is never in the remove set, so re-moving a thread to the stage it
+    /// already occupies cannot cancel its own add.
+    #[test]
+    fn test_state_move_never_removes_its_own_destination() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            &labels_of(&["INBOX", "Purgatory"]),
+            &stages,
+            "Purgatory",
+            &state_resolver(),
+        );
+
+        assert_eq!(planned.add, vec!["Label_7".to_string()]);
+        assert_eq!(planned.remove, vec!["INBOX".to_string()]);
+    }
+
+    /// An `action:`-less filter has an empty Move destination: age the thread out of the
+    /// inbox and its stage, add nothing. An empty label id would be a Gmail 400.
+    #[test]
+    fn test_state_move_with_no_destination_adds_nothing() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            &labels_of(&["INBOX", "Purgatory"]),
+            &stages,
+            "",
+            &state_resolver(),
+        );
+
+        assert!(planned.add.is_empty(), "add={:?}", planned.add);
+        assert_eq!(
+            planned.remove,
+            vec!["INBOX".to_string(), "Label_7".to_string()]
+        );
+    }
+
+    /// The real data flow: thread label IDs off the wire resolve to names, the plan is
+    /// computed over names, and the write comes back out as IDs.
+    #[test]
+    fn test_state_move_round_trips_wire_label_ids() {
+        let resolver = state_resolver();
+        let thread = GmailThread {
+            id: "t1".to_string(),
+            messages: vec![msg_at(
+                "m1",
+                "t1",
+                "noreply@example.com",
+                &["INBOX", "UNREAD", "Label_9"],
+                1_000,
+            )],
+        };
+        let stages = derive_stages(&ladder_filters());
+
+        let planned = plan_state_move(
+            &thread.labels_resolved(&resolver),
+            &stages,
+            "Purgatory",
+            &resolver,
+        );
+
+        assert_eq!(planned.add, vec!["Label_7".to_string()]);
+        assert_eq!(planned.remove, vec!["INBOX".to_string()]);
     }
 
     /// `--mark-only` success criterion: a pin filter's plan collapses to exactly one
