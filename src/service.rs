@@ -291,6 +291,26 @@ fn resolve_triage_schedule(triage_accounts: &[&Account]) -> String {
 /// Write the digest EnvironmentFile (mode 600) containing one line per DISTINCT
 /// `token-env` name across slack-enabled accounts that is set in the current
 /// environment. Warns for any referenced env var that is unset.
+/// Parse a `KEY=value` env file into a map. Missing or unreadable file -> empty
+/// map. Blank lines, `#` comments, and lines without `=` are skipped; the value
+/// keeps everything after the FIRST `=` so a token containing `=` survives.
+fn parse_env_file(path: &Path) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return map;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            map.insert(key.trim().to_string(), value.to_string());
+        }
+    }
+    map
+}
+
 fn write_digest_env(slack_accounts: &[&Account]) -> Result<()> {
     let mut seen: Vec<String> = Vec::new();
     for account in slack_accounts {
@@ -301,19 +321,51 @@ fn write_digest_env(slack_accounts: &[&Account]) -> Result<()> {
         }
     }
 
+    let path = digest_env_path()?;
+
+    // Values already on disk are a CREDENTIAL SOURCE, not scratch. An earlier
+    // version read the env var, warned when it was unset, and then wrote the
+    // empty result to this very path -- destroying the token it had just told
+    // the operator to put here. That is exactly what happened on 2026-09-07: a
+    // `service reinstall` from a shell with SLACK_XOXP_TOKEN unset truncated a
+    // live 96-byte token file to 0 bytes, unrecoverably.
+    //
+    // So: env wins when set, disk is the fallback, and a name with neither is
+    // the only case that warns.
+    let existing = parse_env_file(&path);
+
     let mut lines = String::new();
+    let mut missing: Vec<&str> = Vec::new();
     for name in &seen {
         match std::env::var(name) {
             Ok(value) => lines.push_str(&format!("{}={}\n", name, value)),
-            Err(_) => eprintln!(
-                "Warning: Slack token env var '{}' is not set; the digest service will fail until it is provided in {}",
-                name,
-                digest_env_path()?.display()
-            ),
+            Err(_) => match existing.get(name.as_str()) {
+                Some(value) => {
+                    println!("Preserving existing '{}' from {}", name, path.display());
+                    lines.push_str(&format!("{}={}\n", name, value));
+                }
+                None => missing.push(name.as_str()),
+            },
         }
     }
 
-    let path = digest_env_path()?;
+    for name in &missing {
+        eprintln!(
+            "Warning: Slack token env var '{}' is not set and is not already in {}; the digest service will fail until it is provided",
+            name,
+            path.display()
+        );
+    }
+
+    // Fail CLOSED rather than truncate a file that currently holds secrets.
+    if lines.is_empty() && !existing.is_empty() {
+        eyre::bail!(
+            "refusing to overwrite {} with an empty file: it holds {} value(s) and no replacement was found in the environment. Export the token(s) and re-run, or edit the file directly.",
+            path.display(),
+            existing.len()
+        );
+    }
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .context("Failed to create config directory for digest.env")?;
@@ -956,6 +1008,28 @@ mod tests {
                 .contains("eratosthenes-triage.service")
         );
         assert!(tmr.to_string_lossy().contains("eratosthenes-triage.timer"));
+    }
+
+    #[test]
+    fn test_parse_env_file_missing_file_is_empty() {
+        let map = parse_env_file(Path::new("/nonexistent/digest.env"));
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_parse_env_file_keeps_value_containing_equals() {
+        let dir = std::env::temp_dir().join("eratos-parse-env-test");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let path = dir.join("digest.env");
+        std::fs::write(&path, "SLACK_XOXP_TOKEN=xoxp-a=b=c\n# comment\n\nBARE\n").expect("write");
+        let map = parse_env_file(&path);
+        assert_eq!(
+            map.get("SLACK_XOXP_TOKEN").map(String::as_str),
+            Some("xoxp-a=b=c")
+        );
+        // comment, blank, and `=`-less lines are skipped
+        assert_eq!(map.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

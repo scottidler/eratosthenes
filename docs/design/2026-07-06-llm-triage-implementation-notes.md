@@ -639,3 +639,59 @@ first fix did not follow it.
   `~/.config/eratosthenes/digest.env` directly) before the digest timer next
   fires (`Thu 2026-09-10 07:00:00 PDT`). Flagged the same day it happened
   rather than left for a later phase to discover.
+
+## INCIDENT 2026-09-07: live Slack token destroyed by `service reinstall`
+
+### What happened
+Phase 5's live verification ran `eratosthenes service reinstall` from a shell
+where `SLACK_XOXP_TOKEN` was unset. `write_digest_env` truncated the live
+`~/.config/eratosthenes/digest.env` from 96 bytes to 0. The token value is
+gone and is not reconstructible from any artifact on this machine.
+
+### Root cause (pre-existing, NOT introduced by Phase 5)
+`write_digest_env` (`src/service.rs`) read each `token_env` from the process
+environment, printed a warning when it was unset, and then wrote the
+accumulated (empty) string to `digest.env` unconditionally. The warning even
+named that same path as where the operator should provide the token, while the
+very next statement destroyed it. Phase 5's verification is what triggered it;
+any `service reinstall` from a shell without the token exported would have.
+
+### Fix
+`write_digest_env` now treats on-disk values as a credential source:
+- env var set -> use it (unchanged)
+- env var unset but the name already present in `digest.env` -> preserve it,
+  and say so on stdout
+- neither -> warn, naming both the var and the file
+- **fails closed**: refuses to write an empty file over one that currently
+  holds values, with an error naming the count and the remedy
+
+New `parse_env_file` helper keeps everything after the FIRST `=`, so a token
+containing `=` survives a round trip. Tested.
+
+### Proof the guard holds
+Planted a sentinel in the (already-empty) file and ran the exact failing
+command, `SLACK_XOXP_TOKEN` unset:
+`Preserving existing 'SLACK_XOXP_TOKEN' from /home/saidler/.config/eratosthenes/digest.env`
+and the file survived at 46 bytes.
+
+### Collateral, found and repaired
+That verification reinstall also rewrote the units' `ExecStart` to the
+`target/release` build path (the tool warned about it). Repaired: run and
+digest restored to `/home/saidler/.cargo/bin/eratosthenes`, and the triage unit
+pair REMOVED, since the feature is not installed and a weekday 06:30 timer
+against an uninstalled subcommand would just fail. Final state matches
+pre-Phase-5: `eratosthenes.timer` and `eratosthenes-digest.timer` only.
+`digest.env` left empty (0 bytes), its true state, rather than holding a fake
+sentinel that would fail confusingly.
+
+### Scott's action required
+Re-provide the Slack user token before the digest fires Thu 2026-09-10 07:00.
+Either export `SLACK_XOXP_TOKEN` and run `eratosthenes service reinstall`, or
+write `SLACK_XOXP_TOKEN=<value>` into `~/.config/eratosthenes/digest.env`
+directly (chmod 600). `~/repos/scottidler/keep/.secrets/` holds several Slack
+secrets but none is named for this var; not decrypted or inspected here.
+
+### Standing lesson for the rest of this build
+Live verification of an install/reinstall path runs against real credentials
+and real units. Capture and restore is not enough when a step is destructive
+rather than overwriting-with-equivalent.
