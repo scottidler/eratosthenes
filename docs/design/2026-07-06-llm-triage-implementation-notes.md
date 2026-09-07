@@ -833,3 +833,128 @@ checked-in tests, not derived by hand.
   bullets on 11 surviving threads and deleted 59 whole threads** to make room.
   The patch was reverted and AC (2) re-run: pass. Nothing of the experiment
   remains in the tree.
+
+## Phase 7: Reply drafts
+
+### Design decisions
+- **The no-send guard is a pure-Rust scan, not a shelled-out `rg`** --
+  `tests/no_send_guard.rs:find_send_calls` -- implementing Phase 0d's pinned
+  pattern `\b(messages_send|drafts_send)\s*\(` literally: word boundary, either
+  builder, optional whitespace (newlines included, so rustfmt cannot hide a
+  call by wrapping it), open paren. Two measured reasons: this host's ripgrep
+  has no PCRE2, so a `--pcre2` guard errors silently and an `||` fallback around
+  it reports a false "clean" (the exact mistake made during Phase 0); and a
+  guard that depends on an external binary being installed fails OPEN when it
+  is not. Four supporting tests keep the guard honest -- it matches both real
+  builder shapes, it ignores `settings_send_as_*` / `channel.send(` /
+  `my_messages_send(` / bare mentions, it bites on an injected send in a temp
+  tree, and `guard_actually_walks_the_source_tree` pins a file-count floor so a
+  scan that walks nothing can never pass vacuously.
+- **The answered-rule ignores DRAFT messages when picking the newest message**
+  -- `src/triage/draft.rs:plan_refresh`. A draft this engine just created is
+  from the account owner AND is the newest message in the thread, so a naive
+  "newest message is Scott's" rule would read its own unsent draft as Scott's
+  answer and strip the bucket label on the very next run. Pinned by
+  `test_plan_refresh_never_reads_its_own_draft_as_an_answer`.
+- **The needs-reply refresh runs on EVERY invocation**, including one that
+  classified nothing -- `src/triage/mod.rs:execute`. Phase 4's `execute`
+  returned early when there were no new messages; a thread whose previous run
+  labeled it and then died carries no new message, so classification would
+  never look at it again and the free-retry property the doc claims would not
+  hold. The classify pass moved into `classify_and_label` and the refresh runs
+  after it unconditionally.
+- **Missing/unset/empty voice profile disables DRAFTING only, not the
+  answered-rule** -- `src/triage/mod.rs:refresh_drafts`. Loud on both channels
+  (`error!` + stdout), then the pass continues: clearing a bucket label off an
+  answered thread is a label decision with no voice in it, and classification
+  already committed. An empty profile file is treated as missing, because
+  drafting in a generic assistant voice is worse than not drafting.
+- **`claude` is resolved lazily, on the first thread that actually needs a
+  draft** -- `src/triage/mod.rs:refresh_drafts`. An account whose needs-reply
+  threads are all answered or already drafted never shells out.
+- **Non-ASCII subjects are RFC 2047 encoded** --
+  `src/triage/draft.rs:encode_header_value`, with a 20-line standard base64 in
+  the same file. Gmail hands back DECODED headers at `format=full`, so copying
+  a subject straight into a header would emit 8-bit bytes where the standard
+  allows none, and the Gmail API requires a MATCHING `Subject` for a draft to
+  thread. ASCII passes through byte-identical; long values fold at CRLF+space
+  inside the 75-char encoded-word limit.
+- **`To:` is a bare address, no display name** --
+  `src/triage/draft.rs:reply_headers`. Sidesteps encoding a display name
+  entirely; Gmail renders the name from contacts. `Reply-To` wins over `From`.
+  No `Cc` and no `From`, per the doc's Gmail-Reply semantics.
+- **The draft pass reuses the `max-threads` cap** --
+  `src/triage/mod.rs:collect_draft_targets`, with its own loud cap message. One
+  `claude` subprocess per draft, so an unbounded needs-reply set is an unbounded
+  number of subprocesses. Same knob, no new config.
+- **Draft targets are found by label ID, not a text query** --
+  `src/triage/mod.rs:collect_draft_targets` via the existing
+  `list_threads_by_label_ids(["INBOX", <bucket>])`. A nested label name needs
+  quoting in Gmail query syntax, and `labelIds` is evaluated thread-level, which
+  is the level bucket labels live at.
+- **A missing `Message-ID` on the target message is a loud per-thread SKIP, not
+  a degraded draft** -- `src/triage/draft.rs:reply_headers`. Without it there is
+  no `In-Reply-To`, and an untethered draft dumped into a thread is worse than
+  no draft: the next refresh retries a thread that has no draft, for free.
+
+### Deviations
+- **The narrow module is the pre-existing `src/gmail/client.rs`, and its public
+  surface is get | list | modify-labels | drafts-create PLUS `trash_thread` and
+  `hub()`.** The doc says "exactly ... nothing else". `trash_thread` is the
+  aging engine's Oblivion action and `hub()` is how `label.rs` creates labels;
+  both predate this phase and narrowing them means refactoring the aging
+  engine, which is not Phase 7's. Recorded rather than done. The no-send
+  GUARANTEE does not rest on that surface anyway: `tests/no_send_guard.rs`
+  scans every `.rs` file under `src/`, which is strictly stronger than a
+  per-module surface check. A `create_draft` module doc says so and says "do
+  not add a send path here".
+- **`drafts.create` sends the RFC822 as the upload's MEDIA part, not as
+  `Draft.message.raw`** -- `src/gmail/client.rs:create_draft`. Not a choice:
+  `google-gmail1 7.0.0+20251215` marks `drafts.create` upload-capable and its
+  plain `doit()` is PRIVATE, so `upload(stream, "message/rfc822")` is the only
+  public terminal call. Same request on the wire (a multipart POST whose
+  metadata part carries `threadId` and whose media part carries the message),
+  and it skips the base64 inflation `raw` would add. Same effect, correct seam.
+- **One new direct dependency: `mime = "0.3.17"`.** The doc's Dependencies
+  section adds none. Forced by the deviation above: `upload()`'s public
+  signature takes a `mime::Mime` and neither `google-gmail1` nor
+  `google-apis-common` re-exports the type. Version pinned to the one already
+  in `Cargo.lock` transitively, so nothing new is vendored.
+- **The guard test does not shell out to ripgrep**, though Phase 0d wrote the
+  pattern as an `rg` invocation. Semantics are identical; reasons in Design
+  decisions above.
+
+### Tradeoffs
+- **Pure-Rust guard vs. `rg` subprocess:** the Rust matcher is one more piece of
+  code that could itself be wrong, which is precisely why its bite is
+  demonstrated twice (automated, against a temp tree; and manually, against a
+  real compiled `drafts_send` call in `src/gmail/client.rs`). In exchange the
+  guard has no external dependency, no PCRE2 question, and cannot fail open.
+- **`Content-Transfer-Encoding: 8bit` vs. quoted-printable or base64 body:**
+  8bit with a UTF-8 charset is what Gmail's own raw-upload examples use and it
+  keeps the draft readable in transit; a strictly-7bit body would need another
+  hand-rolled encoder. Non-ASCII bodies are the common case (curly quotes), so
+  this is not a corner.
+- **Reusing `max-threads` for the draft cap vs. a new `max-drafts` knob:** one
+  knob is one thing to tune and one thing to get wrong; the cost is that raising
+  the classify cap also raises the draft cap. At ~10 threads/day that is noise.
+- **Answered-rule mutation happens per thread inside the loop vs. planned up
+  front like `plan_writes`:** the draft branch needs a live subprocess anyway,
+  so the pass cannot be a pure plan end to end. `plan_refresh` and
+  `plan_draft_targets` are pure and tested; only the apply loop is not.
+
+### Open questions
+- **THREADING IS UNVERIFIED END TO END, and this is the one thing that must be
+  checked live before this ships.** Phase 0(a) -- the hand-built threaded-draft
+  probe -- was never run: creating a Gmail draft is blocked by this session's
+  permission classifier, so no `drafts.create` has ever been issued from this
+  host. The implementation follows the documented API contract (`threadId` on
+  the message, `In-Reply-To`/`References` per RFC 2822, matching `Subject`), and
+  every header is unit-tested, but "the draft appears INSIDE the target thread
+  in the Gmail UI" is an assumption, not an observation. One live check on one
+  real thread closes it.
+- Relatedly unobserved for the same reason: whether the media-upload form of
+  `drafts.create` threads identically to the `raw` form. The Gmail API documents
+  them as the same request; nothing here has watched it happen.
+- `service install|reinstall` is NOT run by this phase, and must not be: the
+  2026-09-07 incident in this file destroyed a live credential that way.

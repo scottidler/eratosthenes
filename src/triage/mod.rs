@@ -8,19 +8,21 @@
 pub mod body;
 pub mod classify;
 pub mod claude;
+pub mod draft;
 pub mod thread;
 
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 
 use crate::cfg::config::Config;
 use crate::cfg::triage::{TriageBucket, TriageConfig};
 use crate::gmail::client::GmailClient;
 use crate::gmail::label::{LabelResolver, LabelVisibility, create_label_if_missing};
 use crate::triage::claude::{ClaudeCli, TRIAGE_TIMEOUT};
+use crate::triage::draft::RefreshPlan;
 use crate::triage::thread::TriageThread;
 
 /// Message-level idempotency marker. Message-level, deliberately: Gmail labels
@@ -276,6 +278,29 @@ pub async fn execute(
 
     ensure_triage_labels(client, triage, prefix, dry_run).await?;
 
+    let self_address = client
+        .profile_email()
+        .await
+        .context("resolving the account's own address")?;
+
+    classify_and_label(client, triage, &self_address, prefix, dry_run).await?;
+
+    // Runs on EVERY invocation, including one that classified nothing: the
+    // refresh is what retries a thread whose previous run died between the
+    // label write and the draft, and that thread carries no new message, so
+    // classification will never look at it again.
+    refresh_drafts(client, triage, &self_address, prefix, dry_run).await
+}
+
+/// The classify pass: new inbox messages -> buckets -> one `threads.modify`
+/// each.
+async fn classify_and_label(
+    client: &GmailClient,
+    triage: &TriageConfig,
+    self_address: &str,
+    prefix: &str,
+    dry_run: bool,
+) -> Result<()> {
     let selection = discover_candidates(client, triage, prefix).await?;
     if selection.thread_ids.is_empty() {
         info!("{}no new inbox messages to classify", prefix);
@@ -302,12 +327,7 @@ pub async fn execute(
         return Ok(());
     }
 
-    let self_address = client
-        .profile_email()
-        .await
-        .context("resolving the account's own address")?;
-
-    let classification = classify_threads(triage, &threads, &self_address, prefix).await?;
+    let classification = classify_threads(triage, &threads, self_address, prefix).await?;
 
     if dry_run {
         let by_id: HashMap<&str, &TriageThread> =
@@ -488,6 +508,324 @@ async fn classify_threads(
     Err(last_error
         .unwrap_or_else(|| eyre::eyre!("classifier produced no usable response"))
         .wrap_err("classifier response unusable after one retry; no threads were labeled"))
+}
+
+/// One thread still carrying a `draft: true` bucket label, and which label that
+/// is: the answered-rule needs the label id to take it back off.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DraftTarget {
+    pub thread_id: String,
+    pub bucket: String,
+    pub label_id: String,
+}
+
+/// Distinct threads still sitting in the inbox under a `draft: true` bucket,
+/// capped.
+///
+/// Deduped across buckets because a thread can only be drafted into once, and
+/// first bucket wins so the config's own bucket order decides -- not the order
+/// Gmail happened to return threads in.
+pub fn plan_draft_targets(
+    per_bucket: Vec<(String, String, Vec<String>)>,
+    cap: usize,
+) -> (Vec<DraftTarget>, usize) {
+    let mut targets: Vec<DraftTarget> = Vec::new();
+    for (bucket, label_id, thread_ids) in per_bucket {
+        for thread_id in thread_ids {
+            if targets.iter().any(|t| t.thread_id == thread_id) {
+                continue;
+            }
+            targets.push(DraftTarget {
+                thread_id,
+                bucket: bucket.clone(),
+                label_id: label_id.clone(),
+            });
+        }
+    }
+
+    let total = targets.len();
+    targets.truncate(cap);
+    (targets, total)
+}
+
+/// Find every inbox thread under a `draft: true` bucket.
+///
+/// Matched on label IDs rather than a `label:llm/needs-reply` text query: a
+/// nested label name needs quoting in Gmail's query syntax, and `labelIds` is
+/// evaluated thread-level, which is the level bucket labels live at.
+async fn collect_draft_targets(
+    client: &GmailClient,
+    draft_buckets: &[&TriageBucket],
+    cap: usize,
+    prefix: &str,
+) -> Result<Vec<DraftTarget>> {
+    let mut per_bucket: Vec<(String, String, Vec<String>)> = Vec::new();
+    for bucket in draft_buckets {
+        let Some(label_id) = client.resolver.resolve_name(&bucket.label) else {
+            // Only reachable on a dry run, which creates no labels: a real run
+            // has already ensured them.
+            debug!(
+                "{}label '{}' does not exist yet; nothing to refresh",
+                prefix, bucket.label
+            );
+            continue;
+        };
+        let label_id = label_id.to_string();
+        let thread_ids = client
+            .list_threads_by_label_ids(&["INBOX", label_id.as_str()])
+            .await
+            .with_context(|| format!("listing inbox threads labeled '{}'", bucket.label))?;
+        per_bucket.push((bucket.name.clone(), label_id, thread_ids));
+    }
+
+    let (targets, total) = plan_draft_targets(per_bucket, cap);
+    if total > targets.len() {
+        let message = format!(
+            "max-threads cap HIT in the reply-draft pass: {} threads await a draft, \
+handling the first {}, {} left for the next run (raise max-threads if this repeats)",
+            total,
+            targets.len(),
+            total - targets.len()
+        );
+        warn!("{}{}", prefix, message);
+        println!("{}{}", prefix, message);
+    }
+    info!(
+        "{}reply-draft candidates: {} threads",
+        prefix,
+        targets.len()
+    );
+
+    Ok(targets)
+}
+
+/// The needs-reply refresh: answered threads lose their bucket label, and
+/// unanswered ones without a draft get one.
+///
+/// Nothing here ever SENDS, and nothing modifies or deletes an existing draft:
+/// Scott may have edited it, and his edits are sacred. The cost of that is a
+/// draft going stale when the counterparty replies again, which he sees as the
+/// newer message in the same thread. Accepted (design doc, Data Model).
+async fn refresh_drafts(
+    client: &GmailClient,
+    triage: &TriageConfig,
+    self_address: &str,
+    prefix: &str,
+    dry_run: bool,
+) -> Result<()> {
+    let draft_buckets: Vec<&TriageBucket> = triage.buckets.iter().filter(|b| b.draft).collect();
+    if draft_buckets.is_empty() {
+        debug!(
+            "{}no bucket sets draft: true; skipping the reply-draft pass",
+            prefix
+        );
+        return Ok(());
+    }
+    debug!(
+        "{}refresh_drafts: buckets={}, model={}, dry_run={}",
+        prefix,
+        draft_buckets.len(),
+        triage.draft_model,
+        dry_run
+    );
+
+    let targets =
+        collect_draft_targets(client, &draft_buckets, triage.max_threads as usize, prefix).await?;
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    // Loaded once and LOUDLY: a missing profile disables DRAFTING only. The
+    // answered-rule below is a label decision with no voice in it, and
+    // classification already happened.
+    let voice = match draft::load_voice_profile(triage.voice_profile.as_deref()) {
+        Ok(profile) => Some(profile),
+        Err(e) => {
+            error!("{}reply drafting SKIPPED: {:#}", prefix, e);
+            println!("{}Triage: reply drafting SKIPPED: {:#}", prefix, e);
+            None
+        }
+    };
+
+    // Resolved on first need, not up front: an account whose needs-reply
+    // threads are all answered or already drafted never shells out at all.
+    let mut cli: Option<ClaudeCli> = None;
+    let mut drafted = 0usize;
+    let mut answered = 0usize;
+    let mut skipped = 0usize;
+
+    for target in &targets {
+        let raw = match client.get_thread_full(&target.thread_id).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                warn!(
+                    "{}fetching thread {} at format=full failed: {:#}",
+                    prefix, target.thread_id, e
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+        let thread = match TriageThread::from_api(raw) {
+            Ok(thread) => thread,
+            Err(e) => {
+                warn!(
+                    "{}skipping unreadable thread {}: {:#}",
+                    prefix, target.thread_id, e
+                );
+                skipped += 1;
+                continue;
+            }
+        };
+
+        match draft::plan_refresh(&thread, self_address) {
+            RefreshPlan::Answered => {
+                if dry_run {
+                    println!(
+                        "{}[dry-run] thread {} is answered; would remove '{}'",
+                        prefix, target.thread_id, target.bucket
+                    );
+                } else {
+                    client
+                        .modify_thread(
+                            &target.thread_id,
+                            &[],
+                            std::slice::from_ref(&target.label_id),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "clearing '{}' from answered thread {}",
+                                target.bucket, target.thread_id
+                            )
+                        })?;
+                    info!(
+                        "{}[triage:{}] thread {} answered; bucket label removed",
+                        prefix, target.bucket, target.thread_id
+                    );
+                }
+                answered += 1;
+            }
+            RefreshPlan::DraftExists => {
+                debug!(
+                    "{}thread {} already has a draft; leaving it untouched",
+                    prefix, target.thread_id
+                );
+                skipped += 1;
+            }
+            RefreshPlan::Empty => {
+                warn!(
+                    "{}thread {} has no message to reply to; skipping",
+                    prefix, target.thread_id
+                );
+                skipped += 1;
+            }
+            RefreshPlan::Draft { target_id } => {
+                let Some(voice) = voice.as_deref() else {
+                    skipped += 1;
+                    continue;
+                };
+                if dry_run {
+                    println!(
+                        "{}[dry-run] thread {} would get a reply draft",
+                        prefix, target.thread_id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+
+                let Some(message) = thread.messages.iter().find(|m| m.id == target_id) else {
+                    warn!(
+                        "{}thread {} lost message {} between plan and build; skipping",
+                        prefix, target.thread_id, target_id
+                    );
+                    skipped += 1;
+                    continue;
+                };
+                let headers = match draft::reply_headers(message) {
+                    Ok(headers) => headers,
+                    Err(e) => {
+                        error!(
+                            "{}no reply draft for thread {}: {:#}",
+                            prefix, target.thread_id, e
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
+                if cli.is_none() {
+                    let resolved =
+                        ClaudeCli::resolve(triage.claude_binary.as_deref(), draft::DRAFT_TIMEOUT)
+                            .await
+                            .map_err(|e| eyre::eyre!("{}", e))?;
+                    debug!(
+                        "{}reply drafts: claude version={}",
+                        prefix,
+                        resolved.version()
+                    );
+                    cli = Some(resolved);
+                }
+                let Some(cli) = cli.as_ref() else {
+                    unreachable!("the claude CLI was just resolved or the run bailed")
+                };
+
+                let prompt = draft::build_prompt(voice);
+                let payload = classify::build_payload(
+                    std::slice::from_ref(&thread),
+                    triage.body_chars,
+                    self_address,
+                )
+                .context("building the draft payload")?;
+                let raw = cli
+                    .invoke(&triage.draft_model, &prompt, &payload)
+                    .await
+                    .map_err(|e| eyre::eyre!("{}", e))?;
+
+                let body = match draft::parse_response(&raw) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        error!(
+                            "{}draft response for thread {} was unusable: {:#}",
+                            prefix, target.thread_id, e
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                };
+
+                let rfc822 = draft::build_rfc822(&headers, &body);
+                let draft_id = client
+                    .create_draft(&thread.id, &rfc822)
+                    .await
+                    .with_context(|| format!("drafting a reply in thread {}", thread.id))?;
+                info!(
+                    "{}[triage:{}] thread {} -> draft {} to {}",
+                    prefix, target.bucket, thread.id, draft_id, headers.to
+                );
+                drafted += 1;
+            }
+        }
+    }
+
+    info!(
+        "{}Reply drafts done: {} drafted, {} answered, {} skipped{}",
+        prefix,
+        drafted,
+        answered,
+        skipped,
+        if dry_run { " (dry run)" } else { "" }
+    );
+    println!(
+        "{}Triage: {} reply drafts, {} answered, {} skipped{}",
+        prefix,
+        drafted,
+        answered,
+        skipped,
+        if dry_run { " (dry run)" } else { "" }
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]

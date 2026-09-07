@@ -325,3 +325,59 @@ fn test_plan_writes_skips_an_assignment_whose_thread_was_not_fetched() {
     let writes = plan_writes(&threads, &classification, &config, &resolver, false).unwrap();
     assert!(writes.is_empty());
 }
+
+/// The bucket a thread is drafted under is the config's order, not Gmail's: a
+/// thread carrying two `draft: true` bucket labels is handled once, by the
+/// first bucket in config.
+#[test]
+fn test_plan_draft_targets_dedupes_a_thread_across_buckets() {
+    let per_bucket = vec![
+        (
+            "needs-reply".to_string(),
+            "Label_1".to_string(),
+            vec!["t1".to_string(), "t2".to_string()],
+        ),
+        (
+            "escalations".to_string(),
+            "Label_9".to_string(),
+            vec!["t2".to_string(), "t3".to_string()],
+        ),
+    ];
+
+    let (targets, total) = plan_draft_targets(per_bucket, 10);
+    let planned: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|t| (t.thread_id.as_str(), t.bucket.as_str()))
+        .collect();
+    assert_eq!(
+        planned,
+        vec![
+            ("t1", "needs-reply"),
+            ("t2", "needs-reply"),
+            ("t3", "escalations")
+        ]
+    );
+    assert_eq!(total, 3);
+}
+
+/// The cap bounds the draft pass too: one `claude` call per draft, so an
+/// unbounded needs-reply set would be an unbounded number of subprocesses.
+#[test]
+fn test_plan_draft_targets_caps_and_reports_the_total() {
+    let per_bucket = vec![(
+        "needs-reply".to_string(),
+        "Label_1".to_string(),
+        vec!["t1".to_string(), "t2".to_string(), "t3".to_string()],
+    )];
+
+    let (targets, total) = plan_draft_targets(per_bucket, 2);
+    assert_eq!(targets.len(), 2);
+    assert_eq!(total, 3, "the total is what makes the cap message honest");
+}
+
+#[test]
+fn test_plan_draft_targets_on_an_empty_mailbox_plans_nothing() {
+    let (targets, total) = plan_draft_targets(Vec::new(), 50);
+    assert!(targets.is_empty());
+    assert_eq!(total, 0);
+}

@@ -1,7 +1,24 @@
+//! The one module every Gmail call in this binary goes through.
+//!
+//! Its mutating surface is deliberately narrow -- label modification, trash,
+//! and draft CREATION -- and there is no send anywhere in it, because nothing
+//! in this design ever sends mail on Scott's behalf: a reply draft is written
+//! into Gmail Drafts and a human reviews it. `google-gmail1` exposes two send
+//! builders on the very types used here, one of them the sibling of
+//! `create_draft` below, so "we did not call it" is not a guarantee anyone can
+//! read off this file. The guarantee is `tests/no_send_guard.rs`, which scans
+//! all of `src/` for both builders and whose bite is demonstrated, not assumed.
+//! Do not add a send path here.
+
+use std::io::Cursor;
+
 use eyre::{Context, Result, eyre};
 use google_gmail1::Gmail;
-use google_gmail1::api::{BatchModifyMessagesRequest, ModifyMessageRequest, ModifyThreadRequest};
+use google_gmail1::api::{
+    BatchModifyMessagesRequest, Draft, Message, ModifyMessageRequest, ModifyThreadRequest,
+};
 use log::{debug, warn};
+use mime::Mime;
 
 use crate::gmail::auth::GMAIL_SCOPE;
 use crate::gmail::label::LabelResolver;
@@ -23,6 +40,9 @@ pub struct GmailClient {
     pub resolver: LabelResolver,
     metadata_headers: Vec<String>,
 }
+
+/// Media type of a draft upload. `drafts.create` accepts `message/*` only.
+const RFC822: &str = "message/rfc822";
 
 /// Headers always needed to parse a message (recipients, sender, subject).
 /// Header-based filter guards (e.g. List-Id, Precedence) are added on top of
@@ -437,6 +457,61 @@ impl GmailClient {
                 .context(format!("threads.modify({}) failed", id))
         })
         .await
+    }
+
+    /// `drafts.create`: park an RFC822 message in Gmail Drafts, inside
+    /// `thread_id`. Returns the new draft's id.
+    ///
+    /// The ONLY write this binary makes that produces a message, and it
+    /// produces an UNSENT one. Threading is Gmail's to honor: the API contract
+    /// requires `threadId` on the message, `In-Reply-To`/`References` per RFC
+    /// 2822, and a matching `Subject` -- all three are built in
+    /// `triage::draft::build_rfc822`.
+    ///
+    /// The RFC822 rides as MEDIA, not as `Draft.message.raw`. Not a choice:
+    /// `google-gmail1` marks `drafts.create` upload-capable and its plain
+    /// `doit()` is private, so `upload(stream, "message/rfc822")` is the only
+    /// public terminal call. Same request either way -- a multipart POST whose
+    /// metadata part carries `threadId` and whose media part carries the
+    /// message -- and it skips the base64 inflation the `raw` field would add.
+    pub async fn create_draft(&self, thread_id: &str, rfc822: &str) -> Result<String> {
+        debug!(
+            "create_draft: thread_id={}, rfc822_bytes={}",
+            thread_id,
+            rfc822.len()
+        );
+
+        let draft = with_retry(&self.limiter, "drafts.create", || async {
+            self.limiter.acquire(10).await;
+            let req = Draft {
+                id: None,
+                message: Some(Message {
+                    thread_id: Some(thread_id.to_string()),
+                    ..Default::default()
+                }),
+            };
+            self.hub
+                .users()
+                .drafts_create(req, "me")
+                .add_scope(GMAIL_SCOPE)
+                .upload(
+                    Cursor::new(rfc822.as_bytes().to_vec()),
+                    RFC822
+                        .parse::<Mime>()
+                        .map_err(|e| eyre!("'{}' is not a parseable mime type: {}", RFC822, e))?,
+                )
+                .await
+                .map(|(_, d)| d)
+                .context(format!("drafts.create(thread {}) failed", thread_id))
+        })
+        .await?;
+
+        draft.id.ok_or_else(|| {
+            eyre!(
+                "drafts.create returned no draft id for thread {}",
+                thread_id
+            )
+        })
     }
 
     pub async fn trash_thread(&self, id: &str) -> Result<()> {

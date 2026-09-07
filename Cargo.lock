@@ -373,6 +373,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "log",
+ "mime",
  "rustls",
  "serde",
  "serde_json",
