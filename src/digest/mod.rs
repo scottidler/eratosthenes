@@ -47,9 +47,15 @@ const LINE_TRUNCATION_MARKER: &str = "...";
 
 /// Section header emoji + title, and the word used in the count line, in
 /// DISPLAY order: most actionable first.
-const SECTIONS: [(&str, &str); 2] = [
-    (":star: Starred", "starred"),
-    (":exclamation: Important", "important"),
+/// Section header emoji, title, and the word used in the count line.
+///
+/// The emoji is the SHORTCODE NAME with no colons, because Block Kit renders it via a dedicated
+/// `{"type":"emoji","name":...}` element. A `:star:` inside a `rich_text` text element renders as
+/// the literal seven characters `:star:` -- rich_text content is literal, and that kills mrkdwn
+/// FORMATTING just as surely as it kills mrkdwn escaping bugs. That asymmetry shipped once.
+const SECTIONS: [(&str, &str, &str); 2] = [
+    ("star", "Starred", "starred"),
+    ("exclamation", "Important", "important"),
 ];
 
 /// Which section a thread lands in. Starred wins when a thread is both.
@@ -262,19 +268,19 @@ fn render(
     let counts: Vec<String> = SECTIONS
         .iter()
         .enumerate()
-        .map(|(idx, (_, word))| format!("{} {}", sections[idx].len(), word))
+        .map(|(idx, (_, _, word))| format!("{} {}", sections[idx].len(), word))
         .collect();
     let mut out = format!("*Pinned inbox digest* - {}\n", counts.join(", "));
     if let Some(text) = banner {
         out.push_str(&format!("{}\n", text));
     }
 
-    for (idx, (header, _)) in SECTIONS.iter().enumerate() {
+    for (idx, (emoji, header, _)) in SECTIONS.iter().enumerate() {
         let total = sections[idx].len();
         if total == 0 {
             continue;
         }
-        out.push_str(&format!("\n*{} ({})*\n", header, total));
+        out.push_str(&format!("\n*:{}: {} ({})*\n", emoji, header, total));
         for item in sections[idx].iter().take(shows[idx]) {
             out.push_str(&line(item, browser_index));
             out.push('\n');

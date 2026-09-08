@@ -41,6 +41,12 @@ fn plain(text: &str) -> Value {
     json!({ "type": "text", "text": text })
 }
 
+/// Emoji element. `name` is the shortcode WITHOUT colons (`star`, not `:star:`), per Block
+/// Kit's emoji element. This is the only way to get an emoji into `rich_text`.
+fn emoji(name: &str) -> Value {
+    json!({ "type": "emoji", "name": name })
+}
+
 fn link(url: &str, text: &str) -> Value {
     json!({ "type": "link", "url": url, "text": text })
 }
@@ -95,7 +101,7 @@ pub fn format_blocks(items: &[DigestItem], browser_index: u8, banner: Option<&st
     let counts: Vec<String> = SECTIONS
         .iter()
         .enumerate()
-        .map(|(i, (_, word))| format!("{} {}", by_section[i].len(), word))
+        .map(|(i, (_, _, word))| format!("{} {}", by_section[i].len(), word))
         .collect();
     elements.push(section(vec![bold(&format!(
         "Pinned inbox digest - {}\n",
@@ -111,16 +117,19 @@ pub fn format_blocks(items: &[DigestItem], browser_index: u8, banner: Option<&st
         return json!([{ "type": "rich_text", "elements": elements }]);
     }
 
-    for (idx, (header, _)) in SECTIONS.iter().enumerate() {
+    for (idx, (emoji_name, header, _)) in SECTIONS.iter().enumerate() {
         let bucket = &by_section[idx];
         if bucket.is_empty() {
             continue;
         }
-        elements.push(section(vec![bold(&format!(
-            "\n{} ({})\n",
-            header,
-            bucket.len()
-        ))]));
+        // The emoji is its OWN element. A `:star:` in a text element renders as the literal
+        // characters, because rich_text content is literal -- the same property that makes
+        // escaping unnecessary also means no shortcode is ever substituted.
+        elements.push(section(vec![
+            plain("\n"),
+            emoji(emoji_name),
+            bold(&format!(" {} ({})\n", header, bucket.len())),
+        ]));
 
         for item in bucket {
             let subject = if item.subject.trim().is_empty() {
@@ -251,6 +260,83 @@ mod tests {
             1,
             "thread count must not multiply blocks"
         );
+    }
+
+    /// Collect every `{"type":"emoji","name":...}` name in a rendered payload. Structural, not
+    /// a string match: `serde_json` orders keys alphabetically, so matching raw JSON text is
+    /// brittle in a way that has nothing to do with the behavior under test.
+    fn emoji_names(items: &[DigestItem]) -> Vec<String> {
+        fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("emoji")
+                && let Some(n) = v.get("name").and_then(|n| n.as_str())
+            {
+                out.push(n.to_string());
+            }
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(&format_blocks(items, 0, None), &mut out);
+        out
+    }
+
+    /// The bug this guards: `:star:` inside a `rich_text` text element renders as the literal
+    /// seven characters. Slack substitutes a shortcode only in a mrkdwn context or via the
+    /// dedicated `emoji` element, and rich_text text is neither.
+    #[test]
+    fn section_emoji_is_an_element_not_a_shortcode_in_text() {
+        let items = [item(Pin::Starred, "s", None, &["a"])];
+        assert_eq!(emoji_names(&items), vec!["star".to_string()]);
+        assert!(
+            !render(&items).contains(":star:"),
+            "a literal shortcode came back and will render as characters"
+        );
+    }
+
+    /// Both section emoji, so neither is left behind.
+    #[test]
+    fn both_section_emoji_are_elements() {
+        let items = [
+            item(Pin::Starred, "s", None, &["a"]),
+            item(Pin::Important, "i", None, &["b"]),
+        ];
+        assert_eq!(
+            emoji_names(&items),
+            vec!["star".to_string(), "exclamation".to_string()]
+        );
+        let out = render(&items);
+        assert!(!out.contains(":star:"), "{out}");
+        assert!(!out.contains(":exclamation:"), "{out}");
+    }
+
+    /// No shortcode-shaped literal may ride inside a text element either -- same root cause, and
+    /// the reason the attribution signature moved to a mrkdwn section block upstream.
+    #[test]
+    fn no_shortcode_leaks_into_a_literal_text_element() {
+        let items = [item(Pin::Starred, "subj", Some("do it"), &["ctx"])];
+        let blocks = format_blocks(&items, 0, None);
+        fn walk(v: &serde_json::Value, out: &mut Vec<String>) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("text")
+                && let Some(t) = v.get("text").and_then(|t| t.as_str())
+            {
+                out.push(t.to_string());
+            }
+            match v {
+                serde_json::Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                serde_json::Value::Object(m) => m.values().for_each(|x| walk(x, out)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        walk(&blocks, &mut texts);
+        let re_like = texts.iter().find(|t| {
+            let t = t.trim();
+            t.len() > 2 && t.starts_with(':') && t[1..].contains(':')
+        });
+        assert!(re_like.is_none(), "shortcode-shaped literal: {re_like:?}");
     }
 
     /// There is no machine-chosen section any more; only what the human pinned.
