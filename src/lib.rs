@@ -167,33 +167,12 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         .context("listing inbox threads")?;
     let inbox_set: HashSet<String> = inbox_ids.into_iter().collect();
 
-    // Needs Reply is the triage layer's own bucket, so the section exists only
-    // for an account that has a `triage:` block. Resolved by bucket NAME: the
-    // Gmail label is config, and hardcoding `llm/needs-reply` here would make
-    // renaming it in YAML silently empty the section.
-    let needs_reply_label: Option<String> = config
-        .triage
-        .as_ref()
-        .and_then(|t| {
-            t.buckets
-                .iter()
-                .find(|b| b.name == triage::NEEDS_REPLY_BUCKET)
-        })
-        .map(|b| b.label.clone());
-
-    // Queried and intersected exactly like the pins above, for the same reason:
-    // a conjunctive `in:inbox label:...` is evaluated against a single message.
-    let needs_reply_ids: Vec<String> = match needs_reply_label.as_deref() {
-        Some(label) => client
-            .list_threads(&format!("label:{}{}", label, stage_exclusions))
-            .await
-            .with_context(|| format!("listing '{}' threads", label))?
-            .into_iter()
-            .filter(|id| inbox_set.contains(id))
-            .collect(),
-        None => Vec::new(),
-    };
-
+    // NO machine-chosen section here, deliberately. A `Needs Reply` section fed
+    // from the triage layer's `llm/needs-reply` bucket shipped and was removed
+    // after one live run: it contributed 15 rows against the 5 the human had
+    // pinned, 9 of them Greenhouse pipeline notifications, and the digest
+    // stopped being "what I pinned" and became "what a model picked". The
+    // pinned set below is curated by a human, which is the entire point.
     let starred_ids: Vec<String> = client
         .list_threads(&format!("is:starred{}", stage_exclusions))
         .await
@@ -209,7 +188,6 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         .filter(|id| inbox_set.contains(id))
         .collect();
 
-    let needs_reply_set: HashSet<String> = needs_reply_ids.iter().cloned().collect();
     let starred_set: HashSet<String> = starred_ids.iter().cloned().collect();
     let important_set: HashSet<String> = important_ids.iter().cloned().collect();
 
@@ -217,11 +195,7 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
     // the three signals; it still gets exactly one digest line).
     let mut unique: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for id in needs_reply_ids
-        .iter()
-        .chain(starred_ids.iter())
-        .chain(important_ids.iter())
-    {
+    for id in starred_ids.iter().chain(important_ids.iter()) {
         if seen.insert(id.clone()) {
             unique.push(id.clone());
         }
@@ -235,7 +209,7 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         }
     }
 
-    let mut items = digest::build(&threads, &needs_reply_set, &starred_set, &important_set);
+    let mut items = digest::build(&threads, &starred_set, &important_set);
 
     // Bullets are EXPECTED only when the account has a `triage:` block. Without
     // one the digest posts un-enriched and carries NO banner: that is the
@@ -261,9 +235,8 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         .context("posting digest to Slack")?;
 
     println!(
-        "{}Digest posted: {} needs reply, {} starred, {} important",
+        "{}Digest posted: {} starred, {} important",
         prefix,
-        needs_reply_set.len(),
         starred_set.len(),
         important_set.len()
     );

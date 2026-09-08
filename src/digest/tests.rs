@@ -62,26 +62,25 @@ fn item(pin: Pin, millis: i64, sender: &str, subject: &str, thread_id: &str) -> 
 #[test]
 fn test_build_starred_wins_when_both() {
     let t = thread("t1", vec![msg("m1", "t1", "A <a@x.com>", "subj", 1_000)]);
-    let items = build(&[t], &ids(&[]), &ids(&["t1"]), &ids(&["t1"]));
+    let items = build(&[t], &ids(&["t1"]), &ids(&["t1"]));
     assert_eq!(items.len(), 1);
     assert_eq!(items[0].pin, Pin::Starred);
 }
 
-/// A thread appears exactly ONCE, in its highest section: Needs Reply beats
-/// both pins, Starred beats Important.
+/// A thread appears exactly ONCE even when both pins apply, and Starred wins.
 #[test]
-fn test_build_needs_reply_outranks_both_pins_and_yields_one_item() {
+fn test_build_double_pinned_thread_yields_one_item() {
     let t = thread("t1", vec![msg("m1", "t1", "A <a@x.com>", "subj", 1_000)]);
-    let items = build(&[t], &ids(&["t1"]), &ids(&["t1"]), &ids(&["t1"]));
+    let items = build(&[t], &ids(&["t1"]), &ids(&["t1"]));
     assert_eq!(items.len(), 1, "a thread must produce exactly one item");
-    assert_eq!(items[0].pin, Pin::NeedsReply);
+    assert_eq!(items[0].pin, Pin::Starred);
 }
 
 /// The rendered digest must place a triple-pinned thread in one section only.
 #[test]
 fn test_format_places_a_thread_in_exactly_one_section() {
     let t = thread("T1", vec![msg("m1", "T1", "A <a@x.com>", "subj", 1_000)]);
-    let items = build(&[t], &ids(&["T1"]), &ids(&["T1"]), &ids(&["T1"]));
+    let items = build(&[t], &ids(&["T1"]), &ids(&["T1"]));
     let out = format(&items, 0, None);
     assert_eq!(
         out.matches("#all/T1|").count(),
@@ -89,9 +88,13 @@ fn test_format_places_a_thread_in_exactly_one_section() {
         "one deep link, one section:\n{}",
         out
     );
-    assert!(out.contains("*:speech_balloon: Needs Reply (1)*"));
-    assert!(!out.contains("*:star: Starred"));
+    assert!(out.contains("*:star: Starred (1)*"));
     assert!(!out.contains("*:exclamation: Important"));
+    assert!(
+        !out.contains("Needs Reply"),
+        "the machine-chosen section is gone for good:\n{}",
+        out
+    );
 }
 
 #[test]
@@ -105,7 +108,7 @@ fn test_build_one_item_per_thread_even_with_many_messages() {
             msg("m3", "t1", "C <c@x.com>", "latest", 3_000),
         ],
     );
-    let items = build(&[t], &ids(&[]), &ids(&["t1"]), &ids(&[]));
+    let items = build(&[t], &ids(&["t1"]), &ids(&[]));
     assert_eq!(items.len(), 1);
     // Sender/subject/date come from the LATEST message.
     assert_eq!(items[0].sender, "C");
@@ -116,21 +119,21 @@ fn test_build_one_item_per_thread_even_with_many_messages() {
 #[test]
 fn test_build_skips_unpinned_threads() {
     let t = thread("t9", vec![msg("m1", "t9", "A <a@x.com>", "subj", 1_000)]);
-    let items = build(&[t], &ids(&[]), &ids(&[]), &ids(&[]));
+    let items = build(&[t], &ids(&[]), &ids(&[]));
     assert!(items.is_empty());
 }
 
 #[test]
 fn test_build_important_when_only_important() {
     let t = thread("t2", vec![msg("m1", "t2", "A <a@x.com>", "subj", 1_000)]);
-    let items = build(&[t], &ids(&[]), &ids(&[]), &ids(&["t2"]));
+    let items = build(&[t], &ids(&[]), &ids(&["t2"]));
     assert_eq!(items[0].pin, Pin::Important);
 }
 
 #[test]
 fn test_build_leaves_ask_and_bullets_empty() {
     let t = thread("t1", vec![msg("m1", "t1", "A <a@x.com>", "subj", 1_000)]);
-    let items = build(&[t], &ids(&[]), &ids(&["t1"]), &ids(&[]));
+    let items = build(&[t], &ids(&["t1"]), &ids(&[]));
     assert_eq!(items[0].ask, None);
     assert!(items[0].bullets.is_empty());
 }
@@ -138,7 +141,7 @@ fn test_build_leaves_ask_and_bullets_empty() {
 #[test]
 fn test_build_sender_falls_back_to_email_without_display_name() {
     let t = thread("t1", vec![msg("m1", "t1", "<a@x.com>", "subj", 1_000)]);
-    let items = build(&[t], &ids(&[]), &ids(&["t1"]), &ids(&[]));
+    let items = build(&[t], &ids(&["t1"]), &ids(&[]));
     assert_eq!(items[0].sender, "a@x.com");
 }
 
@@ -168,7 +171,7 @@ fn test_attach_bullets_folds_the_pass_in_by_thread_id() {
 #[test]
 fn test_format_empty_set_is_positive_with_signature() {
     let out = format(&[], 0, None);
-    assert!(out.contains("Inbox clear - 0 needs reply, 0 starred, 0 important"));
+    assert!(out.contains("Inbox clear - 0 starred, 0 important"));
     assert!(out.trim_end().ends_with(SIGNATURE));
 }
 
@@ -192,7 +195,7 @@ fn test_format_basic_shape() {
     ];
     let out = format(&items, 0, None);
 
-    assert!(out.contains("*Pinned inbox digest* - 0 needs reply, 1 starred, 1 important"));
+    assert!(out.contains("*Pinned inbox digest* - 1 starred, 1 important"));
     assert!(out.contains("*:star: Starred (1)*"));
     assert!(out.contains("*:exclamation: Important (1)*"));
     assert!(out.contains("*Mark Weiler*"));
@@ -203,17 +206,15 @@ fn test_format_basic_shape() {
 
 /// Section order is fixed and most-actionable-first, independent of dates.
 #[test]
-fn test_format_section_order_is_needs_reply_then_starred_then_important() {
+fn test_format_section_order_is_starred_then_important() {
     let items = vec![
         item(Pin::Important, 9_000, "I", "i", "IMP"),
         item(Pin::Starred, 8_000, "S", "s", "STAR"),
-        item(Pin::NeedsReply, 1_000, "N", "n", "NR"),
     ];
     let out = format(&items, 0, None);
-    let nr = out.find("Needs Reply").unwrap();
     let star = out.find(":star: Starred").unwrap();
     let imp = out.find("Important (").unwrap();
-    assert!(nr < star && star < imp, "{}", out);
+    assert!(star < imp, "{}", out);
 }
 
 #[test]
@@ -270,7 +271,7 @@ fn test_format_sorts_each_section_newest_first() {
 
 #[test]
 fn test_format_renders_the_ask_first_and_marked() {
-    let mut it = item(Pin::NeedsReply, 1_000, "Mark", "pentest", "T");
+    let mut it = item(Pin::Starred, 1_000, "Mark", "pentest", "T");
     it.ask = Some("confirm the scope by Friday".to_string());
     it.bullets = vec![
         "scope covers two apps".to_string(),
@@ -294,7 +295,7 @@ fn test_format_renders_the_ask_first_and_marked() {
 /// ask line PLUS its bullets, up to 8 lines under the digest line.
 #[test]
 fn test_format_ask_is_not_one_of_the_bullets() {
-    let mut it = item(Pin::NeedsReply, 1_000, "Mark", "pentest", "T");
+    let mut it = item(Pin::Starred, 1_000, "Mark", "pentest", "T");
     it.ask = Some("confirm the scope".to_string());
     it.bullets = (0..7).map(|i| format!("bullet {}", i)).collect();
     let out = format(&[it], 0, None);
@@ -324,11 +325,11 @@ fn test_format_no_ask_renders_no_marker_and_no_placeholder() {
     assert_eq!(out.matches("  - ").count(), 2, "{}", out);
 }
 
-/// EVERY pinned thread gets bullets, in all three sections -- not just the
+/// EVERY pinned thread gets bullets, in all both sections -- not just the
 /// Needs Reply one.
 #[test]
-fn test_format_bullets_render_in_all_three_sections() {
-    let items: Vec<DigestItem> = [Pin::NeedsReply, Pin::Starred, Pin::Important]
+fn test_format_bullets_render_in_both_sections() {
+    let items: Vec<DigestItem> = [Pin::Starred, Pin::Important]
         .into_iter()
         .enumerate()
         .map(|(i, pin)| {
@@ -338,7 +339,7 @@ fn test_format_bullets_render_in_all_three_sections() {
         })
         .collect();
     let out = format(&items, 0, None);
-    for i in 0..3 {
+    for i in 0..2 {
         assert!(out.contains(&format!("  - point {}\n", i)), "{}", out);
     }
 }
@@ -424,11 +425,7 @@ fn test_fixture_line_is_123_chars_including_the_newline() {
 /// ladder and does not claim to.
 #[test]
 fn test_ac1_ten_mixed_threads_with_seven_bullets_render_whole_under_budget() {
-    let plan = [
-        (Pin::NeedsReply, 3usize),
-        (Pin::Starred, 4),
-        (Pin::Important, 3),
-    ];
+    let plan = [(Pin::Starred, 7usize), (Pin::Important, 3)];
     let mut items = Vec::new();
     let mut index = 0usize;
     for (pin, count) in plan {
@@ -450,7 +447,7 @@ fn test_ac1_ten_mixed_threads_with_seven_bullets_render_whole_under_budget() {
         out.len()
     );
     assert!(!out.contains("... +"), "no thread may be dropped:\n{}", out);
-    assert!(out.contains("*Pinned inbox digest* - 3 needs reply, 4 starred, 3 important"));
+    assert!(out.contains("*Pinned inbox digest* - 7 starred, 3 important"));
     for item in &items {
         assert!(
             out.contains(&std::format!("#all/{}|", item.thread_id)),
@@ -512,16 +509,12 @@ fn test_ladder_sheds_bullets_before_dropping_any_thread() {
 }
 
 /// AC (2): the ladder, deliberately over budget at EVERY rung including the
-/// last. 70 MIXED threads (20 Needs Reply / 25 Starred / 25 Important), 35
-/// ask-bearing spread across all three, 7 bullets each at the 80-char cap.
-/// The rung-2 floor is ~12300 against `BUDGET` 10000, so rung 3 must fire.
+/// last. 70 MIXED threads (45 Starred / 25 Important), 35 ask-bearing spread
+/// across both, 7 bullets each at the 80-char cap. The rung-2 floor is ~12300
+/// against `BUDGET` 10000, so rung 3 must fire.
 #[test]
 fn test_ac2_seventy_mixed_threads_drive_the_ladder_to_rung_three() {
-    let plan = [
-        (Pin::NeedsReply, 20usize, 10usize),
-        (Pin::Starred, 25, 13),
-        (Pin::Important, 25, 12),
-    ];
+    let plan = [(Pin::Starred, 45usize, 23usize), (Pin::Important, 25, 12)];
     let mut items = Vec::new();
     let mut index = 0usize;
     for (pin, count, asks) in plan {
@@ -534,7 +527,7 @@ fn test_ac2_seventy_mixed_threads_drive_the_ladder_to_rung_three() {
     assert_eq!(
         items.iter().filter(|i| i.ask.is_some()).count(),
         35,
-        "35 ask-bearing, spread across all three sections"
+        "35 ask-bearing, spread across all both sections"
     );
 
     let out = format(&items, 0, None);
@@ -545,7 +538,7 @@ fn test_ac2_seventy_mixed_threads_drive_the_ladder_to_rung_three() {
         out.len()
     );
     // Header counts stay exact even though threads are hidden.
-    assert!(out.contains("*Pinned inbox digest* - 20 needs reply, 25 starred, 25 important"));
+    assert!(out.contains("*Pinned inbox digest* - 45 starred, 25 important"));
 
     // Rung 2 floor reached: every thread that still renders is at ask-or-nothing.
     let descriptive: Vec<&str> = out
@@ -622,10 +615,10 @@ fn test_ac2_seventy_mixed_threads_drive_the_ladder_to_rung_three() {
 #[test]
 fn test_ladder_terminates_when_everything_must_be_shed() {
     let items: Vec<DigestItem> = (0..400)
-        .map(|i| fixture_item(i, Pin::NeedsReply, true, 7))
+        .map(|i| fixture_item(i, Pin::Starred, true, 7))
         .collect();
     let out = format(&items, 0, None);
-    assert!(out.contains("*Pinned inbox digest* - 400 needs reply"));
+    assert!(out.contains("*Pinned inbox digest* - 400 starred"));
     assert!(out.contains("... +"));
     assert!(out.trim_end().ends_with(SIGNATURE));
 }

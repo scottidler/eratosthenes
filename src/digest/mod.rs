@@ -1,3 +1,4 @@
+pub mod blocks;
 pub mod bullets;
 
 use std::collections::{HashMap, HashSet};
@@ -46,28 +47,33 @@ const LINE_TRUNCATION_MARKER: &str = "...";
 
 /// Section header emoji + title, and the word used in the count line, in
 /// DISPLAY order: most actionable first.
-const SECTIONS: [(&str, &str); 3] = [
-    (":speech_balloon: Needs Reply", "needs reply"),
+const SECTIONS: [(&str, &str); 2] = [
     (":star: Starred", "starred"),
     (":exclamation: Important", "important"),
 ];
 
-/// Which section a thread lands in. Highest wins: a thread appears exactly
-/// once, in `Needs Reply` > `Starred` > `Important` order.
+/// Which section a thread lands in. Starred wins when a thread is both.
+///
+/// There is deliberately NO machine-chosen section here. The 2026-09-08 live
+/// run added one (`Needs Reply`, from the triage layer's own bucket) and it
+/// inverted the product: 15 model-picked threads buried the 5 the human had
+/// actually pinned, and 9 of the 15 were Greenhouse pipeline notifications.
+/// The digest's whole premise, from its own design doc, is "the mail currently
+/// pinned in the inbox (Starred and Important)" -- a set the HUMAN curated.
+/// Triage's labels and reply drafts still do their job in Gmail; they just do
+/// not get to add rows here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pin {
-    NeedsReply,
     Starred,
     Important,
 }
 
 impl Pin {
-    /// Index into `SECTIONS`, which is also the actionability rank.
+    /// Index into `SECTIONS`.
     fn index(self) -> usize {
         match self {
-            Pin::NeedsReply => 0,
-            Pin::Starred => 1,
-            Pin::Important => 2,
+            Pin::Starred => 0,
+            Pin::Important => 1,
         }
     }
 }
@@ -106,23 +112,19 @@ pub struct DigestItem {
 /// rendered as-is.
 pub fn build(
     threads: &[GmailThread],
-    needs_reply_ids: &HashSet<String>,
     starred_ids: &HashSet<String>,
     important_ids: &HashSet<String>,
 ) -> Vec<DigestItem> {
     debug!(
-        "build: threads={}, needs_reply_ids={}, starred_ids={}, important_ids={}",
+        "build: threads={}, starred_ids={}, important_ids={}",
         threads.len(),
-        needs_reply_ids.len(),
         starred_ids.len(),
         important_ids.len()
     );
 
     let mut items = Vec::new();
     for thread in threads {
-        let pin = if needs_reply_ids.contains(&thread.id) {
-            Pin::NeedsReply
-        } else if starred_ids.contains(&thread.id) {
+        let pin = if starred_ids.contains(&thread.id) {
             Pin::Starred
         } else if important_ids.contains(&thread.id) {
             Pin::Important
@@ -182,10 +184,9 @@ pub fn attach_bullets(items: &mut [DigestItem], by_thread: &HashMap<String, Thre
 /// 1. every thread keeps its bullets;
 /// 2. shrink the per-thread bullet count, NEVER dropping an ask;
 /// 3. only with every thread at its ask-or-nothing floor, drop trailing
-///    THREADS, least actionable section first: Important, then Starred, then
-///    Needs Reply, each with its own `... +N more`.
+///    THREADS, Important first then Starred, each with its own `... +N more`.
 pub fn format(items: &[DigestItem], browser_index: u8, banner: Option<&str>) -> String {
-    let mut sections: [Vec<&DigestItem>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let mut sections: [Vec<&DigestItem>; 2] = [Vec::new(), Vec::new()];
     for item in items {
         sections[item.pin.index()].push(item);
     }
@@ -194,18 +195,17 @@ pub fn format(items: &[DigestItem], browser_index: u8, banner: Option<&str>) -> 
         section.sort_by_key(|i| std::cmp::Reverse(i.date));
     }
 
-    let totals = [sections[0].len(), sections[1].len(), sections[2].len()];
+    let totals = [sections[0].len(), sections[1].len()];
     debug!(
-        "format: needs_reply={}, starred={}, important={}, browser_index={}, banner={}",
+        "format: starred={}, important={}, browser_index={}, banner={}",
         totals[0],
         totals[1],
-        totals[2],
         browser_index,
         banner.is_some()
     );
 
     if totals.iter().all(|t| *t == 0) {
-        let mut out = "Inbox clear - 0 needs reply, 0 starred, 0 important\n".to_string();
+        let mut out = "Inbox clear - 0 starred, 0 important\n".to_string();
         if let Some(text) = banner {
             out.push_str(&format!("{}\n", text));
         }
@@ -231,12 +231,11 @@ pub fn format(items: &[DigestItem], browser_index: u8, banner: Option<&str>) -> 
     }
 
     // Rung 3: every thread is at its floor and the body is STILL over budget.
-    // Shed by ACTIONABILITY, least first, so a Needs Reply thread is never
-    // dropped while a Starred or Important one remains. This replaces the old
-    // longest-section-first rule outright.
+    // Shed Important before Starred: starring is an explicit human act, while
+    // Gmail assigns Important on its own.
     let mut shows = totals;
     loop {
-        let Some(idx) = [2usize, 1, 0].into_iter().find(|i| shows[*i] > 0) else {
+        let Some(idx) = [1usize, 0].into_iter().find(|i| shows[*i] > 0) else {
             debug!("format: rung 3 exhausted; nothing left to shed");
             return rendered;
         };
@@ -254,8 +253,8 @@ pub fn format(items: &[DigestItem], browser_index: u8, banner: Option<&str>) -> 
 }
 
 fn render(
-    sections: &[Vec<&DigestItem>; 3],
-    shows: &[usize; 3],
+    sections: &[Vec<&DigestItem>; 2],
+    shows: &[usize; 2],
     bullet_cap: usize,
     banner: Option<&str>,
     browser_index: u8,
@@ -331,11 +330,16 @@ fn line(item: &DigestItem, browser_index: u8) -> String {
     } else {
         escape_mrkdwn(&cap_chars(&item.subject, MAX_SUBJECT_CHARS))
     };
-    let url = format!(
-        "https://mail.google.com/mail/u/{}/#all/{}",
-        browser_index, item.thread_id
-    );
+    let url = gmail_url(browser_index, &item.thread_id);
     format!("`{}` *{}* <{}|{}>", date, sender, url, subject)
+}
+
+/// Gmail deep link for one thread, at the account's own browser profile index.
+pub(crate) fn gmail_url(browser_index: u8, thread_id: &str) -> String {
+    format!(
+        "https://mail.google.com/mail/u/{}/#all/{}",
+        browser_index, thread_id
+    )
 }
 
 /// Escape the three characters Slack treats specially in `mrkdwn` text. A bare
