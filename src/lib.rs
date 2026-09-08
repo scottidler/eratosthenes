@@ -221,16 +221,24 @@ pub async fn digest<P: SlackPoster>(account: &str, config: &Config, poster: &P) 
         _ => None,
     };
 
+    // Block Kit is the BODY; the mrkdwn `format` output is the notification fallback.
+    //
+    // Both are built, deliberately. `blocks` is what a reader sees -- real bulleted lists, an
+    // `emoji` element per section header, literal text that needs no escaping. `fallback_text`
+    // would be the honest fallback, but `format` carries the whole digest, so a client that
+    // cannot render blocks still gets the content rather than a bare header.
     let text = digest::format(&items, slack.browser_index, banner.as_deref());
+    let blocks = digest::blocks::format_blocks(&items, slack.browser_index, banner.as_deref());
 
     debug!(
-        "digest: posting to channel={}, items={}, degraded={}",
+        "digest: posting to channel={}, items={}, degraded={}, blocks={}",
         slack.channel,
         items.len(),
-        banner.is_some()
+        banner.is_some(),
+        blocks.as_array().map_or(0, Vec::len)
     );
     poster
-        .post(&slack.channel, &text)
+        .post(&slack.channel, &text, Some(&blocks))
         .await
         .context("posting digest to Slack")?;
 

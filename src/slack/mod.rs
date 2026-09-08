@@ -36,7 +36,19 @@ type HyperRustlsClient = hyper_util::client::legacy::Client<
 /// bound the lint warns about does not apply.
 #[allow(async_fn_in_trait)]
 pub trait SlackPoster {
-    async fn post(&self, channel: &str, text: &str) -> Result<()>;
+    /// Post `text`, optionally rendered as Block Kit `blocks`.
+    ///
+    /// `blocks` is the BODY when present and `text` becomes the notification and accessibility
+    /// fallback, because Slack renders blocks and demotes `text` to notification-only. Without
+    /// this parameter the digest's block renderer was unreachable: it existed, was tested, and
+    /// nothing called it, so the mrkdwn path shipped instead and its `  - ` prefixes rendered as
+    /// literal hyphens.
+    async fn post(
+        &self,
+        channel: &str,
+        text: &str,
+        blocks: Option<&serde_json::Value>,
+    ) -> Result<()>;
 }
 
 /// Slack response envelope for `chat.postMessage`.
@@ -76,17 +88,26 @@ impl HttpSlackPoster {
 }
 
 impl SlackPoster for HttpSlackPoster {
-    async fn post(&self, channel: &str, text: &str) -> Result<()> {
+    async fn post(
+        &self,
+        channel: &str,
+        text: &str,
+        blocks: Option<&serde_json::Value>,
+    ) -> Result<()> {
         debug!(
-            "HttpSlackPoster::post: channel={}, text_len={}",
+            "HttpSlackPoster::post: channel={}, text_len={}, blocks={}",
             channel,
-            text.len()
+            text.len(),
+            blocks.is_some()
         );
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "channel": channel,
             "text": text,
         });
+        if let Some(blocks) = blocks {
+            payload["blocks"] = blocks.clone();
+        }
         let body = serde_json::to_vec(&payload).context("Failed to serialize Slack payload")?;
 
         let req = http::Request::builder()
