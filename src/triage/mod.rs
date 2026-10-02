@@ -778,6 +778,13 @@ async fn refresh_drafts(
                 );
                 skipped += 1;
             }
+            RefreshPlan::NotSoleRecipient => {
+                info!(
+                    "{}thread {} not addressed to the owner alone; no draft",
+                    prefix, target.thread_id
+                );
+                skipped += 1;
+            }
             RefreshPlan::Empty => {
                 warn!(
                     "{}thread {} has no message to reply to; skipping",

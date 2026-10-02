@@ -43,7 +43,12 @@ pub enum RefreshPlan {
     /// A draft already sits in the thread. Skipped, and NEVER modified or
     /// deleted: Scott may have edited it, and his edits are sacred.
     DraftExists,
-    /// No draft, newest message inbound: draft a reply to `target_id`.
+    /// Newest message was not addressed to the account owner ALONE (a list, a
+    /// group alias, a Cc, a Bcc): never drafted. Scott speaks for himself in a
+    /// one-to-one thread only.
+    NotSoleRecipient,
+    /// No draft, newest message inbound and addressed to Scott alone: draft a
+    /// reply to `target_id`.
     Draft { target_id: String },
     /// Nothing to reply to (a thread of drafts, or no readable message).
     Empty,
@@ -89,6 +94,9 @@ pub fn plan_refresh(thread: &TriageThread, self_address: &str) -> RefreshPlan {
     }
     if has_draft {
         return RefreshPlan::DraftExists;
+    }
+    if !newest.is_solely_to(self_address) {
+        return RefreshPlan::NotSoleRecipient;
     }
     RefreshPlan::Draft {
         target_id: newest.id.clone(),
@@ -369,15 +377,25 @@ mod tests {
     }
 
     fn inbound(id: &str, millis: i64) -> google_gmail1::api::Message {
+        addressed(id, millis, "Scott Idler <scott.idler@tatari.tv>", None)
+    }
+
+    fn addressed(id: &str, millis: i64, to: &str, cc: Option<&str>) -> google_gmail1::api::Message {
+        let message_id = format!("<{}@x.com>", id);
+        let mut headers = vec![
+            ("From", "Bob <bob@x.com>"),
+            ("To", to),
+            ("Subject", "the ask"),
+            ("Message-ID", message_id.as_str()),
+        ];
+        if let Some(cc) = cc {
+            headers.push(("Cc", cc));
+        }
         api_message(
             id,
             "t1",
             millis,
-            vec![
-                ("From", "Bob <bob@x.com>"),
-                ("Subject", "the ask"),
-                ("Message-ID", &format!("<{}@x.com>", id)),
-            ],
+            headers,
             "can you look at this?",
             &["INBOX", "UNREAD"],
         )
@@ -406,6 +424,92 @@ mod tests {
             RefreshPlan::Draft {
                 target_id: "m2".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn test_plan_refresh_drafts_when_sole_recipient_case_differs() {
+        let thread = thread(vec![addressed("m1", 1_000, "Scott.Idler@Tatari.tv", None)]);
+        assert!(matches!(
+            plan_refresh(&thread, "scott.idler@tatari.tv"),
+            RefreshPlan::Draft { .. }
+        ));
+    }
+
+    #[test]
+    fn test_plan_refresh_never_drafts_to_a_list_or_group_alias() {
+        let thread = thread(vec![addressed(
+            "m1",
+            1_000,
+            "prd-reviewers@tatari.tv",
+            None,
+        )]);
+        assert_eq!(
+            plan_refresh(&thread, "scott.idler@tatari.tv"),
+            RefreshPlan::NotSoleRecipient
+        );
+    }
+
+    #[test]
+    fn test_plan_refresh_never_drafts_when_owner_shares_the_to_line() {
+        let thread = thread(vec![addressed(
+            "m1",
+            1_000,
+            "scott.idler@tatari.tv, patrick@tatari.tv",
+            None,
+        )]);
+        assert_eq!(
+            plan_refresh(&thread, "scott.idler@tatari.tv"),
+            RefreshPlan::NotSoleRecipient
+        );
+    }
+
+    #[test]
+    fn test_plan_refresh_never_drafts_when_anyone_is_cced() {
+        let thread = thread(vec![addressed(
+            "m1",
+            1_000,
+            "scott.idler@tatari.tv",
+            Some("alex@tatari.tv"),
+        )]);
+        assert_eq!(
+            plan_refresh(&thread, "scott.idler@tatari.tv"),
+            RefreshPlan::NotSoleRecipient
+        );
+    }
+
+    #[test]
+    fn test_plan_refresh_never_drafts_when_owner_is_only_cced() {
+        let thread = thread(vec![addressed(
+            "m1",
+            1_000,
+            "michael@tatari.tv",
+            Some("scott.idler@tatari.tv"),
+        )]);
+        assert_eq!(
+            plan_refresh(&thread, "scott.idler@tatari.tv"),
+            RefreshPlan::NotSoleRecipient
+        );
+    }
+
+    /// Bcc and malformed mail both arrive with the owner absent from `To`.
+    #[test]
+    fn test_plan_refresh_never_drafts_without_a_to_header() {
+        let thread = thread(vec![api_message(
+            "m1",
+            "t1",
+            1_000,
+            vec![
+                ("From", "Bob <bob@x.com>"),
+                ("Subject", "s"),
+                ("Message-ID", "<m1@x.com>"),
+            ],
+            "b",
+            &["INBOX"],
+        )]);
+        assert_eq!(
+            plan_refresh(&thread, "scott.idler@tatari.tv"),
+            RefreshPlan::NotSoleRecipient
         );
     }
 

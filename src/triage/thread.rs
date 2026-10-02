@@ -120,6 +120,22 @@ impl TriageMessage {
             .iter()
             .any(|addr| addr == &self_address.to_lowercase())
     }
+
+    /// True only when `To` is exactly the account owner and `Cc` is empty. A
+    /// list, group alias, extra recipient, or Bcc (owner absent from `To`) all
+    /// fail, and so does a missing `To`: fail closed.
+    pub fn is_solely_to(&self, self_address: &str) -> bool {
+        let to = self.header("To").map(|s| s.to_string());
+        let cc = self.header("Cc").map(|s| s.to_string());
+        let to = parse_address_header(to.as_ref());
+        let cc = parse_address_header(cc.as_ref());
+        let sole = cc.is_empty() && to.len() == 1 && to[0] == self_address.to_lowercase();
+        trace!(
+            "is_solely_to: id={}, to={:?}, cc={:?}, sole={}",
+            self.id, to, cc, sole
+        );
+        sole
+    }
 }
 
 /// A candidate thread, messages in Gmail's own oldest-first order.
