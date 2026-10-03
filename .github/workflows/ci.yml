@@ -43,7 +43,7 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-          - os: macos-14  # Apple Silicon ARM
+          - os: macos-15  # Apple Silicon ARM
     steps:
     - uses: actions/checkout@v4
 
