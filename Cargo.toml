@@ -41,4 +41,5 @@ tempfile = "3.27.0"
 # each, and a shortened test-only timeout would not be testing the constant
 # that ships.
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
+wiremock = "0.6.5"
 # For build.rs if needed
