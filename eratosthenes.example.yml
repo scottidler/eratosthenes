@@ -122,6 +122,18 @@ slack:
 # every message from scratch), delete this label in the Gmail UI by hand.
 # marker-label: Triaged
 
+# ---- max-skipped-threads (OPTIONAL) ------------------------------------------
+# Gmail occasionally answers one healthy thread with a transient
+# `400 FAILED_PRECONDITION` (or a `404 notFound` for a thread that vanished
+# mid-run). The run skips that thread with a WARN naming its id and the failed
+# call, makes no further writes to it this run, and counts it in the `Done:`
+# line; the next run picks it up again. Account-wide errors (429, auth, retries
+# exhausted, transport) still fail the run. This is the ceiling on DISTINCT
+# skipped threads/messages per run: one more than this fails the run on the
+# spot, because that many is systemic, not noise. 0 = any skip fails the run.
+# Defaults to 10.
+max-skipped-threads: 10
+
 # ---- message-filters -------------------------------------------------------
 # Applied to INCOMING messages as they are classified. Each entry is keyed by a
 # unique name; ALL of its conditions must match (logical AND); first match wins.

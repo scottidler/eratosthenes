@@ -117,6 +117,12 @@ pub struct Config {
     /// config change is required to adopt it.
     #[serde(default = "default_marker_label")]
     pub marker_label: String,
+
+    /// Ceiling on distinct threads/messages one run may skip for a thread-scoped
+    /// Gmail error before the run fails anyway. One transient thread is noise;
+    /// more than this many in one run is systemic and must alert.
+    #[serde(default = "default_max_skipped_threads")]
+    pub max_skipped_threads: usize,
 }
 
 fn default_log_level() -> String {
@@ -125,6 +131,13 @@ fn default_log_level() -> String {
 
 fn default_marker_label() -> String {
     "Triaged".to_string()
+}
+
+/// 35 thread-scoped failures in 6,821 runs is about 1 per 195 runs; 11
+/// independent ones in a single run is not plausible, so more than 10 is
+/// systemic (design doc 2026-10-06-per-thread-error-isolation).
+fn default_max_skipped_threads() -> usize {
+    10
 }
 
 impl Config {
@@ -507,6 +520,37 @@ auth:
 
         let config = parse_config(yaml).unwrap();
         assert_eq!(config.marker_label, "Triaged");
+    }
+
+    #[test]
+    fn test_max_skipped_threads_defaults_to_ten() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+"#;
+        let config = parse_config(yaml).unwrap();
+        assert_eq!(config.max_skipped_threads, 10);
+    }
+
+    #[test]
+    fn test_max_skipped_threads_override_is_kebab_case() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+max-skipped-threads: 3
+"#;
+        let config = parse_config(yaml).unwrap();
+        assert_eq!(config.max_skipped_threads, 3);
+    }
+
+    #[test]
+    fn test_max_skipped_threads_rejects_a_negative_value() {
+        let yaml = r#"
+auth:
+  creds-path: /tmp/creds
+max-skipped-threads: -1
+"#;
+        assert!(parse_config(yaml).is_err());
     }
 
     #[test]

@@ -11,6 +11,18 @@ use crate::gmail::client::GmailClient;
 use crate::gmail::label::{LabelResolver, LabelVisibility, create_label_if_missing};
 use crate::gmail::message::{GmailMessage, GmailThread};
 use crate::gmail::query::compile_query;
+use crate::skip::SkipLedger;
+
+/// What one account run did, the numbers its `Done:` line reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSummary {
+    /// Messages the message filters matched (marked, in `--mark-only`).
+    pub messages_matched: usize,
+    /// Threads a state filter moved or trashed (0 in `--mark-only`).
+    pub threads_transitioned: usize,
+    /// Distinct threads/messages skipped on a thread-scoped Gmail error.
+    pub skipped: usize,
+}
 
 pub async fn execute(
     client: &mut GmailClient,
@@ -18,15 +30,20 @@ pub async fn execute(
     prefix: &str,
     dry_run: bool,
     mark_only: bool,
-) -> Result<()> {
+) -> Result<RunSummary> {
     debug!(
-        "{}execute: dry_run={}, mark_only={}, message_filters={}, state_filters={}",
+        "{}execute: dry_run={}, mark_only={}, message_filters={}, state_filters={}, max_skipped_threads={}",
         prefix,
         dry_run,
         mark_only,
         config.message_filters.len(),
-        config.state_filters.len()
+        config.state_filters.len(),
+        config.max_skipped_threads
     );
+
+    // One ledger for the whole account run, created before the `--mark-only`
+    // early return so no path can bypass the ceiling.
+    let mut skipped = SkipLedger::new(config.max_skipped_threads);
 
     if mark_only {
         // One-shot backfill mode, not a permanent verb: reuses account discovery and
@@ -48,12 +65,17 @@ pub async fn execute(
         )
         .await?;
         info!(
-            "{}Done: {} messages marked (mark-only){}",
+            "{}Done: {} messages marked (mark-only), {} skipped{}",
             prefix,
             total_marked,
+            skipped.len(),
             if dry_run { " (dry run)" } else { "" }
         );
-        return Ok(());
+        return Ok(RunSummary {
+            messages_matched: total_marked,
+            threads_transitioned: 0,
+            skipped: skipped.len(),
+        });
     }
 
     if dry_run {
@@ -68,7 +90,8 @@ pub async fn execute(
     ensure_labels(client, config).await?;
 
     info!("{}=== Phase 0: Stage Sanitization ===", prefix);
-    let sanitized = sanitize_stages(client, &config.state_filters, prefix, dry_run).await?;
+    let sanitized =
+        sanitize_stages(client, &config.state_filters, &mut skipped, prefix, dry_run).await?;
     if sanitized > 0 {
         info!(
             "{}[sanitize] cleaned {} threads with conflicting stage labels",
@@ -89,17 +112,22 @@ pub async fn execute(
 
     info!("{}=== Phase 2: State Filters (Thread Age-Off) ===", prefix);
     let total_transitioned =
-        execute_state_filters(client, &config.state_filters, prefix, dry_run).await?;
+        execute_state_filters(client, &config.state_filters, &mut skipped, prefix, dry_run).await?;
 
     info!(
-        "{}Done: {} messages matched filters, {} threads transitioned{}",
+        "{}Done: {} messages matched filters, {} threads transitioned, {} skipped{}",
         prefix,
         total_matched,
         total_transitioned,
+        skipped.len(),
         if dry_run { " (dry run)" } else { "" }
     );
 
-    Ok(())
+    Ok(RunSummary {
+        messages_matched: total_matched,
+        threads_transitioned: total_transitioned,
+        skipped: skipped.len(),
+    })
 }
 
 async fn ensure_labels(client: &mut GmailClient, config: &Config) -> Result<()> {
@@ -183,6 +211,7 @@ fn derive_stages(state_filters: &[StateFilter]) -> Vec<String> {
 async fn sanitize_stages(
     client: &GmailClient,
     state_filters: &[StateFilter],
+    skipped: &mut SkipLedger,
     prefix: &str,
     dry_run: bool,
 ) -> Result<usize> {
@@ -236,15 +265,20 @@ async fn sanitize_stages(
                 late
             );
 
-            if !dry_run {
-                for tid in &thread_ids {
-                    client
-                        .modify_thread(tid, &[], std::slice::from_ref(&late_id))
-                        .await?;
+            for tid in &thread_ids {
+                if skipped.contains(tid) {
+                    continue;
                 }
+                if !dry_run
+                    && let Err(err) = client
+                        .modify_thread(tid, &[], std::slice::from_ref(&late_id))
+                        .await
+                {
+                    skipped.skip_thread(tid, "threads.modify", err, prefix)?;
+                    continue;
+                }
+                total_cleaned += 1;
             }
-
-            total_cleaned += thread_ids.len();
         }
     }
 
@@ -796,6 +830,7 @@ fn log_mark_only_stamps(
 async fn execute_state_filters(
     client: &GmailClient,
     state_filters: &[StateFilter],
+    skipped: &mut SkipLedger,
     prefix: &str,
     dry_run: bool,
 ) -> Result<usize> {
@@ -841,19 +876,40 @@ async fn execute_state_filters(
             total,
             thread_id
         );
-        let thread = client.get_thread(thread_id).await?;
-        if evaluate_thread(
-            client,
-            &thread,
-            state_filters,
-            &stages,
-            prefix,
-            &clock,
-            dry_run,
-        )
-        .await?
-        {
-            transitioned += 1;
+        if skipped.contains(thread_id) {
+            trace!(
+                "{}[state] thread {} already skipped this run, no further writes",
+                prefix, thread_id
+            );
+            continue;
+        }
+
+        // The per-thread boundary: the fetch AND the whole filter walk are one
+        // unit. Catching inside `apply_state_action` instead would turn a failed
+        // Move into "not acted", and `evaluate_thread` would go on to try later
+        // filters, a Delete among them.
+        let outcome: std::result::Result<bool, (&str, eyre::Report)> = async {
+            let thread = client
+                .get_thread(thread_id)
+                .await
+                .map_err(|err| ("threads.get", err))?;
+            evaluate_thread(
+                client,
+                &thread,
+                state_filters,
+                &stages,
+                prefix,
+                &clock,
+                dry_run,
+            )
+            .await
+            .map_err(|err| ("state-filter action", err))
+        }
+        .await;
+        match outcome {
+            Ok(true) => transitioned += 1,
+            Ok(false) => {}
+            Err((op, err)) => skipped.skip_thread(thread_id, op, err, prefix)?,
         }
     }
 
@@ -979,8 +1035,11 @@ fn plan_state_move(
     // The ladder only runs forward. A bucket filter (`llm/recruiting -> Purgatory`) still
     // matches a thread `Purge` already sent to Oblivion, because the bucket label survives
     // by design; without this guard it dragged the thread back to Purgatory, `Purge` sent
-    // it on to Oblivion the next run, and 643 threads flipped every run until Gmail
-    // answered one of those writes with a 400 failedPrecondition (2026-10-05).
+    // it on to Oblivion the next run, and 643 threads flipped every run (2026-10-05),
+    // about 130k `threads.modify` calls a day and the 429 storm that came with them. The
+    // occasional 400 failedPrecondition is NOT this bug's doing: it hits quiescent,
+    // never-written threads before and after this guard, and is handled per thread by the
+    // skip boundary in `execute_state_filters`.
     if let Some(dest_index) = stages.iter().position(|s| Label::new(s) == dest_label)
         && let Some(current_index) = current_stage_index(thread_labels, stages)
         && current_index > dest_index

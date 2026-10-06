@@ -6,6 +6,7 @@ pub mod cfg;
 pub mod digest;
 pub mod engine;
 pub mod gmail;
+mod skip;
 pub mod slack;
 pub mod triage;
 
@@ -112,7 +113,9 @@ pub async fn run(
     }
     client.set_metadata_headers(metadata_headers);
 
-    engine::execute(&mut client, config, &prefix, dry_run, mark_only).await
+    engine::execute(&mut client, config, &prefix, dry_run, mark_only)
+        .await
+        .map(|_| ())
 }
 
 /// Build and post the pinned-inbox digest for one account. The caller only

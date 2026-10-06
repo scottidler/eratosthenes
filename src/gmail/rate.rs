@@ -262,6 +262,58 @@ impl std::fmt::Display for RetryExhausted {
     }
 }
 
+/// Who a per-thread Gmail failure belongs to. `Thread`: that one thread is
+/// skipped and the run goes on. `Account`: the run fails, because the failure
+/// says nothing good about the next call either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorScope {
+    Thread,
+    Account,
+}
+
+/// Google's structured body names a failure scoped to ONE thread: the
+/// transient `400 FAILED_PRECONDITION` Gmail answers a healthy thread with, or
+/// a `404 notFound` for a thread that vanished between list and get. An
+/// allowlist, read field by field; anything it does not name is `Account`.
+fn json_error_is_thread_scoped(body: &serde_json::Value) -> bool {
+    let error = &body["error"];
+    match error["code"].as_u64() {
+        Some(400) => error["status"].as_str() == Some("FAILED_PRECONDITION"),
+        Some(404) => error["errors"].as_array().is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry["reason"].as_str() == Some("notFound"))
+        }),
+        _ => false,
+    }
+}
+
+/// Classify an error from a PER-THREAD Gmail call. Only per-thread call sites
+/// may ask: `threads.list`, `labels.list`, `messages.list` and `batch_modify`
+/// never reach this and always propagate.
+///
+/// `google_gmail1` maps every non-2xx with a JSON body to `BadRequest`, so the
+/// variant says nothing about status; the body does. Exhaustion is checked
+/// first and wins outright: a ladder that ran out is an account problem (rate
+/// limit, outage, transport), and `RetryExhausted` is a `wrap_err` context,
+/// which `downcast_ref` finds and a `chain()` walk does not.
+pub fn error_scope(report: &eyre::Report) -> ErrorScope {
+    if report.downcast_ref::<RetryExhausted>().is_some() {
+        return ErrorScope::Account;
+    }
+    for source in report.chain() {
+        if let Some(err) = source.downcast_ref::<google_gmail1::Error>() {
+            return match err {
+                google_gmail1::Error::BadRequest(body) if json_error_is_thread_scoped(body) => {
+                    ErrorScope::Thread
+                }
+                _ => ErrorScope::Account,
+            };
+        }
+    }
+    ErrorScope::Account
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -547,5 +599,73 @@ mod tests {
         .await
         .unwrap_err();
         assert!(err.downcast_ref::<RetryExhausted>().is_none());
+    }
+
+    fn bad_request(body: serde_json::Value) -> eyre::Report {
+        use eyre::Context;
+        Err::<(), _>(google_gmail1::Error::BadRequest(body))
+            .context("threads.get(abc) failed")
+            .unwrap_err()
+    }
+
+    #[test]
+    fn test_error_scope_failed_precondition_is_thread() {
+        let report = bad_request(serde_json::json!({
+            "error": { "code": 400, "status": "FAILED_PRECONDITION" }
+        }));
+        assert_eq!(error_scope(&report), ErrorScope::Thread);
+    }
+
+    #[test]
+    fn test_error_scope_other_400_is_account() {
+        let report = bad_request(serde_json::json!({
+            "error": { "code": 400, "status": "INVALID_ARGUMENT",
+                       "errors": [{ "reason": "invalidArgument" }] }
+        }));
+        assert_eq!(error_scope(&report), ErrorScope::Account);
+    }
+
+    #[test]
+    fn test_error_scope_404_needs_the_not_found_reason() {
+        let found = bad_request(serde_json::json!({
+            "error": { "code": 404, "errors": [{ "reason": "notFound" }] }
+        }));
+        assert_eq!(error_scope(&found), ErrorScope::Thread);
+        let other = bad_request(serde_json::json!({
+            "error": { "code": 404, "errors": [{ "reason": "somethingElse" }] }
+        }));
+        assert_eq!(error_scope(&other), ErrorScope::Account);
+    }
+
+    /// The status must ride its own code: a FAILED_PRECONDITION status under a
+    /// non-400 code is not the Class A shape.
+    #[test]
+    fn test_error_scope_failed_precondition_status_under_other_code_is_account() {
+        let report = bad_request(serde_json::json!({
+            "error": { "code": 403, "status": "FAILED_PRECONDITION" }
+        }));
+        assert_eq!(error_scope(&report), ErrorScope::Account);
+    }
+
+    #[test]
+    fn test_error_scope_retry_exhausted_wins_over_a_thread_body() {
+        let report = bad_request(serde_json::json!({
+            "error": { "code": 400, "status": "FAILED_PRECONDITION" }
+        }))
+        .wrap_err(RetryExhausted {
+            op: "threads.get".to_string(),
+            attempts: MAX_RETRIES,
+        });
+        assert_eq!(error_scope(&report), ErrorScope::Account);
+    }
+
+    #[test]
+    fn test_error_scope_untyped_and_transport_errors_are_account() {
+        let untyped = eyre::eyre!("FAILED_PRECONDITION mentioned in text only");
+        assert_eq!(error_scope(&untyped), ErrorScope::Account);
+        let io = eyre::Report::new(google_gmail1::Error::Io(std::io::Error::other(
+            "connection reset",
+        )));
+        assert_eq!(error_scope(&io), ErrorScope::Account);
     }
 }

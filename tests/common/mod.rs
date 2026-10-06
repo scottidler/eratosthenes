@@ -6,8 +6,10 @@
 
 use eratosthenes::gmail::client::GmailClient;
 use serde_json::json;
+use std::sync::Mutex;
+use tokio::sync::oneshot;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 type Hub = google_gmail1::Gmail<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
@@ -45,25 +47,36 @@ pub fn rate_limited() -> ResponseTemplate {
 
 /// A thread with one message, enough for `GmailMessage::from_api`.
 pub fn thread_body(thread_id: &str) -> serde_json::Value {
+    thread_body_with_labels(thread_id, &["INBOX"])
+}
+
+/// A one-message thread carrying `label_ids` (Gmail label ids, not names),
+/// last active 2023-11-14, so any day-based TTL has long expired.
+pub fn thread_body_with_labels(thread_id: &str, label_ids: &[&str]) -> serde_json::Value {
     json!({
         "id": thread_id,
         "messages": [{
             "id": format!("{thread_id}-m1"),
             "threadId": thread_id,
-            "labelIds": ["INBOX"],
+            "labelIds": label_ids,
             "internalDate": "1700000000000",
             "payload": { "headers": [{ "name": "Subject", "value": "hello" }] }
         }]
     })
 }
 
-/// Mount the `labels.list` response `GmailClient::new` needs at construction.
-async fn mount_labels(server: &MockServer) {
+/// Mount the `labels.list` response `GmailClient::new` needs at construction:
+/// INBOX plus each `(id, name)` user label, so `ensure_labels` creates nothing.
+async fn mount_labels(server: &MockServer, user_labels: &[(&str, &str)]) {
+    let mut labels = vec![json!({ "id": "INBOX", "name": "INBOX", "type": "system" })];
+    labels.extend(
+        user_labels
+            .iter()
+            .map(|(id, name)| json!({ "id": id, "name": name, "type": "user" })),
+    );
     Mock::given(method("GET"))
         .and(path("/gmail/v1/users/me/labels"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "labels": [{ "id": "INBOX", "name": "INBOX", "type": "system" }]
-        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "labels": labels })))
         .mount(server)
         .await;
 }
@@ -72,9 +85,14 @@ async fn mount_labels(server: &MockServer) {
 /// in for OAuth; the connector is the same hyper-rustls type the hub uses in
 /// production, allowed to speak plain http for the local mock.
 pub async fn client_for(server: &MockServer) -> GmailClient {
+    client_with_labels(server, &[]).await
+}
+
+/// `client_for`, with `(id, name)` user labels already present in the mailbox.
+pub async fn client_with_labels(server: &MockServer, user_labels: &[(&str, &str)]) -> GmailClient {
     // Idempotent for tests: a second install in the same process just errors.
     let _ = eratosthenes::init_tls();
-    mount_labels(server).await;
+    mount_labels(server, user_labels).await;
 
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -104,4 +122,48 @@ pub async fn thread_get_requests(server: &MockServer) -> usize {
         .iter()
         .filter(|r| r.url.path().starts_with("/gmail/v1/users/me/threads/"))
         .count()
+}
+
+/// Requests the mock saw with `method` whose path is exactly `path`.
+pub async fn requests_to(server: &MockServer, method: &str, path: &str) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on by default")
+        .iter()
+        .filter(|r| r.method.as_str() == method && r.url.path() == path)
+        .count()
+}
+
+/// Answers with `response` and, on the FIRST request, freezes the test
+/// runtime's clock. A paused clock auto-advances whenever the runtime would
+/// park, including while an HTTP response is in flight, so pausing up front
+/// turns every request into a `REQUEST_TIMEOUT`. Pausing at the first hit lets
+/// everything before it run on real I/O and the retry ladder after it run on
+/// virtual time. Must be built inside the test's (current-thread) runtime.
+pub struct PauseOnFirstHit {
+    response: ResponseTemplate,
+    signal: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+pub fn pause_on_first_hit(response: ResponseTemplate) -> PauseOnFirstHit {
+    let (tx, rx) = oneshot::channel();
+    tokio::spawn(async move {
+        if rx.await.is_ok() {
+            tokio::time::pause();
+        }
+    });
+    PauseOnFirstHit {
+        response,
+        signal: Mutex::new(Some(tx)),
+    }
+}
+
+impl Respond for PauseOnFirstHit {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if let Some(tx) = self.signal.lock().expect("signal lock").take() {
+            let _ = tx.send(());
+        }
+        self.response.clone()
+    }
 }
