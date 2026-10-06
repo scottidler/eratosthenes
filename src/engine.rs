@@ -59,6 +59,7 @@ pub async fn execute(
             client,
             &config.message_filters,
             &config.marker_label,
+            &mut skipped,
             prefix,
             dry_run,
             mark_only,
@@ -104,6 +105,7 @@ pub async fn execute(
         client,
         &config.message_filters,
         &config.marker_label,
+        &mut skipped,
         prefix,
         dry_run,
         mark_only,
@@ -266,7 +268,7 @@ async fn sanitize_stages(
             );
 
             for tid in &thread_ids {
-                if skipped.contains(tid) {
+                if skipped.contains_thread(tid) {
                     continue;
                 }
                 if !dry_run
@@ -299,17 +301,19 @@ async fn execute_message_filters(
     client: &GmailClient,
     filters: &[MessageFilter],
     marker: &str,
+    skipped: &mut SkipLedger,
     prefix: &str,
     dry_run: bool,
     mark_only: bool,
 ) -> Result<usize> {
     debug!(
-        "{}execute_message_filters: count={}, marker={}, dry_run={}, mark_only={}",
+        "{}execute_message_filters: count={}, marker={}, dry_run={}, mark_only={}, skipped_so_far={}",
         prefix,
         filters.len(),
         marker,
         dry_run,
-        mark_only
+        mark_only,
+        skipped.len()
     );
 
     // Each filter keeps the ids its OWN query returned; `all_ids` is only the deduped
@@ -351,11 +355,18 @@ async fn execute_message_filters(
     let mut messages: HashMap<String, GmailMessage> = HashMap::new();
     for (i, id) in all_ids.iter().enumerate() {
         trace!("{}[phase1] [{}/{}] fetching {}", prefix, i + 1, total, id);
-        let msg = client.get_message(id).await?;
         if (i + 1) % 50 == 0 {
             trace!("{}[phase1] [{}/{}] fetching...", prefix, i + 1, total);
         }
-        messages.insert(id.clone(), msg);
+        // A skipped message never enters `messages`, so it never matches and
+        // gets no write. Its siblings are unaffected: star suppression reads
+        // the whole thread through `threads.get`, not this map.
+        match client.get_message(id).await {
+            Ok(msg) => {
+                messages.insert(id.clone(), msg);
+            }
+            Err(err) => skipped.skip_message(id, "messages.get", err, prefix)?,
+        }
     }
 
     let matched_per_filter =
@@ -384,17 +395,43 @@ async fn execute_message_filters(
         if matched_ids.is_empty() {
             continue;
         }
-        total_matched += matched_ids.len();
 
         // Mark-only never pins and never suppresses, so the suppression check's
         // `threads.get` round trip buys it nothing -- skip it.
         if !mark_only && pins(filter) {
-            fetch_thread_labels(client, matched_ids, &messages, &mut thread_labels, prefix).await?;
+            fetch_thread_labels(
+                client,
+                matched_ids,
+                &messages,
+                &mut thread_labels,
+                skipped,
+                prefix,
+            )
+            .await?;
         }
+
+        // The drop-writes seam: a thread skipped anywhere earlier this run
+        // (sanitize, or the label fetch just above) gets no star, Tag, Move or
+        // marker. Without it, a thread missing from `thread_labels` reads as
+        // unpinned and gets a duplicate star, and the marker freezes its
+        // message unhandled forever.
+        let writable_ids = drop_skipped_threads(matched_ids, &messages, skipped);
+        if writable_ids.len() < matched_ids.len() {
+            debug!(
+                "{}[filter:{}] dropped {} matched messages on skipped threads",
+                prefix,
+                filter.name,
+                matched_ids.len() - writable_ids.len()
+            );
+        }
+        if writable_ids.is_empty() {
+            continue;
+        }
+        total_matched += writable_ids.len();
 
         let writes = plan_filter_writes(
             filter,
-            matched_ids,
+            &writable_ids,
             &messages,
             &thread_labels,
             &client.resolver,
@@ -472,23 +509,54 @@ async fn fetch_thread_labels(
     matched_ids: &[String],
     messages: &HashMap<String, GmailMessage>,
     thread_labels: &mut HashMap<String, HashSet<String>>,
+    skipped: &mut SkipLedger,
     prefix: &str,
 ) -> Result<()> {
+    debug!(
+        "{}fetch_thread_labels: matched={}, cached={}, skipped_so_far={}",
+        prefix,
+        matched_ids.len(),
+        thread_labels.len(),
+        skipped.len()
+    );
     for id in matched_ids {
         let Some(msg) = messages.get(id) else {
             continue;
         };
-        if thread_labels.contains_key(&msg.thread_id) {
+        if thread_labels.contains_key(&msg.thread_id) || skipped.contains_thread(&msg.thread_id) {
             continue;
         }
         trace!(
             "{}[phase1] fetching thread {} for suppression check",
             prefix, msg.thread_id
         );
-        let thread = client.get_thread(&msg.thread_id).await?;
-        thread_labels.insert(msg.thread_id.clone(), thread.label_ids());
+        match client.get_thread(&msg.thread_id).await {
+            Ok(thread) => {
+                thread_labels.insert(msg.thread_id.clone(), thread.label_ids());
+            }
+            Err(err) => skipped.skip_thread(&msg.thread_id, "threads.get", err, prefix)?,
+        }
     }
     Ok(())
+}
+
+/// `matched_ids` minus every message whose thread is skipped this run, order kept.
+/// Pure, so the planner downstream stays pure: the skipped set is an input, not a
+/// lookup the planner makes.
+fn drop_skipped_threads(
+    matched_ids: &[String],
+    messages: &HashMap<String, GmailMessage>,
+    skipped: &SkipLedger,
+) -> Vec<String> {
+    matched_ids
+        .iter()
+        .filter(|id| {
+            messages
+                .get(id.as_str())
+                .is_none_or(|msg| !skipped.contains_thread(&msg.thread_id))
+        })
+        .cloned()
+        .collect()
 }
 
 /// One intended `batch_modify(ids, add, remove)` call.
@@ -609,7 +677,8 @@ fn plan_filter_writes(
 /// The ids a thread-scoped pin actually writes to: at most one per thread, and none at all
 /// for a thread whose label union already carries the pin. A thread missing from
 /// `thread_labels` counts as unpinned; `fetch_thread_labels` populates every matched
-/// thread for pinning filters before this runs.
+/// thread for pinning filters before this runs, and `drop_skipped_threads` removes the
+/// ones it could not fetch, so none reaches here missing.
 fn plan_pin_ids(
     matched_ids: &[String],
     messages: &HashMap<String, GmailMessage>,
@@ -876,7 +945,7 @@ async fn execute_state_filters(
             total,
             thread_id
         );
-        if skipped.contains(thread_id) {
+        if skipped.contains_thread(thread_id) {
             trace!(
                 "{}[state] thread {} already skipped this run, no further writes",
                 prefix, thread_id
@@ -1346,6 +1415,56 @@ mod tests {
     /// THE reported bug: a message the engine already handled, which the user then
     /// UNSTARRED. It still matches the filter's address criteria and it is still unread,
     /// so nothing but the marker stops it. No STARRED add may be issued.
+    fn skipped_threads(ids: &[&str]) -> SkipLedger {
+        let mut ledger = SkipLedger::new(10);
+        for id in ids {
+            let err = eyre::Report::new(google_gmail1::Error::BadRequest(serde_json::json!({
+                "error": { "code": 400, "status": "FAILED_PRECONDITION" }
+            })));
+            ledger
+                .skip_thread(id, "threads.get", err, "")
+                .expect("thread-scoped skip under the ceiling");
+        }
+        ledger
+    }
+
+    #[test]
+    fn test_drop_skipped_threads_removes_every_message_on_a_skipped_thread() {
+        let messages = message_map(vec![
+            msg_at("a1", "ta", "x@y.com", &["UNREAD"], 1),
+            msg_at("b1", "tb", "x@y.com", &["UNREAD"], 2),
+            msg_at("b2", "tb", "x@y.com", &["UNREAD"], 3),
+            msg_at("c1", "tc", "x@y.com", &["UNREAD"], 4),
+        ]);
+        let matched: Vec<String> = ["a1", "b1", "b2", "c1"].map(String::from).to_vec();
+        let kept = drop_skipped_threads(&matched, &messages, &skipped_threads(&["tb"]));
+        assert_eq!(kept, vec!["a1".to_string(), "c1".to_string()]);
+    }
+
+    #[test]
+    fn test_drop_skipped_threads_keeps_everything_with_no_skips() {
+        let messages = message_map(vec![msg_at("a1", "ta", "x@y.com", &["UNREAD"], 1)]);
+        let matched = vec!["a1".to_string()];
+        let kept = drop_skipped_threads(&matched, &messages, &SkipLedger::new(10));
+        assert_eq!(kept, matched);
+    }
+
+    /// Gmail gives a thread its first message's id: a skipped MESSAGE with that id
+    /// must not drop the thread's other messages.
+    #[test]
+    fn test_drop_skipped_threads_ignores_a_message_skip_sharing_the_thread_id() {
+        let messages = message_map(vec![msg_at("m2", "m1", "x@y.com", &["UNREAD"], 2)]);
+        let mut ledger = SkipLedger::new(10);
+        let err = eyre::Report::new(google_gmail1::Error::BadRequest(serde_json::json!({
+            "error": { "code": 400, "status": "FAILED_PRECONDITION" }
+        })));
+        ledger
+            .skip_message("m1", "messages.get", err, "")
+            .expect("thread-scoped skip under the ceiling");
+        let matched = vec!["m2".to_string()];
+        assert_eq!(drop_skipped_threads(&matched, &messages, &ledger), matched);
+    }
+
     #[test]
     fn test_marked_and_unstarred_message_is_never_re_starred() {
         let filter = from_filter("leadership", &["*@example.com"]);

@@ -90,3 +90,26 @@
 
 ### Open questions
 - None.
+
+## Phase 3: Message-filter drop-writes
+### Design decisions
+- `execute_message_filters` takes `&mut SkipLedger`; both call sites in `engine::execute` (normal and `--mark-only`) pass the run's one ledger.
+- `get_message` boundary - `src/engine.rs:execute_message_filters` - a failure goes through `SkipLedger::skip_message(id, "messages.get", ..)`; `Thread` scope logs `skipping message {id}: messages.get failed: ...`, records, ceiling-checks, and the message never enters `messages`, so it never matches. `Account` scope propagates unchanged.
+- `fetch_thread_labels` takes the ledger, skips a thread whose `threads.get` fails with `Thread` scope (`skip_thread(.., "threads.get", ..)`), and does not refetch a thread already in the ledger.
+- The seam is a pure `drop_skipped_threads(matched_ids, messages, skipped) -> Vec<String>` - `src/engine.rs` - called after `fetch_thread_labels` and before `plan_filter_writes`, for every filter (pinning or not, mark-only included). So a thread skipped by sanitize (Phase 0) or by the label fetch gets no star, Tag, Move or marker. `plan_filter_writes` is unchanged and stays pure.
+- `SkipLedger` keys are now `(Skipped::{Thread, Message}, id)`, and `contains` became `contains_thread` - `src/skip.rs` - because Gmail gives a thread the id of its first message: with bare ids, a skipped first message would read as a skipped thread and drop its healthy siblings' writes (and skip the thread in Phase 2), which the doc's "skip that one message" rules out. The ceiling still counts distinct skipped ids, now distinct per kind.
+- `messages_matched` (and the `Done:` line's matched/marked count) counts messages actually planned for writing, after the drop, so `--mark-only`'s "N messages marked" stays true. `claimed` still counts every match.
+- Tests: `tests/message_isolation.rs` (label-fetch failure drops all five write kinds for the skipped threads with the healthy threads' writes pinned exactly; `messages.get` skip under normal and `--mark-only`; account-scoped `messages.get` error fails the run with no write), unit tests for `drop_skipped_threads` and the new ledger API.
+- Bites run: (1) `drop_skipped_threads` call replaced with `matched_ids.to_vec()` -> `failed_label_fetch_drops_every_write_to_that_thread` fails with `ma2 is on a skipped thread but was written`, every batchModify carrying `ma2`/`mb2` (duplicate star, Tag, marker, Move). (2) `get_message` arm reverted to `return Err(err)` -> both `messages.get` skip tests fail with `messages.get(m2) failed ... FAILED_PRECONDITION`. Both restored.
+- Acceptance `rg -nU '(get_thread|get_message|modify_thread|trash_thread)\([^;]*?\)\s*\.await\?' src/engine.rs` now prints only the two `apply_state_action` writes (`modify_thread` at :1206-1207, `trash_thread` at :1217).
+
+### Deviations
+- `fetch_thread_labels` records skips into the shared ledger and returns `Result<()>` instead of returning `(labels, skipped_thread_ids)`: same effect, correct seam. The run already has one ledger (Phase 2), and a second skipped set would have to be merged back into it for the ceiling and for Phase 2's no-further-writes check.
+- Ledger keys carry their kind (thread vs message), not bare ids as the Data Model's single `HashSet<String>` reads. Reason above (thread id == first message id).
+
+### Tradeoffs
+- Filter `matched_ids` for every filter vs only pinning filters: the doc names the drop "before `plan_filter_writes`"; applying it everywhere also covers sanitize skips on non-pinning filters at no extra calls.
+- No integration test for a sanitize-stage skip carrying into message filters; the ledger lookup it relies on is the same `contains_thread` the unit tests and the label-fetch test exercise.
+
+### Open questions
+- None.

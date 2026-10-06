@@ -11,8 +11,26 @@ use log::{debug, warn};
 
 use crate::gmail::rate::{ErrorScope, error_scope};
 
+/// What a skipped id names. Kept beside the id because Gmail gives a thread
+/// the id of its first message, so a bare id would make a skipped message read
+/// as a skipped thread and suppress writes to its healthy siblings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Skipped {
+    Thread,
+    Message,
+}
+
+impl Skipped {
+    fn noun(self) -> &'static str {
+        match self {
+            Skipped::Thread => "thread",
+            Skipped::Message => "message",
+        }
+    }
+}
+
 pub(crate) struct SkipLedger {
-    ids: HashSet<String>,
+    ids: HashSet<(Skipped, String)>,
     max: usize,
 }
 
@@ -29,8 +47,10 @@ impl SkipLedger {
         self.ids.len()
     }
 
-    pub(crate) fn contains(&self, id: &str) -> bool {
-        self.ids.contains(id)
+    /// Was this thread skipped earlier this run? A skipped message with the
+    /// same id does not count: only the thread itself failed.
+    pub(crate) fn contains_thread(&self, thread_id: &str) -> bool {
+        self.ids.contains(&(Skipped::Thread, thread_id.to_string()))
     }
 
     /// The per-thread boundary: a `Thread`-scope failure is logged, recorded,
@@ -43,17 +63,30 @@ impl SkipLedger {
         err: eyre::Report,
         prefix: &str,
     ) -> Result<()> {
-        self.absorb("thread", thread_id, op, err, prefix)
+        self.absorb(Skipped::Thread, thread_id, op, err, prefix)
+    }
+
+    /// `skip_thread` for one message: a `Thread`-scope failure fetching it
+    /// drops only that message, never its thread's siblings.
+    pub(crate) fn skip_message(
+        &mut self,
+        message_id: &str,
+        op: &str,
+        err: eyre::Report,
+        prefix: &str,
+    ) -> Result<()> {
+        self.absorb(Skipped::Message, message_id, op, err, prefix)
     }
 
     fn absorb(
         &mut self,
-        noun: &str,
+        kind: Skipped,
         id: &str,
         op: &str,
         err: eyre::Report,
         prefix: &str,
     ) -> Result<()> {
+        let noun = kind.noun();
         let scope = error_scope(&err);
         debug!(
             "{}skip ledger: {} {} op={} scope={:?} skipped_so_far={} max={}",
@@ -70,7 +103,7 @@ impl SkipLedger {
         }
 
         warn!("{}{}", prefix, skip_warning(noun, id, op, &err));
-        self.ids.insert(id.to_string());
+        self.ids.insert((kind, id.to_string()));
 
         // Checked at each insert, not at end of run: a systemic failure stops
         // after max+1 calls instead of burning the whole run's worth. The text
@@ -111,8 +144,8 @@ mod tests {
             .skip_thread("t1", "threads.get", failed_precondition(), "")
             .unwrap();
         assert_eq!(ledger.len(), 1);
-        assert!(ledger.contains("t1"));
-        assert!(!ledger.contains("t2"));
+        assert!(ledger.contains_thread("t1"));
+        assert!(!ledger.contains_thread("t2"));
     }
 
     #[test]
@@ -154,6 +187,45 @@ mod tests {
                 .skip_thread("t1", "threads.get", failed_precondition(), "")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_message_skip_is_counted_but_is_not_a_thread_skip() {
+        let mut ledger = SkipLedger::new(10);
+        // Gmail threads take their first message's id, so the same id names both.
+        ledger
+            .skip_message("19f0", "messages.get", failed_precondition(), "")
+            .unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert!(!ledger.contains_thread("19f0"));
+        ledger
+            .skip_thread("19f0", "threads.get", failed_precondition(), "")
+            .unwrap();
+        assert_eq!(ledger.len(), 2, "a thread and a message are distinct skips");
+        assert!(ledger.contains_thread("19f0"));
+    }
+
+    #[test]
+    fn test_message_account_scope_propagates_and_is_not_recorded() {
+        let mut ledger = SkipLedger::new(10);
+        assert!(
+            ledger
+                .skip_message("m1", "messages.get", eyre::eyre!("auth expired"), "")
+                .is_err()
+        );
+        assert_eq!(ledger.len(), 0);
+    }
+
+    #[test]
+    fn test_message_skips_share_the_ceiling() {
+        let mut ledger = SkipLedger::new(1);
+        ledger
+            .skip_thread("t1", "threads.get", failed_precondition(), "")
+            .unwrap();
+        let err = ledger
+            .skip_message("m1", "messages.get", failed_precondition(), "")
+            .unwrap_err();
+        assert!(err.to_string().contains("over max-skipped-threads 1"));
     }
 
     /// The operator acceptance check is
