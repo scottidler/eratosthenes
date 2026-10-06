@@ -133,3 +133,20 @@
 
 ### Open questions
 - None.
+
+## Implementation audit follow-up
+### Design decisions
+- `refresh_drafts` takes `&SkipLedger` and skips any target with `contains_thread` before its fetch or write - `src/triage/mod.rs:refresh_drafts` - the classify pass's skips now bind the whole triage run, so a skipped thread gets no further reads or writes. Its existing per-target fetch-error swallowing is untouched.
+- The all-candidates-skipped early return now prints the `Triage:` summary (via `summary_line`/`print_summary`, shared with the normal path) so "N skipped" shows - `src/triage/mod.rs:classify_and_label`.
+- `transport_failure_is_account` now builds the client against a one-shot listener that answers `labels.list` with `Connection: close` and exits, leaving the port dead; every attempt is connection-refused - `tests/error_scope.rs`, new `client_at` in `tests/common/mod.rs`. It asserts `RetryExhausted`, `Account` scope, and no `TIMEOUT_MARKER`. Runtime 0.06s.
+- Bite for the refresh filter: with the `contains_thread` check disabled, `skipped_thread_gets_no_draft_refresh_write` fails (1 `threads.modify` reached t1, expected 0); restored.
+
+### Deviations
+- Phase 4's "no behavioral deviation" claim missed the `refresh_drafts` write: a thread skipped in the classify pass was refetched and could get a bucket-label-removing `threads.modify`. Fixed here.
+- The summary-on-all-skipped fix is pinned by a unit test on `summary_line`, not an integration test on captured stdout (libtest's capture is not reachable from an integration test); the call on that path is not bite-tested.
+
+### Tradeoffs
+- One-shot hand-rolled listener vs dropping the wiremock server: dropping a pooled wiremock server does not close it, so the old test hit the 30s request timeout rather than a transport error.
+
+### Open questions
+- None.

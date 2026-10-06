@@ -5,8 +5,8 @@
 mod common;
 
 use common::{
-    client_for, drive_clock_manually, failed_precondition, gmail_error_body, gmail_error_code,
-    rate_limited, thread_get_requests,
+    client_at, client_for, drive_clock_manually, failed_precondition, gmail_error_body,
+    gmail_error_code, rate_limited, thread_get_requests,
 };
 use eratosthenes::gmail::client::GmailClient;
 use eratosthenes::gmail::rate::{
@@ -130,19 +130,46 @@ async fn retry_exhausted_is_account() {
     assert_eq!(error_scope(&err), ErrorScope::Account, "{err:#}");
 }
 
-/// Transport: the server goes away after construction, so no attempt gets an
-/// answer, the ladder exhausts, and the classification is `Account`.
+/// A client whose `GmailClient::new` succeeded against a one-shot listener
+/// that answered `labels.list` with `Connection: close` and then exited, so the
+/// port it built against now has nothing listening.
+async fn client_on_dead_port() -> GmailClient {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let serving = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = conn.read(&mut buf);
+        let body = r#"{"labels":[{"id":"INBOX","name":"INBOX","type":"system"}]}"#;
+        write!(
+            conn,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+    });
+    let client = client_at(&format!("http://127.0.0.1:{port}")).await;
+    serving.join().unwrap();
+    client
+}
+
+/// Transport: connection refused on every attempt (a real transport failure,
+/// not the 30s request timeout), so the ladder exhausts and the classification
+/// is `Account`.
 #[tokio::test]
 async fn transport_failure_is_account() {
-    let server = MockServer::start().await;
-    let client = client_for(&server).await;
-    drop(server);
+    let client = client_on_dead_port().await;
     tokio::time::pause();
     let err = client
         .get_thread("t1")
         .await
         .err()
-        .expect("no server, no thread");
+        .expect("nothing is listening, so no thread");
     assert!(err.downcast_ref::<RetryExhausted>().is_some(), "{err:#}");
     assert_eq!(error_scope(&err), ErrorScope::Account, "{err:#}");
+    assert!(
+        !format!("{err:#}").contains(TIMEOUT_MARKER),
+        "must not be a timeout: {err:#}"
+    );
 }

@@ -88,9 +88,15 @@ pub async fn client_for(server: &MockServer) -> GmailClient {
 
 /// `client_for`, with `(id, name)` user labels already present in the mailbox.
 pub async fn client_with_labels(server: &MockServer, user_labels: &[(&str, &str)]) -> GmailClient {
+    mount_labels(server, user_labels).await;
+    client_at(&server.uri()).await
+}
+
+/// The production `GmailClient` pointed at `base_uri`. The caller must have
+/// arranged for `labels.list` to answer there (`GmailClient::new` calls it).
+pub async fn client_at(base_uri: &str) -> GmailClient {
     // Idempotent for tests: a second install in the same process just errors.
     let _ = eratosthenes::init_tls();
-    mount_labels(server, user_labels).await;
 
     let connector = hyper_rustls::HttpsConnectorBuilder::new()
         .with_native_roots()
@@ -103,8 +109,8 @@ pub async fn client_with_labels(server: &MockServer, user_labels: &[(&str, &str)
             .build(connector),
         "test-token".to_string(),
     );
-    hub.base_url(format!("{}/", server.uri()));
-    hub.root_url(format!("{}/", server.uri()));
+    hub.base_url(format!("{base_uri}/"));
+    hub.root_url(format!("{base_uri}/"));
 
     GmailClient::new(hub, "")
         .await

@@ -430,3 +430,15 @@ fn test_plan_draft_targets_on_an_empty_mailbox_plans_nothing() {
     assert!(targets.is_empty());
     assert_eq!(total, 0);
 }
+
+#[test]
+fn test_summary_line_reports_skips_when_nothing_was_classified() {
+    assert_eq!(
+        summary_line("[a] ", 0, 0, 1, false),
+        "[a] Triage: 0 threads classified, 0 labeled, 1 skipped"
+    );
+    assert_eq!(
+        summary_line("", 2, 2, 0, true),
+        "Triage: 2 threads classified, 2 labeled, 0 skipped (dry run)"
+    );
+}

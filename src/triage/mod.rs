@@ -310,7 +310,7 @@ pub async fn execute(
     // refresh is what retries a thread whose previous run died between the
     // label write and the draft, and that thread carries no new message, so
     // classification will never look at it again.
-    refresh_drafts(client, triage, &self_address, prefix, dry_run).await
+    refresh_drafts(client, triage, &self_address, prefix, dry_run, &skipped).await
 }
 
 /// The classify pass: new inbox messages -> buckets -> one `threads.modify`
@@ -362,6 +362,7 @@ async fn classify_and_label(
             "{}every candidate thread was unreadable; nothing to classify",
             prefix
         );
+        print_summary(prefix, 0, 0, skipped.len(), dry_run);
         return Ok(());
     }
 
@@ -463,16 +464,39 @@ the next run will reclassify these threads)",
         skipped,
         if dry_run { " (dry run)" } else { "" }
     );
-    println!(
-        "{}Triage: {} threads classified, {} labeled, {} skipped{}",
+    print_summary(
         prefix,
         classification.assignments.len(),
         applied,
         skipped,
-        if dry_run { " (dry run)" } else { "" }
+        dry_run,
     );
 
     Ok(())
+}
+
+fn summary_line(
+    prefix: &str,
+    classified: usize,
+    labeled: usize,
+    skipped: usize,
+    dry_run: bool,
+) -> String {
+    format!(
+        "{}Triage: {} threads classified, {} labeled, {} skipped{}",
+        prefix,
+        classified,
+        labeled,
+        skipped,
+        if dry_run { " (dry run)" } else { "" }
+    )
+}
+
+fn print_summary(prefix: &str, classified: usize, labeled: usize, skipped: usize, dry_run: bool) {
+    println!(
+        "{}",
+        summary_line(prefix, classified, labeled, skipped, dry_run)
+    );
 }
 
 /// Create the bucket labels and the seen marker if they are missing. Idempotent
@@ -713,6 +737,7 @@ async fn refresh_drafts(
     self_address: &str,
     prefix: &str,
     dry_run: bool,
+    skipped_threads: &SkipLedger,
 ) -> Result<()> {
     let draft_buckets: Vec<&TriageBucket> = triage.buckets.iter().filter(|b| b.draft).collect();
     if draft_buckets.is_empty() {
@@ -756,6 +781,15 @@ async fn refresh_drafts(
     let mut skipped = 0usize;
 
     for target in &targets {
+        // A thread skipped earlier this run gets no further reads or writes.
+        if skipped_threads.contains_thread(&target.thread_id) {
+            debug!(
+                "{}refresh_drafts: thread {} was skipped this run; leaving it alone",
+                prefix, target.thread_id
+            );
+            skipped += 1;
+            continue;
+        }
         let raw = match client.get_thread_full(&target.thread_id).await {
             Ok(raw) => raw,
             Err(e) => {

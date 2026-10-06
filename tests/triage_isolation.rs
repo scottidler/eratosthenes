@@ -264,3 +264,122 @@ async fn skip_ceiling_fails_triage() {
         "{err:#}"
     );
 }
+
+const RELABEL_ID: &str = "Label_R";
+
+fn draft_config(claude: &Path) -> Config {
+    parse_config(&format!(
+        r#"
+auth:
+  creds-path: /tmp/creds
+triage:
+  schedule: "Mon..Fri 06:30:00"
+  claude-binary: {}
+  buckets:
+    - name: needs-reply
+      label: llm/needs-reply
+      description: expects a reply
+      draft: true
+"#,
+        claude.display()
+    ))
+    .expect("draft config parses")
+}
+
+/// t1 is the only candidate AND sits in the draft bucket, already answered by
+/// the owner (so the refresh would remove its bucket label). Its first
+/// `threads.get` fails with `FAILED_PRECONDITION`; every later one succeeds.
+async fn mount_skipped_then_healthy_draft_thread(server: &MockServer) {
+    let me = "me@x.com";
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "emailAddress": me })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MESSAGES))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "messages": [{ "id": "t1-m1", "threadId": "t1" }] })),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{MESSAGES}/t1-m1")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(message_body("t1-m1", "t1")))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(THREADS))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "threads": [{ "id": "t1" }] })),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("{THREADS}/t1")))
+        .respond_with(failed_precondition())
+        .up_to_n_times(1)
+        .mount(server)
+        .await;
+    let answered = json!({
+        "id": "t1",
+        "messages": [{
+            "id": "t1-m1",
+            "threadId": "t1",
+            "labelIds": ["INBOX", RELABEL_ID],
+            "internalDate": "1700000000000",
+            "payload": { "headers": [
+                { "name": "From", "value": me },
+                { "name": "To", "value": "them@x.com" },
+                { "name": "Subject", "value": "hello" }
+            ]}
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("{THREADS}/t1")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answered))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{THREADS}/t1/modify")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "t1" })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(BATCH_MODIFY))
+        .respond_with(ResponseTemplate::new(204))
+        .mount(server)
+        .await;
+}
+
+/// Audit finding: a thread skipped in the classify pass must get no further
+/// reads or writes from the draft refresh. Also the all-candidates-skipped
+/// path: the run is Ok and writes nothing.
+#[tokio::test]
+async fn skipped_thread_gets_no_draft_refresh_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude = write_stub_claude(dir.path());
+    let server = MockServer::start().await;
+    mount_skipped_then_healthy_draft_thread(&server).await;
+    let mut client = client_with_labels(
+        &server,
+        &[(RELABEL_ID, "llm/needs-reply"), (SEEN_ID, "llm/seen")],
+    )
+    .await;
+
+    triage::execute(&mut client, &draft_config(&claude), "", false)
+        .await
+        .expect("the only candidate was skipped on a thread-scoped error");
+
+    assert_eq!(
+        requests_to(&server, "POST", &format!("{THREADS}/t1/modify")).await,
+        0,
+        "a skipped thread must get no draft-refresh write"
+    );
+    assert_eq!(
+        requests_to(&server, "GET", &format!("{THREADS}/t1")).await,
+        1,
+        "a skipped thread must not be refetched"
+    );
+}
