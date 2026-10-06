@@ -21,6 +21,7 @@ use crate::cfg::config::Config;
 use crate::cfg::triage::{TriageBucket, TriageConfig};
 use crate::gmail::client::GmailClient;
 use crate::gmail::label::{LabelResolver, LabelVisibility, create_label_if_missing};
+use crate::skip::SkipLedger;
 use crate::triage::claude::{ClaudeCli, TRIAGE_TIMEOUT};
 use crate::triage::draft::RefreshPlan;
 use crate::triage::thread::TriageThread;
@@ -299,7 +300,11 @@ pub async fn execute(
         .await
         .context("resolving the account's own address")?;
 
-    classify_and_label(client, triage, &self_address, prefix, dry_run).await?;
+    // Triage is its own invocation (`eratosthenes triage`), not a phase of
+    // `run`, so it owns its ledger. The ceiling is the same per-account
+    // `max-skipped-threads` the engine uses.
+    let mut skipped = SkipLedger::new(config.max_skipped_threads);
+    classify_and_label(client, triage, &self_address, prefix, dry_run, &mut skipped).await?;
 
     // Runs on EVERY invocation, including one that classified nothing: the
     // refresh is what retries a thread whose previous run died between the
@@ -316,7 +321,14 @@ async fn classify_and_label(
     self_address: &str,
     prefix: &str,
     dry_run: bool,
+    skipped: &mut SkipLedger,
 ) -> Result<()> {
+    debug!(
+        "{}classify_and_label: dry_run={}, skip_ceiling_already_used={}",
+        prefix,
+        dry_run,
+        skipped.len()
+    );
     let selection = discover_candidates(client, triage, prefix).await?;
     if selection.thread_ids.is_empty() {
         info!("{}no new inbox messages to classify", prefix);
@@ -326,10 +338,20 @@ async fn classify_and_label(
 
     let mut threads: Vec<TriageThread> = Vec::new();
     for id in &selection.thread_ids {
-        let raw = client
-            .get_thread_full(id)
-            .await
-            .with_context(|| format!("fetching thread {} at format=full", id))?;
+        let raw = match client.get_thread_full(id).await {
+            Ok(raw) => raw,
+            Err(e) => {
+                // A thread-scoped failure drops this one thread from the batch;
+                // an account-scoped one (or the skip ceiling) fails the run.
+                skipped.skip_thread(
+                    id,
+                    "threads.get (full)",
+                    e.wrap_err(format!("fetching thread {} at format=full", id)),
+                    prefix,
+                )?;
+                continue;
+            }
+        };
         match TriageThread::from_api(raw) {
             Ok(thread) => threads.push(thread),
             Err(e) => warn!("{}skipping unreadable thread {}: {:#}", prefix, id, e),
@@ -374,10 +396,23 @@ async fn classify_and_label(
     let mut applied = 0usize;
     let mut to_mark: Vec<String> = Vec::new();
     for write in &writes {
-        client
+        if let Err(e) = client
             .modify_thread(&write.thread_id, &write.add, &write.remove)
             .await
-            .with_context(|| format!("labeling thread {} as {}", write.thread_id, write.bucket))?;
+        {
+            // Skipped BEFORE `to_mark` is extended below, so a thread whose
+            // bucket did not land never earns a seen marker and resurfaces.
+            skipped.skip_thread(
+                &write.thread_id,
+                "threads.modify",
+                e.wrap_err(format!(
+                    "labeling thread {} as {}",
+                    write.thread_id, write.bucket
+                )),
+                prefix,
+            )?;
+            continue;
+        }
         info!(
             "{}[triage:{}] thread {} labeled ({} removed)",
             prefix,
@@ -418,7 +453,8 @@ the next run will reclassify these threads)",
         );
     }
 
-    let skipped = classification.unknown_buckets.len() + classification.missing_ids.len();
+    let skipped =
+        classification.unknown_buckets.len() + classification.missing_ids.len() + skipped.len();
     info!(
         "{}Triage done: {} classified, {} labeled, {} skipped{}",
         prefix,

@@ -113,3 +113,23 @@
 
 ### Open questions
 - None.
+
+## Phase 4: Triage parity
+### Design decisions
+- Triage owns its own `SkipLedger`, built in `triage::execute` from `config.max_skipped_threads` - `src/triage/mod.rs:execute` - `eratosthenes triage` is a separate CLI invocation and timer (`lib.rs:triage` -> `triage::execute`), not a phase of `run`, so there is no engine ledger to share. The ceiling is the same per-account key; a triage run and an engine run each get their own count.
+- `get_thread_full` failure goes through `skip_thread(id, "threads.get (full)", ..)` in `classify_and_label`: `Thread` scope drops that one thread from the batch (never sent to the classifier), `Account` scope and the ceiling propagate. The error is wrapped with the old "fetching thread {id} at format=full" context so the WARN and any propagated failure read as before.
+- Bucket write failure goes through `skip_thread(thread_id, "threads.modify", ..)` then `continue`, placed before `to_mark.extend`, so a thread whose bucket did not land never earns a seen marker and resurfaces next run. The ordering at the old `:362-372` is unchanged and still guarantees no marker without a landed bucket.
+- The `Triage:` summary's `skipped` count now adds the ledger's skips to the classifier's unknown-bucket and missing-id skips.
+- Tests: `tests/triage_isolation.rs` drives the public `triage::execute` against wiremock, with a stub `claude` shell script (config `claude-binary`) that answers `--version`, records its stdin payload, and returns a real envelope. Cases: one failing `threads.get` (full) -> others classified and labeled, payload excludes the skipped thread, markers only for landed buckets; failing bucket write -> no marker for that thread; account-scoped (401) fetch error -> run fails, no writes; ceiling (2 skips over 1) -> run fails.
+- Bites run: (1) fetch skip arm replaced with `return Err(..)` -> the one-skip test and the ceiling test fail. (2) bucket-write skip arm replaced with `return Err(e)` -> the bucket-write test fails. Both restored.
+
+### Deviations
+- The doc cites `:329-332` and `:376-380` as the seams; same two call sites, now at the shifted lines. No behavioral deviation.
+- `refresh_drafts` (the reply-draft pass) already swallows `get_thread_full` errors per target, including account-scoped ones; left as is, since the phase names only the classify-pass fetch and bucket write. The same pre-existing shape as the candidate discovery non-goal.
+
+### Tradeoffs
+- Own ledger in triage vs threading the engine's through: there is no shared run, so a shared one would need a new owner; reusing `SkipLedger` unchanged keeps the logic in one place.
+- Stub `claude` script vs refactoring `classify_threads` behind a trait: the config already exposes `claude-binary`, so the real `ClaudeCli` path runs end to end.
+
+### Open questions
+- None.
