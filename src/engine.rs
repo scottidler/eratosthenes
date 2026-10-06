@@ -976,6 +976,25 @@ fn plan_state_move(
 ) -> PlannedMove {
     let dest_label = Label::new(dest);
 
+    // The ladder only runs forward. A bucket filter (`llm/recruiting -> Purgatory`) still
+    // matches a thread `Purge` already sent to Oblivion, because the bucket label survives
+    // by design; without this guard it dragged the thread back to Purgatory, `Purge` sent
+    // it on to Oblivion the next run, and 643 threads flipped every run until Gmail
+    // answered one of those writes with a 400 failedPrecondition (2026-10-05).
+    if let Some(dest_index) = stages.iter().position(|s| Label::new(s) == dest_label)
+        && let Some(current_index) = current_stage_index(thread_labels, stages)
+        && current_index > dest_index
+    {
+        debug!(
+            "plan_state_move: refusing backward move to '{}' from '{}'",
+            dest, stages[current_index]
+        );
+        return PlannedMove {
+            add: Vec::new(),
+            remove: Vec::new(),
+        };
+    }
+
     let mut remove: Vec<Label> = Vec::new();
     if dest_label != Label::Inbox && thread_labels.contains(&Label::Inbox) {
         remove.push(Label::Inbox);
@@ -1002,6 +1021,18 @@ fn plan_state_move(
             .map(|l| resolve_label_id(resolver, l.to_gmail_id()))
             .collect(),
     }
+}
+
+/// The thread's position on the ladder. `INBOX` wins over any later stage label it also
+/// carries: a reply pulls a thread back into the inbox, and from there it ages forward
+/// again rather than being pinned at its old stage.
+fn current_stage_index(thread_labels: &[Label], stages: &[String]) -> Option<usize> {
+    if thread_labels.contains(&Label::Inbox) {
+        return stages.iter().position(|s| Label::new(s) == Label::Inbox);
+    }
+    stages
+        .iter()
+        .rposition(|s| thread_labels.contains(&Label::new(s)))
 }
 
 async fn apply_state_action(
@@ -1031,7 +1062,7 @@ async fn apply_state_action(
             // the thread would be rewritten every run, forever.
             if planned.is_noop() {
                 debug!(
-                    "{}[state:{}] thread {} already at '{}', no-op; continuing to later filters",
+                    "{}[state:{}] thread {} already at or past '{}', no-op; continuing to later filters",
                     prefix, state_filter.name, thread.id, dest,
                 );
                 return Ok(false);
@@ -1993,6 +2024,64 @@ mod tests {
             purge.remove.contains(&"Label_7".to_string()),
             "Purge sheds the Purgatory stage: {:?}",
             purge.remove
+        );
+    }
+
+    /// THE PING-PONG REGRESSION (2026-10-05). A thread `Purge` already sent to Oblivion
+    /// still carries its bucket label, so the bucket filter still matches it. Before this
+    /// fix the plan removed Oblivion and re-added Purgatory, `Purge` reversed it the next
+    /// run, and 643 threads flipped every run until Gmail 400'd one of the writes.
+    #[test]
+    fn test_bucket_filter_never_drags_an_oblivion_thread_back_to_purgatory() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            &labels_of(&["UNREAD", "llm/noise", "Oblivion"]),
+            &stages,
+            "Purgatory",
+            &state_resolver(),
+        );
+
+        assert!(
+            planned.is_noop(),
+            "a backward move must be a no-op: add={:?} remove={:?}",
+            planned.add,
+            planned.remove
+        );
+    }
+
+    /// The ladder reaches a fixed point: once in Oblivion, neither the bucket filter nor
+    /// `Purge` has anything left to write, run after run.
+    #[test]
+    fn test_ladder_reaches_a_fixed_point_at_oblivion() {
+        let stages = derive_stages(&ladder_filters());
+        let resolver = state_resolver();
+        let at_oblivion = labels_of(&["llm/noise", "Oblivion"]);
+
+        for dest in ["Purgatory", "Oblivion"] {
+            let planned = plan_state_move(&at_oblivion, &stages, dest, &resolver);
+            assert!(
+                planned.is_noop(),
+                "move to {dest} must not write once the thread is in Oblivion: {planned:?}"
+            );
+        }
+    }
+
+    /// A reply puts an Oblivion thread back in INBOX. That thread is at stage 0 again, so
+    /// `Cull` may still move it forward to Purgatory; the backward guard must not pin it.
+    #[test]
+    fn test_inbox_thread_carrying_a_later_stage_can_still_move_forward() {
+        let stages = derive_stages(&ladder_filters());
+        let planned = plan_state_move(
+            &labels_of(&["INBOX", "Oblivion"]),
+            &stages,
+            "Purgatory",
+            &state_resolver(),
+        );
+
+        assert_eq!(planned.add, vec!["Label_7".to_string()]);
+        assert_eq!(
+            planned.remove,
+            vec!["INBOX".to_string(), "Label_8".to_string()]
         );
     }
 
