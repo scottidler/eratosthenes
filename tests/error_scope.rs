@@ -5,17 +5,19 @@
 mod common;
 
 use common::{
-    client_for, failed_precondition, gmail_error_body, pause_on_first_hit, rate_limited,
-    thread_get_requests,
+    client_for, drive_clock_manually, failed_precondition, gmail_error_body, gmail_error_code,
+    rate_limited, thread_get_requests,
 };
 use eratosthenes::gmail::client::GmailClient;
-use eratosthenes::gmail::rate::{ErrorScope, RetryExhausted, error_scope, is_retryable};
+use eratosthenes::gmail::rate::{
+    ErrorScope, RetryExhausted, TIMEOUT_MARKER, error_scope, is_retryable,
+};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const THREAD_PATH: &str = "/gmail/v1/users/me/threads/t1";
 
-async fn server_answering(response: impl Respond + 'static) -> (MockServer, GmailClient) {
+async fn server_answering(response: ResponseTemplate) -> (MockServer, GmailClient) {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
         .and(path(THREAD_PATH))
@@ -103,20 +105,28 @@ async fn backend_error_503_is_account() {
 }
 
 /// The ladder exhausting on a real 429 yields `RetryExhausted`, which is
-/// `Account` whatever the last attempt's cause was.
+/// `Account`. The clock is driven by hand so every attempt reads its 429.
 #[tokio::test]
 async fn retry_exhausted_is_account() {
-    let (server, client) = server_answering(pause_on_first_hit(rate_limited())).await;
+    let (server, client) = server_answering(rate_limited()).await;
+    let clock = drive_clock_manually();
     let err = client
         .get_thread("t1")
         .await
         .err()
         .expect("a permanent 429 exhausts the ladder");
-    assert!(thread_get_requests(&server).await > 1, "{err:#}");
+    clock.abort();
     let exhausted = err
         .downcast_ref::<RetryExhausted>()
         .expect("exhaustion is marked");
     assert_eq!(exhausted.op, "threads.get");
+    assert_eq!(
+        thread_get_requests(&server).await,
+        exhausted.attempts as usize,
+        "{err:#}"
+    );
+    assert_eq!(gmail_error_code(&err), Some(429), "{err:#}");
+    assert!(!format!("{err:#}").contains(TIMEOUT_MARKER), "{err:#}");
     assert_eq!(error_scope(&err), ErrorScope::Account, "{err:#}");
 }
 

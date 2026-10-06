@@ -6,16 +6,16 @@
 mod common;
 
 use common::{
-    client_with_labels, failed_precondition, pause_on_first_hit, rate_limited, requests_to,
-    thread_body_with_labels, thread_get_requests,
+    client_with_labels, drive_clock_manually, failed_precondition, gmail_error_code, rate_limited,
+    requests_to, thread_body_with_labels, thread_get_requests,
 };
 use eratosthenes::cfg::config::parse_config;
 use eratosthenes::engine::{self, RunSummary};
 use eratosthenes::gmail::client::GmailClient;
-use eratosthenes::gmail::rate::RetryExhausted;
+use eratosthenes::gmail::rate::{RetryExhausted, TIMEOUT_MARKER};
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param_is_missing};
-use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const THREADS: &str = "/gmail/v1/users/me/threads";
 const PURGATORY_ID: &str = "Label_P";
@@ -77,7 +77,7 @@ async fn mount_active_threads(server: &MockServer, ids: &[String]) {
         .await;
 }
 
-async fn mount_get(server: &MockServer, id: &str, response: impl Respond + 'static) {
+async fn mount_get(server: &MockServer, id: &str, response: ResponseTemplate) {
     Mock::given(method("GET"))
         .and(path(thread_path(id)))
         .respond_with(response)
@@ -267,21 +267,29 @@ async fn rate_limit_on_one_thread_fails_the_run() {
     mount_no_stage_conflicts(&server).await;
     mount_active_threads(&server, &threads).await;
     mount_healthy_inbox_thread(&server, "r1").await;
-    // Real I/O up to r2's first answer, virtual time for its backoff ladder.
-    mount_get(&server, "r2", pause_on_first_hit(rate_limited())).await;
+    mount_get(&server, "r2", rate_limited()).await;
     mount_healthy_inbox_thread(&server, "r3").await;
     let mut client = client_with_labels(&server, LABELS).await;
 
+    // Hand-driven virtual time: every r2 attempt reads its 429, none times out.
+    let clock = drive_clock_manually();
     let err = run(&mut client, &cull_config(10))
         .await
         .expect_err("a 429 is account-scoped and must fail the run");
+    clock.abort();
 
     let exhausted = err
         .downcast_ref::<RetryExhausted>()
         .expect("the 429 exhausted the ladder");
     assert_eq!(exhausted.op, "threads.get");
+    assert_eq!(gmail_error_code(&err), Some(429), "{err:#}");
+    assert!(!format!("{err:#}").contains(TIMEOUT_MARKER), "{err:#}");
+    assert!(format!("{err:#}").contains("threads.get(r2)"), "{err:#}");
     assert_eq!(modify_requests(&server, "r1").await, 1, "r1 ran normally");
-    assert!(requests_to(&server, "GET", &thread_path("r2")).await > 1);
+    assert_eq!(
+        requests_to(&server, "GET", &thread_path("r2")).await,
+        exhausted.attempts as usize
+    );
     assert_eq!(
         requests_to(&server, "GET", &thread_path("r3")).await,
         0,

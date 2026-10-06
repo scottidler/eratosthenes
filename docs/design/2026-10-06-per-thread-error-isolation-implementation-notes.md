@@ -75,3 +75,18 @@
 
 ### Open questions
 - None.
+
+## Phase 2 follow-up: Phase 2 429 tests
+### Design decisions
+- `retry_exhausted_is_account` (`tests/error_scope.rs`) and `rate_limit_on_one_thread_fails_the_run` (`tests/state_isolation.rs`) now run on `drive_clock_manually`. Both assert: requests == `RetryExhausted.attempts`; `gmail_error_code(&err) == Some(429)` (new helper in `tests/common/mod.rs`, the first `BadRequest` body's `error.code` in the chain); no `TIMEOUT_MARKER`. The engine test also asserts the cause names `threads.get(r2)`.
+- `pause_on_first_hit` had no users left and is deleted (it supersedes the Phase 2 entry's mention of it).
+- Bites: (1) up-front `tokio::time::pause()` in `retry_exhausted_is_account` -> fails on the 429 assertion (`left: None, right: Some(429)`, chain reads "transport timeout"). (2) Same in `rate_limit_on_one_thread_fails_the_run` -> fails earlier, on `exhausted.op` (`"threads.list (by label IDs)"` vs `"threads.get"`), because the up-front pause makes sanitize's `threads.list` time out first. Both restored.
+
+### Deviations
+- None.
+
+### Tradeoffs
+- Each hand-driven test adds about 2.2s of wall clock; accepted for proving every attempt reads a real 429.
+
+### Open questions
+- None.

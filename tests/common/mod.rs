@@ -6,10 +6,8 @@
 
 use eratosthenes::gmail::client::GmailClient;
 use serde_json::json;
-use std::sync::Mutex;
-use tokio::sync::oneshot;
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 type Hub = google_gmail1::Gmail<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
@@ -135,39 +133,6 @@ pub async fn requests_to(server: &MockServer, method: &str, path: &str) -> usize
         .count()
 }
 
-/// Answers with `response` and, on the FIRST request, freezes the test
-/// runtime's clock. A paused clock auto-advances whenever the runtime would
-/// park, including while an HTTP response is in flight, so pausing up front
-/// turns every request into a `REQUEST_TIMEOUT`. Pausing at the first hit lets
-/// everything before it run on real I/O and the retry ladder after it run on
-/// virtual time. Must be built inside the test's (current-thread) runtime.
-pub struct PauseOnFirstHit {
-    response: ResponseTemplate,
-    signal: Mutex<Option<oneshot::Sender<()>>>,
-}
-
-pub fn pause_on_first_hit(response: ResponseTemplate) -> PauseOnFirstHit {
-    let (tx, rx) = oneshot::channel();
-    tokio::spawn(async move {
-        if rx.await.is_ok() {
-            tokio::time::pause();
-        }
-    });
-    PauseOnFirstHit {
-        response,
-        signal: Mutex::new(Some(tx)),
-    }
-}
-
-impl Respond for PauseOnFirstHit {
-    fn respond(&self, _request: &Request) -> ResponseTemplate {
-        if let Some(tx) = self.signal.lock().expect("signal lock").take() {
-            let _ = tx.send(());
-        }
-        self.response.clone()
-    }
-}
-
 /// Virtual time that only moves when the test says so, so EVERY retry attempt
 /// gets its real HTTP answer. Pauses the clock, then spawns a task that stays
 /// runnable (a `yield_now` loop), which keeps tokio from auto-advancing while a
@@ -188,4 +153,15 @@ pub fn drive_clock_manually() -> tokio::task::JoinHandle<()> {
             tokio::time::advance(std::time::Duration::from_secs(1)).await;
         }
     })
+}
+
+/// `error.code` of the first `BadRequest` body in `err`'s chain: what the last
+/// attempt actually read. `None` means it never got a Gmail answer (a timeout
+/// or transport failure).
+pub fn gmail_error_code(err: &eyre::Report) -> Option<u64> {
+    err.chain()
+        .find_map(|e| match e.downcast_ref::<google_gmail1::Error>() {
+            Some(google_gmail1::Error::BadRequest(body)) => body["error"]["code"].as_u64(),
+            _ => None,
+        })
 }
