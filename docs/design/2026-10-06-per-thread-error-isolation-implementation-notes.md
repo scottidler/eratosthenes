@@ -59,3 +59,19 @@
 
 ### Open questions
 - None.
+
+## Phase 2 follow-up: Phase 0 429 test
+### Design decisions
+- `rate_limit_is_retried_under_the_paused_clock` (`tests/wiremock_seam.rs`) now runs on `drive_clock_manually` (`tests/common/mod.rs`). That helper pauses the clock and spawns a task that stays runnable in a `yield_now` loop, so tokio never auto-advances while a response is in flight, and steps virtual time 1s per 50ms of real time. Every attempt reads its 429; the backoffs (38s virtual) take about 2.2s of real time.
+- The test now asserts: more than 1 request; `RetryExhausted` present; recorded requests == `RetryExhausted.attempts`; the chain's `BadRequest` body has `error.code == 429`; no `TIMEOUT_MARKER` in `{:#}`.
+- Bites: (1) 429 made non-retryable in `json_error_is_retryable` -> the test fails on "a 429 must be retried" after 1 request. (2) The old up-front `tokio::time::pause()` put back -> the test fails with `left: None, right: Some(429)` and the timeout message in the chain, which proves the new assertion catches the old defect. Both restored.
+
+### Deviations
+- None.
+
+### Tradeoffs
+- Clock driven by hand vs `pause_on_first_hit`: `pause_on_first_hit` still turns attempts 2-5 into timeouts once paused, so it cannot prove every attempt read a 429. Hand-driving costs about 2s of wall clock per test. The 50ms step gives a localhost answer 30 steps (1.5s real) before `REQUEST_TIMEOUT` could fire.
+- `pause_on_first_hit` is kept for the Phase 2 tests (`retry_exhausted_is_account`, `rate_limit_on_one_thread_fails_the_run`). Those assert only Account scope / `RetryExhausted`, which holds whatever the last attempt's cause was.
+
+### Open questions
+- None.

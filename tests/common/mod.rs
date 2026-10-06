@@ -167,3 +167,25 @@ impl Respond for PauseOnFirstHit {
         self.response.clone()
     }
 }
+
+/// Virtual time that only moves when the test says so, so EVERY retry attempt
+/// gets its real HTTP answer. Pauses the clock, then spawns a task that stays
+/// runnable (a `yield_now` loop), which keeps tokio from auto-advancing while a
+/// response is in flight, and steps the clock 1s per `STEP_REAL` of real time.
+/// A localhost answer lands in milliseconds, far inside the 30
+/// steps a `REQUEST_TIMEOUT` would take, while the 1/2/5/10/20s backoffs
+/// elapse in about 2s of real time. Must be called inside the test's
+/// (current-thread) runtime, after any real-time setup.
+pub fn drive_clock_manually() -> tokio::task::JoinHandle<()> {
+    const STEP_REAL: std::time::Duration = std::time::Duration::from_millis(50);
+    tokio::time::pause();
+    tokio::spawn(async {
+        loop {
+            let started = std::time::Instant::now();
+            while started.elapsed() < STEP_REAL {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+    })
+}
