@@ -16,3 +16,21 @@
 
 ### Open questions
 - None.
+
+## Phase 1: Retry hygiene
+### Design decisions
+- `with_retry` keeps the last retryable error and returns `Err(last_err.wrap_err(RetryExhausted { op, attempts }))` - `src/gmail/rate.rs:with_retry` - the cause stays in the chain, so `{:#}` shows it and `downcast_ref::<RetryExhausted>()` finds the marker.
+- `RetryExhausted` Display is `{op} exhausted {attempts} attempts` - `src/gmail/rate.rs` - the old "failed after {} retries" wording is gone, as the success criterion's `rg` requires.
+- The impossible no-attempts case (`MAX_RETRIES == 0`) bails with its own message rather than `unwrap`/`unreachable!` - fail loudly without a panic.
+- Inverted the old `test_with_retry_times_out_a_hanging_call_and_retries_it` assertion that pinned `"after 5 retries"`; it now asserts `RetryExhausted` plus the timeout cause surviving.
+- New tests: DNS-error exhaustion (cause + marker + attempt count) and permanent error is not marked exhausted. Bite verified: restoring the `eyre::bail!` made the DNS test and the inverted timeout test fail.
+
+### Deviations
+- Backoff log reads `[retry] backing off {n}s after failed attempt {k}` instead of the doc's `before attempt {k}`: `backoff` also sleeps after the final failed attempt, where no next attempt exists, so "before attempt 6" would be false. Same intent (drop "Rate limited").
+- DNS test is a unit test in rate.rs with a `google_gmail1::Error::Io` carrying a "dns error" message, not wiremock: a real DNS failure cannot be produced through the mock server.
+
+### Tradeoffs
+- Unit test with a synthetic retryable error vs the wiremock harness: wiremock cannot emit transport-level DNS errors; the unit test hits exactly the code under change.
+
+### Open questions
+- None.

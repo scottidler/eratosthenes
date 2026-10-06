@@ -54,9 +54,9 @@ impl RateLimiter {
     pub async fn backoff(&self, attempt: u32) {
         let wait = backoff_secs(attempt);
         log::warn!(
-            "Rate limited, backing off for {}s (attempt {})",
+            "[retry] backing off {}s after failed attempt {}",
             wait,
-            attempt
+            attempt + 1
         );
         sleep(Duration::from_secs(wait)).await;
     }
@@ -200,6 +200,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = eyre::Result<T>>,
 {
+    let mut last_err: Option<eyre::Report> = None;
     for attempt in 0..MAX_RETRIES {
         // The timeout is what puts the TRANSPORT inside this retry loop. An
         // unbounded call yields no error, so `is_retryable` never runs and the
@@ -229,13 +230,36 @@ where
                         e
                     );
                     limiter.backoff(attempt).await;
+                    last_err = Some(e);
                 } else {
                     return Err(e);
                 }
             }
         }
     }
-    eyre::bail!("{} failed after {} retries", op_name, MAX_RETRIES)
+    // Keep the cause: the journal used to say only "failed after 5 retries".
+    match last_err {
+        Some(e) => Err(e.wrap_err(RetryExhausted {
+            op: op_name.to_string(),
+            attempts: MAX_RETRIES,
+        })),
+        None => eyre::bail!("{} ran zero attempts (MAX_RETRIES is 0)", op_name),
+    }
+}
+
+/// Context wrapped onto the last error when the retry ladder is exhausted.
+/// Callers find it with `report.downcast_ref::<RetryExhausted>()`; the cause
+/// stays in the chain, so `{:#}` renders both.
+#[derive(Debug)]
+pub struct RetryExhausted {
+    pub op: String,
+    pub attempts: u32,
+}
+
+impl std::fmt::Display for RetryExhausted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} exhausted {} attempts", self.op, self.attempts)
+    }
 }
 
 #[cfg(test)]
@@ -405,7 +429,11 @@ mod tests {
         .await;
 
         let err = result.expect_err("a call that never answers must not succeed");
-        assert!(format!("{err:#}").contains("after 5 retries"), "{err:#}");
+        assert!(err.downcast_ref::<RetryExhausted>().is_some(), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(TIMEOUT_MARKER),
+            "the timeout cause must survive exhaustion: {err:#}"
+        );
         assert_eq!(
             attempts.load(Ordering::Relaxed),
             MAX_RETRIES,
@@ -478,5 +506,46 @@ mod tests {
             worst_case_call_duration() > REQUEST_TIMEOUT,
             "a bound sized from REQUEST_TIMEOUT alone would kill a run about to succeed"
         );
+    }
+
+    /// Every attempt hits a DNS error: the exhausted report keeps the cause and
+    /// is identifiable as retry exhaustion. Virtual time skips the backoffs.
+    #[tokio::test(start_paused = true)]
+    async fn test_with_retry_exhaustion_keeps_the_dns_cause() {
+        let limiter = RateLimiter::new();
+        let calls = AtomicU32::new(0);
+        let err = with_retry(&limiter, "threads.get(abc)", || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            async {
+                Err::<(), _>(eyre::Report::new(google_gmail1::Error::Io(
+                    std::io::Error::other("dns error: failed to lookup address information"),
+                )))
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(calls.load(Ordering::Relaxed), MAX_RETRIES);
+        assert!(format!("{err:#}").contains("dns error"), "{err:#}");
+        let exhausted = err
+            .downcast_ref::<RetryExhausted>()
+            .expect("RetryExhausted");
+        assert_eq!(exhausted.attempts, MAX_RETRIES);
+        assert_eq!(exhausted.op, "threads.get(abc)");
+    }
+
+    /// A permanent error returns on the first attempt and is NOT marked as
+    /// exhaustion.
+    #[tokio::test(start_paused = true)]
+    async fn test_with_retry_permanent_error_is_not_retry_exhausted() {
+        let limiter = RateLimiter::new();
+        let err = with_retry(&limiter, "threads.get(abc)", || async {
+            Err::<(), _>(eyre::Report::new(google_gmail1::Error::BadRequest(
+                serde_json::json!({ "error": { "code": 400, "status": "FAILED_PRECONDITION" } }),
+            )))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.downcast_ref::<RetryExhausted>().is_none());
     }
 }
