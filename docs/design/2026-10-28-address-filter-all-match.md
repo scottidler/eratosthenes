@@ -172,20 +172,21 @@ No rule in either config means "I am among the recipients", so nothing loses int
 
 #### Phase 3: Ship, prove live, undo the mis-pins
 **Model:** sonnet (operator steps, run in the main session)
-- Release with `bump release` on talos (`bump --gates`: ungated -> shipit path). It installs on talos only.
-- Install on ripr: in `~/repos/scottidler/eratosthenes` (checkout at v0.7.5 today), `git pull`, then `otto install` (`cargo install --path .`). The 5-minute timer picks up the new binary on its next run.
+- Release on ripr with `bump release` (`bump --gates`: ungated -> shipit path). ripr holds both this checkout and the live service, so the one command pushes, waits for CI, tags, and runs `cargo install` into `~/.cargo/bin/eratosthenes`. All three systemd units exec that path, and the 5-minute timer picks up the new binary on its next run.
 - Prove it on ripr: `eratosthenes --version` reports the release; the next scheduled run logs no errors.
-- Prove the matcher live with a probe message. `--version` passes with the old matcher too. The 7 historical messages carry the marker, so they are never re-checked. And on 2026-10-28 every unread `only-me-ttv` candidate had a non-empty Cc, so `cc: []` rejects them under either matcher. Steps:
-  - `gws gmail users messages insert` a message into the mailbox (sends nothing) with labels `INBOX`, `UNREAD`: From `scott.idler@tatari.tv`, To `scott.idler@tatari.tv, scott.idler+allmatch@tatari.tv`, no Cc.
-  - Run `eratosthenes --log-level trace run --dry-run tatari` on talos with the new binary. Stop it once `~/.local/share/eratosthenes/logs/tatari.log` shows `[filter:only-me-ttv] N matched`; the message filters finish in seconds, and the state pass after them is irrelevant.
-  - Read the probe's `checking` line and the `matched` count, then `gws gmail users messages trash` the probe.
-- Undo the two standing mis-pins with `gws gmail users messages modify`:
-  - remove `IMPORTANT` from 1a169fca93964cba (only eratosthenes set it: `plan_pin_ids` skips threads already IMPORTANT, so Gmail had not marked it)
-  - remove `STARRED` from 1a17dbe10e40e04d (set by `only-me-vip` at 10-27 14:23)
+- Prove the matcher live with a probe message, inserted AFTER the install: the timer running v0.7.5 would really pin it. `--version` passes with the old matcher too. The 7 historical messages carry the marker, so they are never re-checked. And on 2026-10-28 every unread `only-me-ttv` candidate had a non-empty Cc, so `cc: []` rejects them under either matcher. Steps, all on ripr:
+  - Write an RFC 822 message with From `scott.idler@tatari.tv`, To `scott.idler@tatari.tv, scott.idler+allmatch@tatari.tv`, no Cc, and a unique Subject `eratosthenes all-match probe <unix-ts>`. Base64url-encode it as `RAW`.
+  - `gws gmail users messages insert --params '{"userId":"me"}' --json '{"raw":"<RAW>","labelIds":["INBOX","UNREAD"]}'`. This writes into the mailbox and sends nothing. Capture `id` from the response as `PROBE`.
+  - Run `eratosthenes --log-level trace run --dry-run tatari`. Stop it once `~/.local/share/eratosthenes/logs/tatari.log` shows `[filter:only-me-ttv] N matched`; the message filters finish in seconds, and the state pass after them is irrelevant.
+  - Read the `[filter:only-me-ttv] checking <PROBE>` line, and confirm no `[filter:only-me-ttv] MATCH: eratosthenes all-match probe <unix-ts>` line follows it. The `N matched` count covers every candidate, so it is not the check.
+  - `gws gmail users messages trash --params '{"userId":"me","id":"<PROBE>"}'`.
+- Undo the two standing mis-pins:
+  - `gws gmail users messages modify --params '{"userId":"me","id":"1a169fca93964cba"}' --json '{"removeLabelIds":["IMPORTANT"]}'` (only eratosthenes set it: `plan_pin_ids` skips threads already IMPORTANT, so Gmail had not marked it)
+  - `gws gmail users messages modify --params '{"userId":"me","id":"1a17dbe10e40e04d"}' --json '{"removeLabelIds":["STARRED"]}'` (set by `only-me-vip` at 10-27 14:23)
 - **Success criteria:**
-  - `ssh ripr.lan 'eratosthenes --version'` prints the release version.
-  - The probe dry run logs the probe's `[filter:only-me-ttv] checking` line, then `[filter:only-me-ttv] 0 matched`.
-  - `gws gmail users messages get` for 1a169fca93964cba returns `labelIds` without `IMPORTANT`; for 1a17dbe10e40e04d, without `STARRED`.
+  - `eratosthenes --version` on ripr prints the release version.
+  - The probe dry run logs the probe's `[filter:only-me-ttv] checking` line and no `[filter:only-me-ttv] MATCH:` line for the probe's Subject.
+  - `gws gmail users messages get --params '{"userId":"me","id":"<id>","format":"minimal"}'` returns `labelIds` without `IMPORTANT` for 1a169fca93964cba, and without `STARRED` for 1a17dbe10e40e04d.
 
 ## Acceptance Criteria
 
@@ -195,10 +196,10 @@ No rule in either config means "I am among the recipients", so nothing loses int
   - Observed on main: `test result: ok. 9 passed; 0 failed; ... 319 filtered out`. The revert half cannot run until Phase 2 adds `.all(`.
 - [ ] `otto ci` exits 0.
   - Observed on main: exit 1, `check` task, clippy `trailing semicolon in macro used in expression position` x3 (eyre 0.6.12 `bail!` on rustc 1.99.1). Phase 1 fixes it.
-- [ ] `ssh ripr.lan 'eratosthenes --version'` prints the release that carries this change, not `v0.7.5`.
+- [ ] `eratosthenes --version` on ripr prints the release that carries this change, not `v0.7.5`.
   - Observed on main: `eratosthenes v0.7.5`.
-- [ ] The Phase 3 probe dry run logs `[filter:only-me-ttv] checking <probe> to=["scott.idler@tatari.tv", "scott.idler+allmatch@tatari.tv"] cc=[]`, then `[filter:only-me-ttv] 0 matched`.
-  - Observed on main (v0.7.5, 2026-10-28 21:33 UTC, probe 1a1846edca454fca, trashed after): `[filter:only-me-ttv] checking 1a1846edca454fca to=["scott.idler@tatari.tv", "scott.idler+allmatch@tatari.tv"] cc=[] from=["scott.idler@tatari.tv"]` then `[filter:only-me-ttv] 1 matched (total claimed: 1)`. Any-match claims it; that is the bug.
+- [ ] The Phase 3 probe dry run logs `[filter:only-me-ttv] checking <probe> to=["scott.idler@tatari.tv", "scott.idler+allmatch@tatari.tv"] cc=[]`, and no `[filter:only-me-ttv] MATCH: eratosthenes all-match probe <unix-ts>` line follows it.
+  - Observed on main (v0.7.5, 2026-10-28 21:33 UTC, probe 1a1846edca454fca, trashed after): `[filter:only-me-ttv] checking 1a1846edca454fca to=["scott.idler@tatari.tv", "scott.idler+allmatch@tatari.tv"] cc=[] from=["scott.idler@tatari.tv"]` then `[filter:only-me-ttv] MATCH: eratosthenes all-match probe (from: scott.idler@tatari.tv)`. Any-match claims it; that is the bug. (That probe predates the unique-Subject rule; its subject was `eratosthenes all-match probe`.)
 - [ ] `gws gmail users messages get` returns `labelIds` without `IMPORTANT` for 1a169fca93964cba and without `STARRED` for 1a17dbe10e40e04d.
   - Observed on main: 1a169fca93964cba `["IMPORTANT","Label_63","Label_64","Label_69","CATEGORY_PERSONAL","INBOX"]`; 1a17dbe10e40e04d `["UNREAD","STARRED","Label_63","CATEGORY_PERSONAL","INBOX"]`.
 

@@ -29,3 +29,18 @@
 - Code restored after each; `otto ci` on the restored code exits 0.
 ### Open questions
 - None.
+
+## Finalization: implementation audit fold-in
+
+### Design decisions
+- Phase 3 runs entirely on ripr: the checkout and the live service are on the same host, so `bump release` installs straight into the path the systemd units exec. The doc had assumed talos for the release and the probe.
+
+### Deviations
+- Probe success check changed from `[filter:only-me-ttv] 0 matched` to "no `MATCH: <unique probe subject>` line": the count covers every candidate, so an unrelated sole-recipient mail could fail a correct build. Doc defect, not a code change.
+- Every `gws` call in Phase 3 now carries its `--params`/`--json` body; a bare `get` returns 400 (missing `userId`).
+
+### Tradeoffs
+- Probe inserted after the install, not before: the timer still running v0.7.5 would pin it for real.
+
+### Open questions
+- None.
