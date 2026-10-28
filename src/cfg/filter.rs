@@ -60,16 +60,25 @@ pub struct MessageFilter {
 }
 
 impl AddressFilter {
+    /// Every address in the header must match at least one pattern; an empty pattern
+    /// list means the header must be empty. An empty header never satisfies a
+    /// non-empty pattern list, so a header that parsed to no addresses fails closed.
+    /// Applies to parsed addresses only: a segment the parser drops is never checked.
     pub fn matches(&self, emails: &[String]) -> bool {
-        for pat in &self.patterns {
-            let matcher = Glob::new(pat).expect("invalid glob").compile_matcher();
-            for email in emails {
-                if matcher.is_match(email) {
-                    return true;
-                }
-            }
+        if self.patterns.is_empty() {
+            return emails.is_empty();
         }
-        false
+        if emails.is_empty() {
+            return false;
+        }
+        let matchers: Vec<_> = self
+            .patterns
+            .iter()
+            .map(|p| Glob::new(p).expect("invalid glob").compile_matcher())
+            .collect();
+        emails
+            .iter()
+            .all(|e| matchers.iter().any(|m| m.is_match(e)))
     }
 }
 
@@ -97,34 +106,22 @@ impl MessageFilter {
             return false;
         }
 
-        if let Some(ref af) = self.to {
-            if af.patterns.is_empty() {
-                if !to.is_empty() {
-                    return false;
-                }
-            } else if !af.matches(to) {
-                return false;
-            }
+        if let Some(ref af) = self.to
+            && !af.matches(to)
+        {
+            return false;
         }
 
-        if let Some(ref af) = self.cc {
-            if af.patterns.is_empty() {
-                if !cc.is_empty() {
-                    return false;
-                }
-            } else if !af.matches(cc) {
-                return false;
-            }
+        if let Some(ref af) = self.cc
+            && !af.matches(cc)
+        {
+            return false;
         }
 
-        if let Some(ref af) = self.from {
-            if af.patterns.is_empty() {
-                if !from.is_empty() {
-                    return false;
-                }
-            } else if !af.matches(from) {
-                return false;
-            }
+        if let Some(ref af) = self.from
+            && !af.matches(from)
+        {
+            return false;
         }
 
         if !self.subject.is_empty() {
@@ -330,6 +327,146 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    fn addrs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn addr_filter(patterns: &[&str]) -> AddressFilter {
+        AddressFilter {
+            patterns: addrs(patterns),
+        }
+    }
+
+    fn address_only_filter(
+        to: Option<AddressFilter>,
+        cc: Option<AddressFilter>,
+        from: Option<AddressFilter>,
+    ) -> MessageFilter {
+        MessageFilter {
+            name: "test".to_string(),
+            to,
+            cc,
+            from,
+            subject: vec![],
+            labels: LabelsFilter::default(),
+            headers: HashMap::new(),
+            actions: vec![FilterAction::Star],
+        }
+    }
+
+    #[test]
+    fn test_address_filter_all_addresses_must_match() {
+        let filter = addr_filter(&["me@x"]);
+        assert!(filter.matches(&addrs(&["me@x"])));
+        assert!(!filter.matches(&addrs(&["me@x", "other@y"])));
+    }
+
+    #[test]
+    fn test_address_filter_glob_all_match() {
+        let filter = addr_filter(&["*@x"]);
+        assert!(filter.matches(&addrs(&["a@x", "b@x"])));
+        assert!(!filter.matches(&addrs(&["a@x", "b@y"])));
+    }
+
+    #[test]
+    fn test_address_filter_multi_pattern() {
+        let filter = addr_filter(&["a@x", "b@x"]);
+        assert!(filter.matches(&addrs(&["b@x", "a@x"])));
+    }
+
+    #[test]
+    fn test_address_filter_empty_header_fails() {
+        let filter = addr_filter(&["me@x"]);
+        assert!(!filter.matches(&[]));
+    }
+
+    #[test]
+    fn test_address_filter_empty_patterns() {
+        let filter = addr_filter(&[]);
+        assert!(filter.matches(&[]));
+        assert!(!filter.matches(&addrs(&["a@x"])));
+    }
+
+    #[test]
+    fn test_address_filter_duplicates_match() {
+        let filter = addr_filter(&["me@x"]);
+        assert!(filter.matches(&addrs(&["me@x", "me@x"])));
+    }
+
+    #[test]
+    fn test_message_filter_only_me_rejects_group_send() {
+        let filter = address_only_filter(
+            Some(addr_filter(&["scott"])),
+            Some(addr_filter(&[])),
+            Some(addr_filter(&["*@x"])),
+        );
+        let from = addrs(&["sender@x"]);
+        let empty: Vec<String> = vec![];
+        let group: Vec<String> = (0..38)
+            .map(|i| format!("person{i}@x"))
+            .chain(std::iter::once("scott".to_string()))
+            .collect();
+        assert_eq!(group.len(), 39);
+        assert!(!filter.matches(&group, &empty, &from, "Test", &[], &HashMap::new(), ""));
+        assert!(filter.matches(
+            &addrs(&["scott"]),
+            &empty,
+            &from,
+            "Test",
+            &[],
+            &HashMap::new(),
+            ""
+        ));
+    }
+
+    #[test]
+    fn test_message_filter_cc_patterns_all_match() {
+        let filter = address_only_filter(None, Some(addr_filter(&["*@x"])), None);
+        let empty: Vec<String> = vec![];
+        assert!(!filter.matches(
+            &empty,
+            &addrs(&["a@x", "b@y"]),
+            &empty,
+            "Test",
+            &[],
+            &HashMap::new(),
+            ""
+        ));
+        assert!(filter.matches(
+            &empty,
+            &addrs(&["a@x", "b@x"]),
+            &empty,
+            "Test",
+            &[],
+            &HashMap::new(),
+            ""
+        ));
+    }
+
+    #[test]
+    fn test_message_filter_from_all_match() {
+        let filter = address_only_filter(None, None, Some(addr_filter(&["machine@x"])));
+        let empty: Vec<String> = vec![];
+        assert!(!filter.matches(
+            &empty,
+            &empty,
+            &addrs(&["machine@x", "amit@x"]),
+            "Test",
+            &[],
+            &HashMap::new(),
+            ""
+        ));
+        assert!(filter.matches(
+            &empty,
+            &empty,
+            &addrs(&["machine@x"]),
+            "Test",
+            &[],
+            &HashMap::new(),
+            ""
+        ));
+    }
 
     #[test]
     fn test_address_filter_matches_exact() {

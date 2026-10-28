@@ -139,7 +139,8 @@ max-skipped-threads: 10
 # unique name; ALL of its conditions must match (logical AND); first match wins.
 # Address fields accept a single glob, a list of globs, or an empty list `[]`
 # meaning "this field must be empty". Glob syntax: '*' matches anything.
-#   to / cc / from : match recipients/senders   (cc: []  ==  "no CC at all")
+#   to / cc / from : match when EVERY address in the header matches one of the
+#                    globs, so `to: [me]` means only me; (cc: []  ==  "no CC at all")
 #   subject        : list of globs matched against the subject line
 #   label          : Gmail label(s) the message must already carry
 #   headers        : map of header -> globs;  `[]`  ==  "this header must be ABSENT"
