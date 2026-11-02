@@ -3,6 +3,7 @@
 **Author:** Scott Idler
 **Date:** 2026-11-01
 **Status:** Implemented
+**Shipped in:** v0.7.7
 **Review Passes Completed:** 5/5
 
 ## Summary
@@ -234,14 +235,18 @@ pub async fn execute(client, config, prefix, dry_run, mark_only, cache: &mut Thr
 
 ## Acceptance Criteria
 
-- [ ] **1.** `cargo test --test state_cache` passes, including "run 2 makes 0 GET threads/{id} requests"
+- [x] **1.** `cargo test --test state_cache` passes, including "run 2 makes 0 GET threads/{id} requests"
   - Observed on main: not runnable, `tests/state_cache.rs` does not exist (Phase 3 creates it)
-- [ ] **2.** `rg -c 'max_results\(500\)' src/gmail/client.rs` returns >= 1
+  - Observed on v0.7.7 (2026-11-01): `8 passed; 0 failed`
+- [x] **2.** `rg -c 'max_results\(500\)' src/gmail/client.rs` returns >= 1
   - Observed on main: no output (0 matching lines)
-- [ ] **3.** After install on ripr, `ls ~/.cache/eratosthenes/tatari.json` exists, and the second run's `[state] ... hits=H fetched=F` line in `tatari.log` has `F < H`
+  - Observed on v0.7.7 (2026-11-01): `1`
+- [x] **3.** After install on ripr, `ls ~/.cache/eratosthenes/tatari.json` exists, and the second run's `[state] ... hits=H fetched=F` line in `tatari.log` has `F < H`
   - Observed on main: `ls: cannot access '/home/saidler/.cache/eratosthenes': No such file or directory`; no `hits=` line exists
-- [ ] **4.** Over one hour after install, `journalctl --user -u eratosthenes.service` shows >= 10 runs ending in `Finished` (none `Failed`), and no run whose `Starting` lands in the same second as the previous `Finished` (runs no longer chain). The run count keeps a stopped service from passing trivially
+  - Observed on ripr, v0.7.7 (2026-11-01): `tatari.json` exists (460 entries); run 1 `active=463 hits=0 fetched=463 dropped=3 pages=1`, run 2 `active=463 hits=460 fetched=3 dropped=3 pages=1`. A reply on cached thread `1a16ab6a9196b7ac` logged `reason=changed` on the next run (closes the Phase 0 gap)
+- [x] **4.** Over one hour after install, `journalctl --user -u eratosthenes.service` shows >= 10 runs ending in `Finished` (none `Failed`), and no run whose `Starting` lands in the same second as the previous `Finished` (runs no longer chain). The run count keeps a stopped service from passing trivially
   - Observed on main (2026-11-01 15:00-17:25, awk over `-o short-iso`): `21 of 28 starts landed in the same second as the previous Finished`, e.g. `17:13:54 Finished` -> `17:13:54 Starting`
+  - Observed on ripr, v0.7.7 (2026-11-01 23:12 to 00:12): `starts=12 finished=12 failed=0 chained=0`; steady-state runs take 2-4s
 - [ ] **5.** For the first full calendar day after install, that day's rotated log (`zgrep -ac '"code":429' ~/.local/share/eratosthenes/logs/tatari.log.1.gz`, run the following day) returns 0
   - Observed on main: `grep -ac '"code":429' tatari.log` for 2026-11-01 (not yet rotated) returns `60`. The prior seven rotated days returned 0,0,0,0,1,0,0: this criterion guards against regression, the headroom claim is criterion 3
 
