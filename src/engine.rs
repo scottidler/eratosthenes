@@ -2270,6 +2270,8 @@ mod tests {
         let resolver = state_resolver();
         let thread = GmailThread {
             id: "t1".to_string(),
+            history_id: None,
+            skipped_messages: 0,
             messages: vec![msg_at(
                 "m1",
                 "t1",

@@ -65,7 +65,12 @@ impl GmailMessage {
 
 pub struct GmailThread {
     pub id: String,
+    /// The thread's `historyId` as of this fetch; `None` if the API omitted it.
+    pub history_id: Option<u64>,
     pub messages: Vec<GmailMessage>,
+    /// Malformed messages `get_thread` dropped. Nonzero means `messages` is a
+    /// partial view and the derived facts must not be cached.
+    pub skipped_messages: usize,
 }
 
 impl GmailThread {
@@ -157,6 +162,8 @@ mod tests {
     fn test_gmail_thread_is_read() {
         let thread = GmailThread {
             id: "t1".to_string(),
+            history_id: None,
+            skipped_messages: 0,
             messages: vec![
                 GmailMessage {
                     id: "m1".to_string(),
@@ -193,6 +200,8 @@ mod tests {
 
         let thread = GmailThread {
             id: "t1".to_string(),
+            history_id: None,
+            skipped_messages: 0,
             messages: vec![
                 GmailMessage {
                     id: "m1".to_string(),

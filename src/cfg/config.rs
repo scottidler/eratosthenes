@@ -37,6 +37,18 @@ pub fn xdg_data_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".local").join("share"))
 }
 
+/// XDG cache dir, honoring `$XDG_CACHE_HOME` and falling back to `$HOME/.cache`.
+/// Same reasoning as `xdg_data_dir`: `dirs::cache_dir` returns `~/Library/Caches` on macOS.
+pub fn xdg_cache_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("XDG_CACHE_HOME") {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    dirs::home_dir().map(|h| h.join(".cache"))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct AuthConfig {

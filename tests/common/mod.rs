@@ -53,6 +53,7 @@ pub fn thread_body(thread_id: &str) -> serde_json::Value {
 pub fn thread_body_with_labels(thread_id: &str, label_ids: &[&str]) -> serde_json::Value {
     json!({
         "id": thread_id,
+        "historyId": "1000",
         "messages": [{
             "id": format!("{thread_id}-m1"),
             "threadId": thread_id,
@@ -125,6 +126,20 @@ pub async fn thread_get_requests(server: &MockServer) -> usize {
         .expect("request recording is on by default")
         .iter()
         .filter(|r| r.url.path().starts_with("/gmail/v1/users/me/threads/"))
+        .count()
+}
+
+/// GET-only `threads.get` requests: unlike `thread_get_requests`, excludes
+/// `POST .../threads/{id}/modify` and `/trash`.
+pub async fn thread_get_only_requests(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .expect("request recording is on by default")
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "GET" && r.url.path().starts_with("/gmail/v1/users/me/threads/")
+        })
         .count()
 }
 

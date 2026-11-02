@@ -38,6 +38,8 @@ fn extract_email(from_header: &str) -> String {
 fn thread(id: &str, messages: Vec<GmailMessage>) -> GmailThread {
     GmailThread {
         id: id.to_string(),
+        history_id: None,
+        skipped_messages: 0,
         messages,
     }
 }

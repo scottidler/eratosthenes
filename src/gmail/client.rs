@@ -34,6 +34,25 @@ pub struct MessageRef {
     pub thread_id: String,
 }
 
+/// A `threads.list` hit: the thread id plus the `historyId` Gmail stamps on it.
+/// `history_id` moves on every change to the thread, label-only changes
+/// included, which is what lets a caller skip `threads.get` for an unchanged one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadRef {
+    pub id: String,
+    pub history_id: Option<u64>,
+}
+
+/// Everything one paginated `threads.list` walk learned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadList {
+    pub refs: Vec<ThreadRef>,
+    /// List pages fetched, so the wire `maxResults` cap is visible in the run log.
+    pub pages: usize,
+    /// Items the API returned with no `id`, dropped from `refs`.
+    pub skipped_items: usize,
+}
+
 pub struct GmailClient {
     hub: Hub,
     /// Public for the same reason `resolver` is: `create_label_if_missing` is a
@@ -292,6 +311,69 @@ impl GmailClient {
         Ok(all_ids)
     }
 
+    /// `threads.list` keeping the `historyId` each hit carries, at 500 per page
+    /// (Gmail's documented maximum; the default is 100).
+    /// Every page is read with `?`: a failure mid-pagination errors out instead
+    /// of returning a short list, because a caller diffing against a cache would
+    /// read the missing tail as "thread gone".
+    pub async fn list_thread_refs(&self, query: &str) -> Result<ThreadList> {
+        debug!("list_thread_refs: query={}", query);
+        let mut refs: Vec<ThreadRef> = Vec::new();
+        let mut page_token: Option<String> = None;
+        let mut pages = 0usize;
+        let mut skipped_items = 0usize;
+
+        loop {
+            let result = with_retry(&self.limiter, "threads.list", || async {
+                self.limiter.acquire(10).await;
+                let mut call = self
+                    .hub
+                    .users()
+                    .threads_list("me")
+                    .q(query)
+                    .max_results(500)
+                    .add_scope(GMAIL_SCOPE);
+                if let Some(ref token) = page_token {
+                    call = call.page_token(token);
+                }
+                call.doit()
+                    .await
+                    .map(|(_, r)| r)
+                    .context("threads.list failed")
+            })
+            .await?;
+            pages += 1;
+
+            for thread in result.threads.unwrap_or_default() {
+                match thread.id {
+                    Some(id) => refs.push(ThreadRef {
+                        id,
+                        history_id: thread.history_id,
+                    }),
+                    None => skipped_items += 1,
+                }
+            }
+
+            page_token = result.next_page_token;
+            if page_token.is_none() {
+                break;
+            }
+        }
+
+        debug!(
+            "list_thread_refs({}) -> {} refs, {} pages, {} skipped (no id)",
+            query,
+            refs.len(),
+            pages,
+            skipped_items
+        );
+        Ok(ThreadList {
+            refs,
+            pages,
+            skipped_items,
+        })
+    }
+
     pub async fn get_thread(&self, id: &str) -> Result<GmailThread> {
         log::trace!("get_thread: id={}", id);
         let thread = with_retry(&self.limiter, "threads.get", || async {
@@ -312,6 +394,7 @@ impl GmailClient {
         })
         .await?;
 
+        let mut skipped_messages = 0usize;
         let messages = thread
             .messages
             .unwrap_or_default()
@@ -320,6 +403,7 @@ impl GmailClient {
                 Ok(msg) => Some(msg),
                 Err(e) => {
                     warn!("Skipping malformed message in thread {}: {}", id, e);
+                    skipped_messages += 1;
                     None
                 }
             })
@@ -327,7 +411,9 @@ impl GmailClient {
 
         Ok(GmailThread {
             id: thread.id.ok_or_else(|| eyre!("thread missing id"))?,
+            history_id: thread.history_id,
             messages,
+            skipped_messages,
         })
     }
 
