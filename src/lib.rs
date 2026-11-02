@@ -11,7 +11,8 @@ mod skip;
 pub mod slack;
 pub mod triage;
 
-use crate::cfg::config::{Config, load_config};
+use crate::cache::ThreadCache;
+use crate::cfg::config::{Config, load_config, xdg_cache_dir};
 use crate::cfg::state::StateAction;
 use crate::cfg::triage::TriageConfig;
 use crate::digest::{DigestItem, bullets};
@@ -21,7 +22,7 @@ use crate::triage::thread::TriageThread;
 use eyre::{Context, Result};
 use log::{debug, info, warn};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 pub fn load(config_path: &Path) -> Result<Config> {
@@ -114,9 +115,64 @@ pub async fn run(
     }
     client.set_metadata_headers(metadata_headers);
 
-    engine::execute(&mut client, config, &prefix, dry_run, mark_only)
-        .await
-        .map(|_| ())
+    let cache_path = thread_cache_path(account)?;
+    execute_with_cache(
+        &mut client,
+        config,
+        &prefix,
+        dry_run,
+        mark_only,
+        &cache_path,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// `<xdg_cache_dir>/eratosthenes/<account>.json`: one cache file per account,
+/// named like the account's `<account>.yml` and `<account>.log`.
+pub fn thread_cache_path(account: &str) -> Result<PathBuf> {
+    let dir = xdg_cache_dir().ok_or_else(|| {
+        eyre::eyre!("cannot resolve a cache dir: neither $XDG_CACHE_HOME nor $HOME is set")
+    })?;
+    Ok(dir.join("eratosthenes").join(format!("{account}.json")))
+}
+
+/// Load the thread cache, run the engine over it, and save it back whether the
+/// run succeeded or failed, so drops made before an account-scoped error stick.
+/// A failed save is a WARN and never changes the run's result: the cache is an
+/// optimization, and the next run self-heals through the `historyId` diff.
+pub async fn execute_with_cache(
+    client: &mut gmail::client::GmailClient,
+    config: &Config,
+    prefix: &str,
+    dry_run: bool,
+    mark_only: bool,
+    cache_path: &Path,
+) -> Result<engine::RunSummary> {
+    debug!(
+        "{}execute_with_cache: cache_path={}, dry_run={}, mark_only={}",
+        prefix,
+        cache_path.display(),
+        dry_run,
+        mark_only
+    );
+    let mut cache = ThreadCache::load(cache_path);
+    let result = engine::execute(client, config, prefix, dry_run, mark_only, &mut cache).await;
+    match cache.save(cache_path) {
+        Ok(()) => debug!(
+            "{}saved {} cache entries to {}",
+            prefix,
+            cache.len(),
+            cache_path.display()
+        ),
+        Err(e) => warn!(
+            "{}failed to save thread cache {}: {:#}",
+            prefix,
+            cache_path.display(),
+            e
+        ),
+    }
+    result
 }
 
 /// Build and post the pinned-inbox digest for one account. The caller only
@@ -369,4 +425,24 @@ pub async fn triage(account: &str, config: &Config, dry_run: bool, multi: bool) 
 
     let mut client = build_gmail_client(config, &prefix).await?;
     triage::execute(&mut client, config, &prefix, dry_run).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_thread_cache_path_is_one_file_per_account_under_eratosthenes() {
+        let path = thread_cache_path("tatari").expect("cache dir resolves under $HOME");
+        assert!(
+            path.ends_with("eratosthenes/tatari.json"),
+            "{}",
+            path.display()
+        );
+        assert_ne!(
+            thread_cache_path("home").expect("resolves"),
+            path,
+            "accounts never share a cache file"
+        );
+    }
 }

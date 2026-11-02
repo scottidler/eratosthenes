@@ -9,6 +9,7 @@ use common::{
     client_with_labels, drive_clock_manually, failed_precondition, gmail_error_code, rate_limited,
     requests_to, thread_body_with_labels, thread_get_requests,
 };
+use eratosthenes::cache::ThreadCache;
 use eratosthenes::cfg::config::parse_config;
 use eratosthenes::engine::{self, RunSummary};
 use eratosthenes::gmail::client::GmailClient;
@@ -107,7 +108,15 @@ async fn run(
     client: &mut GmailClient,
     config: &eratosthenes::cfg::config::Config,
 ) -> eyre::Result<RunSummary> {
-    engine::execute(client, config, "", false, false).await
+    engine::execute(
+        client,
+        config,
+        "",
+        false,
+        false,
+        &mut ThreadCache::default(),
+    )
+    .await
 }
 
 /// Success criterion 1: one of N threads answers `threads.get` with

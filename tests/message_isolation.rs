@@ -6,6 +6,7 @@
 mod common;
 
 use common::{client_with_labels, failed_precondition, gmail_error_body, requests_to};
+use eratosthenes::cache::ThreadCache;
 use eratosthenes::cfg::config::{Config, parse_config};
 use eratosthenes::engine;
 use serde_json::json;
@@ -222,9 +223,16 @@ async fn failed_label_fetch_drops_every_write_to_that_thread() {
     mount_batch_modify(&server).await;
     let mut client = client_with_labels(&server, LABELS).await;
 
-    let summary = engine::execute(&mut client, &pinning_config(), "", false, false)
-        .await
-        .expect("thread-scoped label-fetch failures must not fail the run");
+    let summary = engine::execute(
+        &mut client,
+        &pinning_config(),
+        "",
+        false,
+        false,
+        &mut ThreadCache::default(),
+    )
+    .await
+    .expect("thread-scoped label-fetch failures must not fail the run");
 
     assert_eq!(summary.skipped, 2);
     let writes = batch_modify_writes(&server).await;
@@ -265,9 +273,16 @@ async fn failed_get_message_skips_only_that_message() {
     mount_batch_modify(&server).await;
     let mut client = client_with_labels(&server, LABELS).await;
 
-    let summary = engine::execute(&mut client, &tag_config(), "", false, false)
-        .await
-        .expect("a thread-scoped messages.get failure must not fail the run");
+    let summary = engine::execute(
+        &mut client,
+        &tag_config(),
+        "",
+        false,
+        false,
+        &mut ThreadCache::default(),
+    )
+    .await
+    .expect("a thread-scoped messages.get failure must not fail the run");
 
     assert_eq!(summary.skipped, 1);
     assert_eq!(summary.messages_matched, 1);
@@ -296,9 +311,16 @@ async fn failed_get_message_is_skipped_under_mark_only() {
     mount_batch_modify(&server).await;
     let mut client = client_with_labels(&server, LABELS).await;
 
-    let summary = engine::execute(&mut client, &tag_config(), "", false, true)
-        .await
-        .expect("a thread-scoped messages.get failure must not fail a mark-only run");
+    let summary = engine::execute(
+        &mut client,
+        &tag_config(),
+        "",
+        false,
+        true,
+        &mut ThreadCache::default(),
+    )
+    .await
+    .expect("a thread-scoped messages.get failure must not fail a mark-only run");
 
     assert_eq!(summary.skipped, 1);
     assert_eq!(
@@ -332,9 +354,16 @@ async fn account_scoped_get_message_error_fails_the_run() {
     mount_batch_modify(&server).await;
     let mut client = client_with_labels(&server, LABELS).await;
 
-    let err = engine::execute(&mut client, &tag_config(), "", false, false)
-        .await
-        .expect_err("an account-scoped messages.get failure must fail the run");
+    let err = engine::execute(
+        &mut client,
+        &tag_config(),
+        "",
+        false,
+        false,
+        &mut ThreadCache::default(),
+    )
+    .await
+    .expect_err("an account-scoped messages.get failure must fail the run");
 
     assert!(format!("{err:#}").contains("messages.get(m2)"), "{err:#}");
     assert_eq!(requests_to(&server, "POST", BATCH_MODIFY).await, 0);

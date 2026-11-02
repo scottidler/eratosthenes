@@ -1,15 +1,17 @@
 use std::collections::{HashMap, HashSet};
 
+use chrono::{DateTime, Utc};
 use eyre::Result;
 use log::{debug, info, trace, warn};
 
+use crate::cache::{CachedThread, ThreadCache};
 use crate::cfg::config::Config;
 use crate::cfg::filter::{FilterAction, MessageFilter};
 use crate::cfg::label::Label;
 use crate::cfg::state::{Clock, StateAction, StateFilter, Ttl};
-use crate::gmail::client::GmailClient;
+use crate::gmail::client::{GmailClient, ThreadRef};
 use crate::gmail::label::{LabelResolver, LabelVisibility, create_label_if_missing};
-use crate::gmail::message::{GmailMessage, GmailThread};
+use crate::gmail::message::GmailMessage;
 use crate::gmail::query::compile_query;
 use crate::skip::SkipLedger;
 
@@ -30,6 +32,7 @@ pub async fn execute(
     prefix: &str,
     dry_run: bool,
     mark_only: bool,
+    cache: &mut ThreadCache,
 ) -> Result<RunSummary> {
     debug!(
         "{}execute: dry_run={}, mark_only={}, message_filters={}, state_filters={}, max_skipped_threads={}",
@@ -113,8 +116,15 @@ pub async fn execute(
     .await?;
 
     info!("{}=== Phase 2: State Filters (Thread Age-Off) ===", prefix);
-    let total_transitioned =
-        execute_state_filters(client, &config.state_filters, &mut skipped, prefix, dry_run).await?;
+    let total_transitioned = execute_state_filters(
+        client,
+        &config.state_filters,
+        &mut skipped,
+        cache,
+        prefix,
+        dry_run,
+    )
+    .await?;
 
     info!(
         "{}Done: {} messages matched filters, {} threads transitioned, {} skipped{}",
@@ -896,18 +906,84 @@ fn log_mark_only_stamps(
     logged
 }
 
+/// The one input a state filter evaluates: a thread's aging facts, whether they
+/// came from a cache hit or a fresh `threads.get`. Same struct either way, so a
+/// hit and a fetch go down the same evaluation path.
+pub struct ThreadState<'a> {
+    pub id: &'a str,
+    /// Raw Gmail label ids, resolved to names at evaluation time.
+    pub label_ids: &'a [String],
+    /// Newest message `internal_date`.
+    pub last_activity: DateTime<Utc>,
+    /// Newest message lacks `UNREAD`.
+    pub is_read: bool,
+}
+
+impl ThreadState<'_> {
+    /// Same resolution `GmailThread::labels_resolved` does: an id the resolver
+    /// does not know stands for itself (system labels like `INBOX`).
+    fn labels_resolved(&self, resolver: &LabelResolver) -> Vec<Label> {
+        self.label_ids
+            .iter()
+            .map(|id| Label::new(resolver.resolve_id(id).unwrap_or(id.as_str())))
+            .collect()
+    }
+}
+
+/// Phase 2's cache counters for one run, logged as one INFO line.
+#[derive(Debug, Default)]
+struct CacheStats {
+    /// Thread refs the active list returned.
+    active: usize,
+    /// Refs evaluated from the cache with no `threads.get`.
+    hits: usize,
+    /// `threads.get` calls made.
+    fetched: usize,
+    /// Cache entries removed: absent from the list, written, or skipped.
+    dropped: usize,
+    /// List pages walked.
+    pages: usize,
+}
+
+/// The cache entry for `thread_ref` if its `historyId` stamp still matches the
+/// list's. Anything else (not cached, a moved stamp, no stamp on the list) is a
+/// miss and gets fetched.
+fn fresh_entry<'c>(cache: &'c ThreadCache, thread_ref: &ThreadRef) -> Option<&'c CachedThread> {
+    let listed = thread_ref.history_id?;
+    cache
+        .get(&thread_ref.id)
+        .filter(|entry| entry.history_id == listed)
+}
+
+/// Why a miss is being fetched, for the per-fetch DEBUG line.
+fn fetch_reason(thread_ref: &ThreadRef, cached: Option<&CachedThread>) -> &'static str {
+    match (thread_ref.history_id, cached) {
+        (None, _) => "no-history-id",
+        (Some(_), None) => "new",
+        (Some(_), Some(_)) => "changed",
+    }
+}
+
+fn drop_entry(cache: &mut ThreadCache, stats: &mut CacheStats, thread_id: &str) {
+    if cache.remove(thread_id).is_some() {
+        stats.dropped += 1;
+    }
+}
+
 async fn execute_state_filters(
     client: &GmailClient,
     state_filters: &[StateFilter],
     skipped: &mut SkipLedger,
+    cache: &mut ThreadCache,
     prefix: &str,
     dry_run: bool,
 ) -> Result<usize> {
     debug!(
-        "{}execute_state_filters: count={}, dry_run={}",
+        "{}execute_state_filters: count={}, dry_run={}, cached={}",
         prefix,
         state_filters.len(),
-        dry_run
+        dry_run,
+        cache.len()
     );
 
     let active_query = build_active_threads_query(state_filters);
@@ -921,31 +997,77 @@ async fn execute_state_filters(
 
     debug!("{}[state] searching active threads...", prefix);
     debug!("{}[state] query: {}", prefix, active_query);
-    let thread_ids = client.list_threads(&active_query).await?;
+    // `?` on the whole walk: a list that fails on any page fails the run here,
+    // before `retain_ids`, so a partial list can never drop live entries.
+    let list = client.list_thread_refs(&active_query).await?;
     debug!(
         "{}[state] {} active threads to evaluate",
         prefix,
-        thread_ids.len()
+        list.refs.len()
     );
+
+    let mut stats = CacheStats {
+        active: list.refs.len(),
+        pages: list.pages,
+        ..CacheStats::default()
+    };
+    let live: HashSet<&str> = list.refs.iter().map(|r| r.id.as_str()).collect();
+    stats.dropped += cache.retain_ids(&live);
 
     let clock = crate::cfg::state::RealClock;
     let stages = derive_stages(state_filters);
     debug!("{}[state] stages={:?}", prefix, stages);
-    let total = thread_ids.len();
+
+    // Logged on the error path too: the counters up to an account-scoped
+    // failure are exactly what the next run's cache was saved with.
+    let result = evaluate_active_threads(
+        client,
+        &list.refs,
+        state_filters,
+        &stages,
+        skipped,
+        cache,
+        &mut stats,
+        prefix,
+        &clock,
+        dry_run,
+    )
+    .await;
+
+    info!(
+        "{}[state] active={} hits={} fetched={} dropped={} pages={}",
+        prefix, stats.active, stats.hits, stats.fetched, stats.dropped, stats.pages
+    );
+    result
+}
+
+/// Per ref: a fresh cache entry is a hit, anything else is a `threads.get`,
+/// then one evaluation path for both. Entries are dropped on a real write, a
+/// skip, or a fetch error; kept on a no-op, a Keep, and a dry-run would-write.
+async fn evaluate_active_threads<C: Clock>(
+    client: &GmailClient,
+    refs: &[ThreadRef],
+    state_filters: &[StateFilter],
+    stages: &[String],
+    skipped: &mut SkipLedger,
+    cache: &mut ThreadCache,
+    stats: &mut CacheStats,
+    prefix: &str,
+    clock: &C,
+    dry_run: bool,
+) -> Result<usize> {
+    let total = refs.len();
     let mut transitioned = 0usize;
 
-    for (i, thread_id) in thread_ids.iter().enumerate() {
+    for (i, thread_ref) in refs.iter().enumerate() {
+        let thread_id = thread_ref.id.as_str();
         if (i + 1) % 50 == 0 {
             trace!("{}[state] [{}/{}] evaluating...", prefix, i + 1, total);
         }
-        trace!(
-            "{}[state] [{}/{}] fetching thread {}",
-            prefix,
-            i + 1,
-            total,
-            thread_id
-        );
         if skipped.contains_thread(thread_id) {
+            // Skipped earlier this run (Phase 0): its entry goes, same as a
+            // Phase 2 skip, so the next run fetches it fresh.
+            drop_entry(cache, stats, thread_id);
             trace!(
                 "{}[state] thread {} already skipped this run, no further writes",
                 prefix, thread_id
@@ -953,22 +1075,78 @@ async fn execute_state_filters(
             continue;
         }
 
+        let hit = fresh_entry(cache, thread_ref).cloned();
+        if hit.is_some() {
+            stats.hits += 1;
+            trace!(
+                "{}[state] [{}/{}] cache hit {}",
+                prefix,
+                i + 1,
+                total,
+                thread_id
+            );
+        } else {
+            stats.fetched += 1;
+            debug!(
+                "{}[state] fetch id={} reason={}",
+                prefix,
+                thread_id,
+                fetch_reason(thread_ref, cache.get(thread_id))
+            );
+        }
+
         // The per-thread boundary: the fetch AND the whole filter walk are one
         // unit. Catching inside `apply_state_action` instead would turn a failed
         // Move into "not acted", and `evaluate_thread` would go on to try later
         // filters, a Delete among them.
         let outcome: std::result::Result<bool, (&str, eyre::Report)> = async {
-            let thread = client
-                .get_thread(thread_id)
-                .await
-                .map_err(|err| ("threads.get", err))?;
+            let (label_ids, last_activity, is_read) = match hit {
+                Some(CachedThread {
+                    label_ids,
+                    last_activity,
+                    is_read,
+                    ..
+                }) => (label_ids, last_activity, is_read),
+                None => {
+                    let thread = client
+                        .get_thread(thread_id)
+                        .await
+                        .map_err(|err| ("threads.get", err))?;
+                    match CachedThread::from_thread(&thread) {
+                        Some(entry) => {
+                            cache.insert(thread_id.to_string(), entry.clone());
+                            (entry.label_ids, entry.last_activity, entry.is_read)
+                        }
+                        None => {
+                            // Not cacheable (empty, no `historyId`, or a partial
+                            // view): any older entry is stale now, and the thread
+                            // is evaluated as before, from the same definitions.
+                            drop_entry(cache, stats, thread_id);
+                            let Some(last_activity) = thread.last_activity() else {
+                                warn!("{}Thread {} has no messages, skipping", prefix, thread_id);
+                                return Ok(false);
+                            };
+                            let mut label_ids: Vec<String> =
+                                thread.label_ids().into_iter().collect();
+                            label_ids.sort();
+                            (label_ids, last_activity, thread.is_read())
+                        }
+                    }
+                }
+            };
+            let state = ThreadState {
+                id: thread_id,
+                label_ids: &label_ids,
+                last_activity,
+                is_read,
+            };
             evaluate_thread(
                 client,
-                &thread,
+                &state,
                 state_filters,
-                &stages,
+                stages,
                 prefix,
-                &clock,
+                clock,
                 dry_run,
             )
             .await
@@ -976,9 +1154,21 @@ async fn execute_state_filters(
         }
         .await;
         match outcome {
-            Ok(true) => transitioned += 1,
+            Ok(true) => {
+                transitioned += 1;
+                // `Ok(true)` in a dry run is a would-write: Gmail is unchanged,
+                // so the entry is still true.
+                if !dry_run {
+                    drop_entry(cache, stats, thread_id);
+                }
+            }
             Ok(false) => {}
-            Err((op, err)) => skipped.skip_thread(thread_id, op, err, prefix)?,
+            Err((op, err)) => {
+                // Before `skip_thread`: it returns early on an account-scoped
+                // error or a blown ceiling, and the drop must survive into the save.
+                drop_entry(cache, stats, thread_id);
+                skipped.skip_thread(thread_id, op, err, prefix)?;
+            }
         }
     }
 
@@ -987,7 +1177,7 @@ async fn execute_state_filters(
 
 async fn evaluate_thread<C: Clock>(
     client: &GmailClient,
-    thread: &GmailThread,
+    thread: &ThreadState<'_>,
     state_filters: &[StateFilter],
     stages: &[String],
     prefix: &str,
@@ -998,12 +1188,8 @@ async fn evaluate_thread<C: Clock>(
     // Per-record: fires once per active thread every run. TRACE, not DEBUG --
     // at the default level this single line grew tatari.log ~48 MiB/day.
     trace!(
-        "{}evaluate_thread: id={}, msgs={}, labels={:?}, is_read={}",
-        prefix,
-        thread.id,
-        thread.messages.len(),
-        thread_labels,
-        thread.is_read()
+        "{}evaluate_thread: id={}, labels={:?}, is_read={}",
+        prefix, thread.id, thread_labels, thread.is_read
     );
 
     for state_filter in state_filters {
@@ -1015,19 +1201,13 @@ async fn evaluate_thread<C: Clock>(
             continue;
         }
 
-        let Some(last_activity) = thread.last_activity() else {
-            warn!("{}Thread {} has no messages, skipping", prefix, thread.id);
-            return Ok(false);
-        };
-
-        let is_read = thread.is_read();
         // Per-record: once per matched thread every run -> TRACE, not DEBUG.
         trace!(
             "{}[thread:{}] matched filter '{}': last_activity={}, is_read={}",
-            prefix, thread.id, state_filter.name, last_activity, is_read
+            prefix, thread.id, state_filter.name, thread.last_activity, thread.is_read
         );
 
-        match state_filter.evaluate_ttl(last_activity, is_read, clock)? {
+        match state_filter.evaluate_ttl(thread.last_activity, thread.is_read, clock)? {
             Some(action) => {
                 let acted = apply_state_action(
                     client,
@@ -1165,7 +1345,7 @@ fn current_stage_index(thread_labels: &[Label], stages: &[String]) -> Option<usi
 
 async fn apply_state_action(
     client: &GmailClient,
-    thread: &GmailThread,
+    thread: &ThreadState<'_>,
     thread_labels: &[Label],
     state_filter: &StateFilter,
     stages: &[String],
@@ -1203,7 +1383,7 @@ async fn apply_state_action(
 
             if !dry_run {
                 client
-                    .modify_thread(&thread.id, &planned.add, &planned.remove)
+                    .modify_thread(thread.id, &planned.add, &planned.remove)
                     .await?;
             }
             Ok(true)
@@ -1214,7 +1394,7 @@ async fn apply_state_action(
                 prefix, state_filter.name, thread.id,
             );
             if !dry_run {
-                client.trash_thread(&thread.id).await?;
+                client.trash_thread(thread.id).await?;
             }
             Ok(true)
         }
@@ -1264,6 +1444,7 @@ mod tests {
     use super::*;
     use crate::cfg::filter::{AddressFilter, LabelsFilter};
     use crate::cfg::state::{StateAction, Ttl};
+    use crate::gmail::message::GmailThread;
     use chrono::DateTime;
 
     fn from_filter(name: &str, patterns: &[&str]) -> MessageFilter {
@@ -2453,5 +2634,87 @@ mod tests {
             logged, 1,
             "only the message actually fetched gets a log line"
         );
+    }
+
+    fn cached(history_id: u64) -> CachedThread {
+        CachedThread {
+            history_id,
+            label_ids: vec!["INBOX".to_string()],
+            last_activity: DateTime::from_timestamp_millis(1_000).expect("valid millis"),
+            is_read: true,
+        }
+    }
+
+    fn thread_ref(id: &str, history_id: Option<u64>) -> ThreadRef {
+        ThreadRef {
+            id: id.to_string(),
+            history_id,
+        }
+    }
+
+    #[test]
+    fn test_fresh_entry_hits_only_on_a_matching_stamp() {
+        let mut cache = ThreadCache::default();
+        cache.insert("t1".to_string(), cached(7));
+
+        assert_eq!(
+            fresh_entry(&cache, &thread_ref("t1", Some(7))),
+            Some(&cached(7))
+        );
+        assert_eq!(fresh_entry(&cache, &thread_ref("t1", Some(8))), None);
+        assert_eq!(
+            fresh_entry(&cache, &thread_ref("t1", None)),
+            None,
+            "a list item with no stamp is never trusted"
+        );
+        assert_eq!(fresh_entry(&cache, &thread_ref("t2", Some(7))), None);
+    }
+
+    #[test]
+    fn test_fetch_reason_names_each_kind_of_miss() {
+        let entry = cached(7);
+        assert_eq!(fetch_reason(&thread_ref("t", Some(1)), None), "new");
+        assert_eq!(
+            fetch_reason(&thread_ref("t", Some(8)), Some(&entry)),
+            "changed"
+        );
+        assert_eq!(
+            fetch_reason(&thread_ref("t", None), Some(&entry)),
+            "no-history-id"
+        );
+        assert_eq!(fetch_reason(&thread_ref("t", None), None), "no-history-id");
+    }
+
+    /// A cached `ThreadState` resolves its raw ids exactly as the fetched
+    /// `GmailThread` does, so a hit and a fetch see the same labels.
+    #[test]
+    fn test_thread_state_resolves_labels_like_the_fetched_thread() {
+        let resolver = state_resolver();
+        let thread = GmailThread {
+            id: "t1".to_string(),
+            history_id: Some(3),
+            skipped_messages: 0,
+            messages: vec![msg_at(
+                "m1",
+                "t1",
+                "noreply@example.com",
+                &["INBOX", "UNREAD", "Label_9", "Label_unknown"],
+                1_000,
+            )],
+        };
+        let entry = CachedThread::from_thread(&thread).expect("cacheable");
+        let state = ThreadState {
+            id: "t1",
+            label_ids: &entry.label_ids,
+            last_activity: entry.last_activity,
+            is_read: entry.is_read,
+        };
+
+        let mut from_state = state.labels_resolved(&resolver);
+        let mut from_thread = thread.labels_resolved(&resolver);
+        from_state.sort_by_key(|l| format!("{l:?}"));
+        from_thread.sort_by_key(|l| format!("{l:?}"));
+        assert_eq!(from_state, from_thread);
+        assert!(from_state.contains(&Label::new("llm/noise")));
     }
 }
