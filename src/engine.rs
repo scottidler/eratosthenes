@@ -999,7 +999,17 @@ async fn execute_state_filters(
     debug!("{}[state] query: {}", prefix, active_query);
     // `?` on the whole walk: a list that fails on any page fails the run here,
     // before `retain_ids`, so a partial list can never drop live entries.
-    let list = client.list_thread_refs(&active_query).await?;
+    let list = match client.list_thread_refs(&active_query).await {
+        Ok(list) => list,
+        Err(e) => {
+            // No counters exist yet; this line stands in for the INFO stats line.
+            warn!(
+                "{}[state] active list failed, cache untouched: {:#}",
+                prefix, e
+            );
+            return Err(e);
+        }
+    };
     debug!(
         "{}[state] {} active threads to evaluate",
         prefix,

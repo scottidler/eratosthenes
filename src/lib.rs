@@ -115,26 +115,36 @@ pub async fn run(
     }
     client.set_metadata_headers(metadata_headers);
 
-    let cache_path = thread_cache_path(account)?;
-    execute_with_cache(
-        &mut client,
-        config,
-        &prefix,
-        dry_run,
-        mark_only,
-        &cache_path,
-    )
-    .await
-    .map(|_| ())
+    match thread_cache_path(account) {
+        Some(cache_path) => execute_with_cache(
+            &mut client,
+            config,
+            &prefix,
+            dry_run,
+            mark_only,
+            &cache_path,
+        )
+        .await
+        .map(|_| ()),
+        None => {
+            // The cache only saves fetches; decisions are identical without it.
+            warn!(
+                "{}no cache dir resolves (neither $XDG_CACHE_HOME nor $HOME): running uncached",
+                prefix
+            );
+            let mut cache = ThreadCache::empty();
+            engine::execute(&mut client, config, &prefix, dry_run, mark_only, &mut cache)
+                .await
+                .map(|_| ())
+        }
+    }
 }
 
 /// `<xdg_cache_dir>/eratosthenes/<account>.json`: one cache file per account,
-/// named like the account's `<account>.yml` and `<account>.log`.
-pub fn thread_cache_path(account: &str) -> Result<PathBuf> {
-    let dir = xdg_cache_dir().ok_or_else(|| {
-        eyre::eyre!("cannot resolve a cache dir: neither $XDG_CACHE_HOME nor $HOME is set")
-    })?;
-    Ok(dir.join("eratosthenes").join(format!("{account}.json")))
+/// named like the account's `<account>.yml` and `<account>.log`. `None` when no
+/// cache dir resolves.
+pub fn thread_cache_path(account: &str) -> Option<PathBuf> {
+    xdg_cache_dir().map(|dir| dir.join("eratosthenes").join(format!("{account}.json")))
 }
 
 /// Load the thread cache, run the engine over it, and save it back whether the

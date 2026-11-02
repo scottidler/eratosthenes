@@ -61,3 +61,21 @@
 
 ### Open questions
 - `thread_cache_path` fails the account run when neither `$XDG_CACHE_HOME` nor `$HOME` resolves. The doc treats the cache as an optimization (save failure is a WARN); confirm a missing cache dir should be loud rather than a WARN and an uncached run
+
+## Implementation audit (round 1) folds
+Panel synthesis: `~/.cache/review-panel/runs/3ImJ8rN7/synthesis.md`. Supersedes the Phase 3 entries named below.
+
+### Design decisions
+- S1 (must-fix): the Phase 3 claim "INFO line is logged on the error path too" did not hold when `list_thread_refs` itself fails, the 429 case this doc targets. `execute_state_filters` (src/engine.rs) now logs WARN `[state] active list failed, cache untouched: <err>` before returning the error. Doc's API Design log bullet amended to name it
+- S2 (cheap-win): the Risks row said a list item with no `historyId` is "never cached". The code caches the fetched thread under `threads.get`'s own stamp; correctness holds because `fresh_entry` never hits without a list stamp. Doc Risks row amended to match the code
+- Q1 (supersedes Phase 3's "thread_cache_path errors"): `thread_cache_path` (src/lib.rs) now returns `Option<PathBuf>`. `None` -> WARN, run with `ThreadCache::empty()`, no save. A missing cache dir never changes a decision, and it used to also kill `--mark-only`, which needs no cache
+- Phase 2 load-guard break-to-prove was done in Phase 2 (version check, skipped-messages, history_id, last_activity, tmp cleanup, rename, parse-error arm), each failing its named test; the evidence was in the phase report and is recorded here
+
+### Deviations
+- None beyond the doc amendments above
+
+### Tradeoffs
+- S1: a distinct WARN line vs an INFO stats line with zeroed counters: zeros would read as an empty active set
+
+### Open questions
+- None.

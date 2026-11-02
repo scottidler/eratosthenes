@@ -146,6 +146,7 @@ pub async fn execute(client, config, prefix, dry_run, mark_only, cache: &mut Thr
 ```
 
 - Log line per run, INFO: `[state] active=N hits=H fetched=F dropped=D pages=P`
+  - a run whose active list fails has no counters yet; it logs WARN `[state] active list failed, cache untouched: <err>` instead (implementation audit S1)
   - `active`: thread refs the list returned
   - `hits`: refs evaluated from the cache with no `threads.get`
   - `fetched`: `threads.get` calls made (new, changed, or `history_id` missing). `hits + fetched = active` minus threads already in the SkipLedger
@@ -310,7 +311,7 @@ pub async fn execute(client, config, prefix, dry_run, mark_only, cache: &mut Thr
 | Manual run overlaps the timer and both save | Low | Low | The unit is `Type=oneshot`, so systemd never overlaps itself; only a hand run can. Per-pid temp file + rename: last writer wins, neither corrupts the other. A stale stamp mismatches the live list and forces a fetch |
 | `maxResults=500` capped lower on the wire | Low | Low | List cost only, never correctness. `pages=P` in the INFO line shows it |
 | Cache file corrupt or from an older version | Low | Low | Load returns empty + WARN; next run rebuilds |
-| `list` omits `historyId` for some thread | Low | Low | `None` always fetches and is never cached |
+| `list` omits `historyId` for some thread | Low | Low | `None` always fetches, so a list with no stamp is never a hit. The fetched thread is still cached under `threads.get`'s own stamp |
 | Engine signature change misses a caller | Low | Low | Compiler; `otto ci` |
 
 ## Open Questions
