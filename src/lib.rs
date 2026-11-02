@@ -2,6 +2,7 @@
 #![deny(dead_code)]
 #![deny(unused_variables)]
 
+pub mod cache;
 pub mod cfg;
 pub mod digest;
 pub mod engine;
