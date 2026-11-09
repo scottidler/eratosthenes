@@ -32,6 +32,7 @@ yup-oauth2 = "12.1.2"
 # Dependencies will be added via cargo add
 
 [build-dependencies]
+build-version = { git = "https://github.com/tatari-tv/build-version-rs", tag = "v0.1.0", version = "0.1.0" }
 
 [dev-dependencies]
 tempfile = "3.27.0"
@@ -42,4 +43,3 @@ tempfile = "3.27.0"
 # that ships.
 tokio = { version = "1.50.0", features = ["full", "test-util"] }
 wiremock = "0.6.5"
-# For build.rs if needed

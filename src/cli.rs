@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "eratosthenes",
     about = "Gmail API-native inbox zero engine",
-    version = env!("GIT_DESCRIBE"),
+    version = env!("BUILD_VERSION"),
     after_help = "\
 REQUIRED CREDENTIALS:
   Google Cloud OAuth2 client secret (Desktop app type)
