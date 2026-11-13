@@ -212,7 +212,6 @@ Description=Eratosthenes Periodic Timer
 [Timer]
 OnBootSec=2min
 OnUnitActiveSec={interval}
-Persistent=true
 
 [Install]
 WantedBy=timers.target
@@ -939,9 +938,10 @@ mod tests {
     fn test_generate_timer() {
         let output = generate_timer("5min");
 
-        assert!(output.contains("OnUnitActiveSec=5min"));
-        assert!(output.contains("OnBootSec=2min"));
-        assert!(output.contains("Persistent=true"));
+        assert!(output.contains("[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n\n[Install]"));
+        // systemd 259 stamps a monotonic-only timer with Persistent= and then never fires
+        // its already-elapsed OnBootSec on re-enable; the line must not come back.
+        assert!(!output.contains("Persistent="));
         assert!(output.contains("WantedBy=timers.target"));
     }
 

@@ -1487,6 +1487,11 @@ fn build_active_threads_query(state_filters: &[StateFilter]) -> String {
 
     for filter in state_filters {
         for label in &filter.labels {
+            // Gmail category labels have no `label:` search form (`category:` is the
+            // operator, and threads there are inbox threads already in the query).
+            if label.to_gmail_id().starts_with("CATEGORY_") {
+                continue;
+            }
             let query = match label {
                 Label::Inbox => "in:inbox".to_string(),
                 Label::Starred => "is:starred".to_string(),
@@ -2207,6 +2212,22 @@ mod tests {
             "marker leaked into the state-filter query: {}",
             query
         );
+    }
+
+    #[test]
+    fn test_build_active_threads_query_skips_category_labels() {
+        let filters = vec![StateFilter {
+            name: "Promotions".to_string(),
+            labels: vec![Label::new("category_promotions")],
+            ttl: Ttl::Days(chrono::Duration::days(1)),
+            action: StateAction::Move(String::new()),
+        }];
+        assert_eq!(filters[0].labels[0].to_gmail_id(), "CATEGORY_PROMOTIONS");
+
+        let query = build_active_threads_query(&filters);
+        assert!(!query.to_lowercase().contains("label:category_"), "{query}");
+        assert!(!query.contains("category:"), "{query}");
+        assert!(query.contains("in:inbox"), "{query}");
     }
 
     #[test]

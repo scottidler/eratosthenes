@@ -128,3 +128,21 @@ None.
 - Sweep skips go into the shared ledger and count toward `max-skipped-threads`, vs a sweep-local count. Same ceiling the rest of triage uses.
 ### Open questions
 - The example config's triage schedule is still `Mon..Fri 06:30:00`; the doc's Data Model shows hourly (`*-*-* *:30:00`). Phase 5 lists only the needs-reply TTL, the keys, and the comment, so it was left. Say if the example should go hourly now or with Phase 8.
+
+## Phase 6: Timer fix and category clause
+### Design decisions
+- Deleted `Persistent=true` from the run timer only (src/service.rs:generate_timer), the one cause of the D2 stall (shape d). The digest and triage OnCalendar timers keep it.
+- `test_generate_timer` assertion replaced in place: it now asserts the exact `[Timer]` section (`OnBootSec=2min`, `OnUnitActiveSec=5min`, then the blank line and `[Install]`) and that no `Persistent=` appears anywhere in the output.
+- Category skip in src/engine.rs:build_active_threads_query keys on `to_gmail_id().starts_with("CATEGORY_")`. No `category:` clause is emitted either.
+- New test `test_build_active_threads_query_skips_category_labels` (src/engine.rs): a `CATEGORY_PROMOTIONS` filter adds no `label:category_` or `category:` clause, and `in:inbox` is still present.
+### Deviations
+- None.
+### Tradeoffs
+- Skip by id prefix vs adding a `Label::Category` variant: the prefix is the smaller change and Phase 1 already normalizes the name; a variant touches every match on `Label`.
+### Open questions
+- None.
+
+### Break-to-prove (observed, each restored)
+- Put `Persistent=true` back after `OnUnitActiveSec={interval}`: `cargo test service` failed `service::tests::test_generate_timer` (`assertion failed: output.contains("[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n\n[Install]")`).
+- Replaced the category skip condition with `if false`: `cargo test engine` failed `test_build_active_threads_query_skips_category_labels`; the query was `in:inbox OR label:category_promotions`.
+- `otto ci` exit 0 after restoring both.
