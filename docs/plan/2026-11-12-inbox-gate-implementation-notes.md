@@ -93,3 +93,38 @@ None.
 - T0 comes from the local clock, while Gmail's `internalDate` comes from the server. Skew of a few seconds can let a message from that window through on either side of the cutoff. Accepted: the filter-pass race it guards is minutes wide, and the alternative (a Gmail-side timestamp) costs a call per run.
 ### Open questions
 - The filter pass inside triage runs `execute_message_filters` with the full live behavior, including Move filters. The doc's "the same pass `run` does" reads that way. If only Star/Flag filters were meant, say so.
+
+## Phase 5: Answered sweep
+### Design decisions
+- `sweep_answered` (src/triage/mod.rs) runs in `triage::execute` after `classify_and_label` (whose seen-marker batches end the classify pass) and before `refresh_drafts`, so the `draft_buckets.is_empty()` return can no longer starve it (D1). It runs on every invocation, dry run included.
+- Scope is `awaits-reply` buckets only. A config with none logs at DEBUG and returns before any Gmail call, so a config that has not opted in sees no change.
+- One answered rule, shared: `TriageThread::is_answered` (src/triage/thread.rs) = the newest non-draft message is from me (`is_from_self`, so the Phase 3 normalization applies). `draft::plan_refresh` now calls it for its `Answered` arm, so the sweep and the draft pass cannot disagree. Lifted, not redefined: same order of checks, `Empty` still wins for a thread of drafts.
+- Metadata fetch: new `GmailClient::get_thread_metadata(id, headers)` (src/gmail/client.rs), `threads.get` at `format=metadata` with only `From`, returning the raw API thread so `TriageThread::from_api` parses it. Not `get_thread`, whose header list is the client-wide message-filter set and whose return type is the engine's `GmailThread`.
+- `plan_answered_targets` (src/triage/mod.rs) groups `(bucket, label id, thread ids)` per thread in first-seen order. A thread under two `awaits-reply` buckets is fetched once and loses both labels in one `threads.modify`.
+- The write removes only the bucket label(s). INBOX stays, per Resolved Decisions: the thread ages under `Cull`.
+- Errors follow the classify pass, not the draft pass: a failed fetch or modify goes through `SkipLedger::skip_thread`, so a thread-scoped error skips that thread and an account-scoped one (or the ceiling) fails the run. A thread already in the ledger this run is left alone.
+- Dry run: the sweep issues its GETs (`threads.list` by label ids, metadata `threads.get`) and prints `[dry-run] thread <id> is answered; would remove [<buckets>]`. Zero non-GET requests. Same contract as the draft pass's existing answered arm. On a fresh mailbox the bucket labels do not exist and the sweep skips that bucket (`resolve_name` is `None`), which is the path `dry_run_issues_zero_non_get_requests` exercises.
+- Summary line, printed and logged: `Triage: N answered threads cleared, N skipped` (+ ` (dry run)`).
+- `NEEDS_REPLY_BUCKET` removed (no references).
+- `eratosthenes.example.yml`: the `keep-needs-reply` (`ttl: Keep`) block is replaced by `age-needs-reply` (read 3d | unread 7d -> Purgatory); the commented triage buckets carry the doc's Data Model keys (needs-reply `draft: false`, `archive: false`, `awaits-reply: true`; the other four `archive: true`); the bucket comment documents the three keys; the state-filter comment states the answered rule as the sweep now runs it. `refresh_drafts`' doc comment and README's `awaits-reply` bullet updated to say the sweep runs whatever `draft` says.
+- Tests:
+  - tests/triage_isolation.rs: `answered_awaits_reply_thread_loses_label_with_draft_false` (exactly one `threads.modify`, `removeLabelIds == [llm/needs-reply id]`, no add, INBOX not removed, the fetch carried `format=metadata`), `answered_thread_in_plain_bucket_keeps_label` (no modify and no `threads.get` for t1), `answered_sweep_dry_run_writes_nothing` (zero non-GET, one read), `unanswered_awaits_reply_thread_keeps_label`. `cargo test --test triage_isolation`: `test result: ok. 9 passed; 0 failed`.
+  - unit: `thread_whose_newest_message_is_mine_is_answered`, `thread_whose_newest_message_is_inbound_is_not_answered`, `my_own_draft_is_not_an_answer`, `thread_of_drafts_only_is_not_answered` (src/triage/thread.rs); `test_plan_answered_targets_groups_a_thread_across_buckets`, `test_plan_answered_targets_on_an_empty_mailbox_plans_nothing` (src/triage/tests.rs).
+- Criteria observed:
+  - `rg -c 'keep-needs-reply' eratosthenes.example.yml`: no output, rg exit 1.
+  - `cargo run -q -- -c eratosthenes.example.yml config validate`: exit 0, `Account 'eratosthenes.example' config is valid.`, 9 state filters including `age-needs-reply`, `Triage: not configured` (the example's triage block is commented out). A scratch copy with the triage block uncommented also validates, exit 0, `Buckets: 5 defined`, so the new keys parse under `deny_unknown_fields`.
+  - `cargo test --test triage_archive`: 7 passed, including `dry_run_issues_zero_non_get_requests`.
+- Break-to-prove, each restored afterwards:
+  - Put the D1 early return back ahead of the sweep in `execute` (`if !triage.buckets.iter().any(|b| b.draft) { return Ok(()); }`). 2 failed: `answered_awaits_reply_thread_loses_label_with_draft_false` (`exactly one threads.modify: []`, `left: 0, right: 1`) and `answered_sweep_dry_run_writes_nothing` (`the dry run still reads the candidate`, `left: 0, right: 1`).
+  - Swept every bucket (`b.awaits_reply || true`). `answered_thread_in_plain_bucket_keeps_label` failed (`a plain bucket keeps its label`, `left: 1, right: 0`), plus two older isolation tests whose plain bucket then hit an unmocked `threads.list`.
+- `otto ci` exit 0.
+### Deviations
+- The sweep is called from `triage::execute`, not from inside `refresh_drafts` ahead of its early return. Same effect, correct seam: the sweep does not depend on the draft pass, and calling it from `execute` keeps `refresh_drafts` about drafts.
+- tests/triage_archive.rs `mount_mailbox` gained a `GET threads` (list) mock returning nothing. Its config has an `awaits-reply` bucket, so live triage now lists it after the classify pass. No assertion changed.
+- README's `awaits-reply` bullet was edited (not in the Phase 5 bullet list) so it states when the label is cleared. It said "the label is cleared", which was not true with `draft: false` until this phase.
+### Tradeoffs
+- No `max-threads` cap on the sweep, vs reusing the draft pass's cap. Each target costs one metadata `threads.get` and no LLM call; the doc's Performance section counts 6 such threads on 2026-11-11. A cap is a capacity feature for a problem not observed.
+- A bucket with both `draft: true` and `awaits-reply: true` (allowed by config) is swept first, so the draft pass no longer sees an answered thread live. On a dry run nothing is removed, so the draft pass also reports it as answered: one thread can print twice in a dry run. Accepted: no bucket in the doc's config sets both.
+- Sweep skips go into the shared ledger and count toward `max-skipped-threads`, vs a sweep-local count. Same ceiling the rest of triage uses.
+### Open questions
+- The example config's triage schedule is still `Mon..Fri 06:30:00`; the doc's Data Model shows hourly (`*-*-* *:30:00`). Phase 5 lists only the needs-reply TTL, the keys, and the comment, so it was left. Say if the example should go hourly now or with Phase 8.

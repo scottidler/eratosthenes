@@ -456,6 +456,48 @@ fn test_plan_draft_targets_caps_and_reports_the_total() {
     assert_eq!(total, 3, "the total is what makes the cap message honest");
 }
 
+/// A thread under two `awaits-reply` buckets is one target carrying both
+/// labels, so the sweep fetches it once and clears both in one write.
+#[test]
+fn test_plan_answered_targets_groups_a_thread_across_buckets() {
+    let per_bucket = vec![
+        (
+            "needs-reply".to_string(),
+            "Label_1".to_string(),
+            vec!["t1".to_string(), "t2".to_string()],
+        ),
+        (
+            "escalations".to_string(),
+            "Label_9".to_string(),
+            vec!["t2".to_string(), "t3".to_string()],
+        ),
+    ];
+    let targets = plan_answered_targets(per_bucket);
+    let planned: Vec<(&str, Vec<&str>)> = targets
+        .iter()
+        .map(|t| {
+            (
+                t.thread_id.as_str(),
+                t.label_ids.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        planned,
+        vec![
+            ("t1", vec!["Label_1"]),
+            ("t2", vec!["Label_1", "Label_9"]),
+            ("t3", vec!["Label_9"]),
+        ]
+    );
+    assert_eq!(targets[1].buckets, vec!["needs-reply", "escalations"]);
+}
+
+#[test]
+fn test_plan_answered_targets_on_an_empty_mailbox_plans_nothing() {
+    assert!(plan_answered_targets(Vec::new()).is_empty());
+}
+
 #[test]
 fn test_plan_draft_targets_on_an_empty_mailbox_plans_nothing() {
     let (targets, total) = plan_draft_targets(Vec::new(), 50);

@@ -441,6 +441,36 @@ impl GmailClient {
         .await
     }
 
+    /// `threads.get` at `format=metadata` carrying only `headers`, as the raw
+    /// API thread. For a triage pass that needs headers and labels but no
+    /// bodies: the answered sweep reads `From` and `DRAFT` and nothing else.
+    /// Separate from `get_thread`, whose header list is the client-wide set
+    /// the message filters need.
+    pub async fn get_thread_metadata(
+        &self,
+        id: &str,
+        headers: &[&str],
+    ) -> Result<google_gmail1::api::Thread> {
+        log::trace!("get_thread_metadata: id={}, headers={:?}", id, headers);
+        with_retry(&self.limiter, "threads.get (metadata)", || async {
+            self.limiter.acquire(10).await;
+            let mut call = self
+                .hub
+                .users()
+                .threads_get("me", id)
+                .format("metadata")
+                .add_scope(GMAIL_SCOPE);
+            for header in headers {
+                call = call.add_metadata_headers(header);
+            }
+            call.doit()
+                .await
+                .map(|(_, t)| t)
+                .context(format!("threads.get({}, metadata) failed", id))
+        })
+        .await
+    }
+
     pub async fn modify_message(&self, id: &str, add: &[String], remove: &[String]) -> Result<()> {
         debug!(
             "modify_message: id={}, add={:?}, remove={:?}",

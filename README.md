@@ -112,7 +112,10 @@ buckets:
   label time. The thread keeps its bucket label and ages to Purgatory ->
   Oblivion on the bucket's state-filter TTL. Archive does not remove `UNREAD`.
 - `awaits-reply: true` means a human is waiting on me. A bot cannot be waiting
-  (row 4 below), and once I reply nobody is (the label is cleared).
+  (row 4 below), and once I reply nobody is: every triage run, an INBOX
+  thread under an `awaits-reply` bucket whose newest non-draft message is mine
+  loses that bucket label, whatever `draft` says. The thread stays in INBOX and
+  ages under `Cull`. Buckets without the key are never swept.
 - Config errors, each naming the bucket: `archive: true` with `draft: true`
   (the draft pass lists INBOX + the label, so an archived bucket never gets a
   draft); `awaits-reply: true` with `archive: true`.

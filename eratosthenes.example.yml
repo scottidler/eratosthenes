@@ -90,7 +90,16 @@ slack:
 #
 #   # Classification taxonomy: names, labels, and the descriptions that become
 #   # the classifier prompt. Adding a bucket = YAML edit. Each bucket label
-#   # needs a matching state-filters entry below (needs-reply -> Keep, etc.).
+#   # needs a matching state-filters entry below (age-needs-reply, etc.).
+#   #   archive: true       remove INBOX at label time, unless the thread is
+#   #                       Starred/Important, has no inbound mail, or holds a
+#   #                       human mail to you alone. Default: false
+#   #   awaits-reply: true  a human is waiting on you: a bot is archived anyway,
+#   #                       and once your reply is the newest message the label
+#   #                       comes off (every triage run, whatever `draft` says;
+#   #                       the thread stays in INBOX and ages under Cull).
+#   #                       Not with archive: true. Default: false
+#   #   draft: true         write a reply draft. Not with archive: true.
 #   # `label` is REQUIRED per bucket; a bucket missing it fails to load,
 #   # naming the offending bucket and field. Defaults to the five buckets
 #   # below if `buckets` is omitted entirely.
@@ -98,19 +107,25 @@ slack:
 #     - name: needs-reply
 #       label: llm/needs-reply
 #       description: a real human wrote to Scott and expects a reply or action
-#       draft: true
+#       draft: false
+#       archive: false        # stays in INBOX
+#       awaits-reply: true    # a bot is archived anyway; my reply clears the label
 #     - name: fyi-work
 #       label: llm/fyi-work
 #       description: work-relevant notifications -- AWS, security, CI, vendors
+#       archive: true
 #     - name: recruiting
 #       label: llm/recruiting
 #       description: LinkedIn, recruiters, job alerts
+#       archive: true
 #     - name: receipts
 #       label: llm/receipts
 #       description: invoices, payments, renewals, order confirmations
+#       archive: true
 #     - name: noise
 #       label: llm/noise
 #       description: everything else -- marketing, newsletters, social
+#       archive: true
 
 # ---- marker-label (OPTIONAL) -----------------------------------------------
 # The label a message-filter stamps on every message it HANDLES (whether or not
@@ -190,12 +205,16 @@ state-filters:
   # own TTL. A bucket filter placed after Cull never sees an INBOX thread.
   # `llm/seen` deliberately gets no state-filter of its own.
 
-  # needs-reply is fully protected until answered. The engine removes
-  # llm/needs-reply once a reply goes out, at which point the thread falls
-  # through to Cull like anything else.
-  - keep-needs-reply:
+  # needs-reply ages like any other bucket. With `awaits-reply: true` on the
+  # bucket, triage removes llm/needs-reply once your reply is the newest
+  # message in the thread; the thread stays in INBOX and Cull ages it from
+  # there.
+  - age-needs-reply:
       label: llm/needs-reply
-      ttl: Keep
+      ttl:
+        read: 3d
+        unread: 7d
+      action: Purgatory
 
   - age-fyi-work:
       label: llm/fyi-work

@@ -211,6 +211,13 @@ async fn mount_mailbox(server: &MockServer, candidates: &[&Msg], threads: &[(&st
         .respond_with(ResponseTemplate::new(204))
         .mount(server)
         .await;
+    // The answered sweep lists INBOX + each `awaits-reply` label after the
+    // classify pass. No inbox thread is under one yet in these fixtures.
+    Mock::given(method("GET"))
+        .and(path(THREADS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
 }
 
 /// One `batchModify` the run issued, as Gmail received it.

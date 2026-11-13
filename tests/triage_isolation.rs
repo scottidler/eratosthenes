@@ -394,3 +394,247 @@ async fn skipped_thread_gets_no_draft_refresh_write() {
         "a skipped thread must not be refetched"
     );
 }
+
+/// `needs-reply` with `draft` as given and `awaits-reply` as given, so the
+/// answered sweep is the only thing that can read t1.
+fn sweep_config(claude: &Path, awaits_reply: bool) -> Config {
+    parse_config(&format!(
+        r#"
+auth:
+  creds-path: /tmp/creds
+triage:
+  schedule: "Mon..Fri 06:30:00"
+  claude-binary: {}
+  buckets:
+    - name: needs-reply
+      label: llm/needs-reply
+      description: expects a reply
+      draft: false
+      awaits-reply: {awaits_reply}
+"#,
+        claude.display()
+    ))
+    .expect("sweep config parses")
+}
+
+/// No new mail to classify; t1 sits in INBOX under `llm/needs-reply`, and its
+/// newest message is my reply.
+async fn mount_answered_inbox_thread(server: &MockServer) {
+    let me = "me@x.com";
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "emailAddress": me })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MESSAGES))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(THREADS))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "threads": [{ "id": "t1" }] })),
+        )
+        .mount(server)
+        .await;
+    let answered = json!({
+        "id": "t1",
+        "messages": [
+            {
+                "id": "t1-m1",
+                "threadId": "t1",
+                "labelIds": ["INBOX", RELABEL_ID],
+                "internalDate": "1700000000000",
+                "payload": { "headers": [{ "name": "From", "value": "them@x.com" }] }
+            },
+            {
+                "id": "t1-m2",
+                "threadId": "t1",
+                "labelIds": ["SENT"],
+                "internalDate": "1700000100000",
+                "payload": { "headers": [{ "name": "From", "value": me }] }
+            }
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("{THREADS}/t1")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(answered))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("{THREADS}/t1/modify")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "t1" })))
+        .mount(server)
+        .await;
+}
+
+const SWEEP_LABELS: &[(&str, &str)] = &[
+    (RELABEL_ID, "llm/needs-reply"),
+    (SEEN_ID, "llm/seen"),
+    (MARKER_ID, "Triaged"),
+];
+
+/// D1: with `draft: false` the draft pass returns early, so the answered rule
+/// never ran. The sweep runs ahead of it for `awaits-reply` buckets.
+#[tokio::test]
+async fn answered_awaits_reply_thread_loses_label_with_draft_false() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude = write_stub_claude(dir.path());
+    let server = MockServer::start().await;
+    mount_answered_inbox_thread(&server).await;
+    let mut client = client_with_labels(&server, SWEEP_LABELS).await;
+
+    triage::execute(&mut client, &sweep_config(&claude, true), "", false)
+        .await
+        .expect("the answered sweep runs clean");
+
+    let modifies: Vec<serde_json::Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/modify"))
+        .map(|r| {
+            assert_eq!(r.url.path(), format!("{THREADS}/t1/modify"));
+            serde_json::from_slice(&r.body).unwrap()
+        })
+        .collect();
+    assert_eq!(
+        modifies.len(),
+        1,
+        "exactly one threads.modify: {modifies:?}"
+    );
+    assert_eq!(modifies[0]["removeLabelIds"], json!([RELABEL_ID]));
+    assert!(
+        modifies[0].get("addLabelIds").is_none_or(|v| v.is_null()),
+        "the sweep adds nothing: {modifies:?}"
+    );
+    assert!(
+        !modifies[0]["removeLabelIds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("INBOX")),
+        "the thread stays in INBOX under Cull"
+    );
+    let fetch = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.method.as_str() == "GET" && r.url.path() == format!("{THREADS}/t1"))
+        .expect("the sweep read t1");
+    assert!(
+        fetch
+            .url
+            .query_pairs()
+            .any(|(k, v)| k == "format" && v == "metadata"),
+        "metadata is enough: {}",
+        fetch.url
+    );
+}
+
+/// A bucket without `awaits-reply` is never swept: same answered thread, no
+/// read and no write.
+#[tokio::test]
+async fn answered_thread_in_plain_bucket_keeps_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude = write_stub_claude(dir.path());
+    let server = MockServer::start().await;
+    mount_answered_inbox_thread(&server).await;
+    let mut client = client_with_labels(&server, SWEEP_LABELS).await;
+
+    triage::execute(&mut client, &sweep_config(&claude, false), "", false)
+        .await
+        .expect("triage runs clean");
+
+    assert_eq!(
+        requests_to(&server, "POST", &format!("{THREADS}/t1/modify")).await,
+        0,
+        "a plain bucket keeps its label"
+    );
+    assert_eq!(
+        requests_to(&server, "GET", &format!("{THREADS}/t1")).await,
+        0,
+        "a plain bucket's threads are not even read"
+    );
+}
+
+/// A dry run reads the sweep's candidates and writes nothing.
+#[tokio::test]
+async fn answered_sweep_dry_run_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude = write_stub_claude(dir.path());
+    let server = MockServer::start().await;
+    mount_answered_inbox_thread(&server).await;
+    let mut client = client_with_labels(&server, SWEEP_LABELS).await;
+
+    triage::execute(&mut client, &sweep_config(&claude, true), "", true)
+        .await
+        .expect("a dry-run sweep runs clean");
+
+    let requests = server.received_requests().await.unwrap();
+    let writes: Vec<String> = requests
+        .iter()
+        .filter(|r| r.method.as_str() != "GET")
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert!(writes.is_empty(), "a dry run wrote: {writes:?}");
+    assert_eq!(
+        requests_to(&server, "GET", &format!("{THREADS}/t1")).await,
+        1,
+        "the dry run still reads the candidate"
+    );
+}
+
+/// The sweep's own unanswered case: newest message inbound, label kept.
+#[tokio::test]
+async fn unanswered_awaits_reply_thread_keeps_label() {
+    let dir = tempfile::tempdir().unwrap();
+    let claude = write_stub_claude(dir.path());
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/gmail/v1/users/me/profile"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "emailAddress": "me@x.com" })),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(MESSAGES))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(THREADS))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({ "threads": [{ "id": "t1" }] })),
+        )
+        .mount(&server)
+        .await;
+    let waiting = json!({
+        "id": "t1",
+        "messages": [{
+            "id": "t1-m1",
+            "threadId": "t1",
+            "labelIds": ["INBOX", RELABEL_ID],
+            "internalDate": "1700000000000",
+            "payload": { "headers": [{ "name": "From", "value": "them@x.com" }] }
+        }]
+    });
+    Mock::given(method("GET"))
+        .and(path(format!("{THREADS}/t1")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(waiting))
+        .mount(&server)
+        .await;
+    let mut client = client_with_labels(&server, SWEEP_LABELS).await;
+
+    triage::execute(&mut client, &sweep_config(&claude, true), "", false)
+        .await
+        .expect("triage runs clean");
+
+    assert_eq!(
+        requests_to(&server, "POST", &format!("{THREADS}/t1/modify")).await,
+        0
+    );
+}

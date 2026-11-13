@@ -289,6 +289,18 @@ impl TriageThread {
         self.newest().map(|m| m.subject()).unwrap_or("")
     }
 
+    /// The answered rule: the newest non-draft message is from me. Drafts are
+    /// skipped because a draft is FROM me and newest, and reading it as my
+    /// answer would strip a bucket label the run after the draft was made.
+    /// `false` for a thread with no non-draft message.
+    pub fn is_answered(&self, self_address: &str) -> bool {
+        self.messages
+            .iter()
+            .rev()
+            .find(|m| !m.is_draft())
+            .is_some_and(|newest| newest.is_from_self(self_address))
+    }
+
     /// Non-draft messages not from me, oldest first. Distinct from
     /// `plan_refresh`'s newest message, which counts my own replies.
     pub fn inbound<'a>(
@@ -829,5 +841,45 @@ pub(crate) mod tests {
         older.internal_date = DateTime::from_timestamp_millis(1).unwrap();
         let thread = thread_of(vec![older, bot_to_list("m2", 2, &["INBOX"])]);
         assert_eq!(thread.protection(ME), Some(Protection::SoleHuman));
+    }
+
+    // ---- is_answered -------------------------------------------------------
+
+    #[test]
+    fn thread_whose_newest_message_is_mine_is_answered() {
+        let thread = thread_of(vec![
+            msg("m1", 1, vec![("From", "bob@x.com"), ("To", ME)], &["INBOX"]),
+            msg("m2", 2, vec![("From", ME), ("To", "bob@x.com")], &["SENT"]),
+        ]);
+        assert!(thread.is_answered(ME));
+    }
+
+    #[test]
+    fn thread_whose_newest_message_is_inbound_is_not_answered() {
+        let thread = thread_of(vec![
+            msg("m1", 1, vec![("From", ME), ("To", "bob@x.com")], &["SENT"]),
+            msg("m2", 2, vec![("From", "bob@x.com"), ("To", ME)], &["INBOX"]),
+        ]);
+        assert!(!thread.is_answered(ME));
+    }
+
+    #[test]
+    fn my_own_draft_is_not_an_answer() {
+        let thread = thread_of(vec![
+            msg("m1", 1, vec![("From", "bob@x.com"), ("To", ME)], &["INBOX"]),
+            msg("m2", 2, vec![("From", ME), ("To", "bob@x.com")], &["DRAFT"]),
+        ]);
+        assert!(!thread.is_answered(ME));
+    }
+
+    #[test]
+    fn thread_of_drafts_only_is_not_answered() {
+        let thread = thread_of(vec![msg(
+            "m1",
+            1,
+            vec![("From", ME), ("To", "bob@x.com")],
+            &["DRAFT"],
+        )]);
+        assert!(!thread.is_answered(ME));
     }
 }

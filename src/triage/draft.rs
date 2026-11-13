@@ -89,7 +89,7 @@ pub fn plan_refresh(thread: &TriageThread, self_address: &str) -> RefreshPlan {
         thread.id, newest.id, has_draft
     );
 
-    if newest.is_from_self(self_address) {
+    if thread.is_answered(self_address) {
         return RefreshPlan::Answered;
     }
     if has_draft {

@@ -42,12 +42,6 @@ pub const CANDIDATE_QUERY: &str = "in:inbox -label:llm/seen";
 /// Gmail's system inbox label id. Archiving is removing it, nothing more.
 pub const INBOX_LABEL: &str = "INBOX";
 
-/// The bucket whose threads become the digest's Needs Reply section. Matched by
-/// bucket NAME so the Gmail label itself stays config: an account that renames
-/// `llm/needs-reply` keeps its section, and an account with no such bucket
-/// simply has no Needs Reply section.
-pub const NEEDS_REPLY_BUCKET: &str = "needs-reply";
-
 /// A candidate message reduced to what the client-side sort needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateMessage {
@@ -496,6 +490,12 @@ pub async fn execute(
     )
     .await?;
 
+    // Ahead of the draft pass and independent of it: an `awaits-reply` bucket
+    // need not set `draft: true`, and the draft pass returns early when no
+    // bucket does (D1). Runs on every invocation, like the draft pass: my reply
+    // carries SENT, not INBOX, so it never makes the thread a candidate again.
+    sweep_answered(client, triage, &self_address, prefix, dry_run, &mut skipped).await?;
+
     // Runs on EVERY invocation, including one that classified nothing: the
     // refresh is what retries a thread whose previous run died between the
     // label write and the draft, and that thread carries no new message, so
@@ -938,6 +938,184 @@ async fn classify_threads(
         .wrap_err("classifier response unusable after one retry; no threads were labeled"))
 }
 
+/// One inbox thread carrying one or more `awaits-reply` bucket labels: what the
+/// answered sweep takes off when I have replied.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AnsweredTarget {
+    pub thread_id: String,
+    pub buckets: Vec<String>,
+    pub label_ids: Vec<String>,
+}
+
+/// Group `(bucket, label id, inbox thread ids)` per thread, first-seen order.
+/// A thread under two `awaits-reply` buckets is fetched once and loses both
+/// labels in one write.
+pub fn plan_answered_targets(
+    per_bucket: Vec<(String, String, Vec<String>)>,
+) -> Vec<AnsweredTarget> {
+    let mut targets: Vec<AnsweredTarget> = Vec::new();
+    for (bucket, label_id, thread_ids) in per_bucket {
+        for thread_id in thread_ids {
+            match targets.iter_mut().find(|t| t.thread_id == thread_id) {
+                Some(target) => {
+                    target.buckets.push(bucket.clone());
+                    target.label_ids.push(label_id.clone());
+                }
+                None => targets.push(AnsweredTarget {
+                    thread_id,
+                    buckets: vec![bucket.clone()],
+                    label_ids: vec![label_id.clone()],
+                }),
+            }
+        }
+    }
+    targets
+}
+
+/// The answered sweep: an inbox thread under an `awaits-reply` bucket whose
+/// newest non-draft message is mine loses that bucket label. Nobody is waiting
+/// on me any more. The thread stays in INBOX and ages under `Cull`.
+///
+/// Buckets without `awaits-reply` are never read, so a config that has not
+/// opted in sees no change. Metadata fetch only: the rule reads `From` and the
+/// `DRAFT` label. A dry run reads (list + metadata get) and prints what it
+/// would remove; it writes nothing.
+async fn sweep_answered(
+    client: &GmailClient,
+    triage: &TriageConfig,
+    self_address: &str,
+    prefix: &str,
+    dry_run: bool,
+    skipped: &mut SkipLedger,
+) -> Result<()> {
+    let awaits: Vec<&TriageBucket> = triage.buckets.iter().filter(|b| b.awaits_reply).collect();
+    if awaits.is_empty() {
+        debug!(
+            "{}no bucket sets awaits-reply: true; skipping the answered sweep",
+            prefix
+        );
+        return Ok(());
+    }
+    debug!(
+        "{}sweep_answered: buckets={}, dry_run={}",
+        prefix,
+        awaits.len(),
+        dry_run
+    );
+
+    let mut per_bucket: Vec<(String, String, Vec<String>)> = Vec::new();
+    for bucket in &awaits {
+        let Some(label_id) = client.resolver.resolve_name(&bucket.label) else {
+            // Only reachable on a dry run, which creates no labels.
+            debug!(
+                "{}label '{}' does not exist yet; nothing to sweep",
+                prefix, bucket.label
+            );
+            continue;
+        };
+        let label_id = label_id.to_string();
+        let thread_ids = client
+            .list_threads_by_label_ids(&[INBOX_LABEL, label_id.as_str()])
+            .await
+            .with_context(|| format!("listing inbox threads labeled '{}'", bucket.label))?;
+        per_bucket.push((bucket.name.clone(), label_id, thread_ids));
+    }
+    let targets = plan_answered_targets(per_bucket);
+    info!(
+        "{}answered-sweep candidates: {} threads",
+        prefix,
+        targets.len()
+    );
+
+    let mut answered = 0usize;
+    let mut swept_skips = 0usize;
+    for target in &targets {
+        if skipped.contains_thread(&target.thread_id) {
+            debug!(
+                "{}sweep_answered: thread {} was skipped this run; leaving it alone",
+                prefix, target.thread_id
+            );
+            swept_skips += 1;
+            continue;
+        }
+        let raw = match client
+            .get_thread_metadata(&target.thread_id, &["From"])
+            .await
+        {
+            Ok(raw) => raw,
+            Err(e) => {
+                skipped.skip_thread(
+                    &target.thread_id,
+                    "threads.get (metadata)",
+                    e.wrap_err(format!(
+                        "fetching thread {} for the answered sweep",
+                        target.thread_id
+                    )),
+                    prefix,
+                )?;
+                swept_skips += 1;
+                continue;
+            }
+        };
+        let thread = match TriageThread::from_api(raw) {
+            Ok(thread) => thread,
+            Err(e) => {
+                warn!(
+                    "{}skipping unreadable thread {}: {:#}",
+                    prefix, target.thread_id, e
+                );
+                swept_skips += 1;
+                continue;
+            }
+        };
+        if !thread.is_answered(self_address) {
+            continue;
+        }
+        if dry_run {
+            println!(
+                "{}[dry-run] thread {} is answered; would remove {:?}",
+                prefix, target.thread_id, target.buckets
+            );
+            answered += 1;
+            continue;
+        }
+        if let Err(e) = client
+            .modify_thread(&target.thread_id, &[], &target.label_ids)
+            .await
+        {
+            skipped.skip_thread(
+                &target.thread_id,
+                "threads.modify",
+                e.wrap_err(format!(
+                    "clearing {:?} from answered thread {}",
+                    target.buckets, target.thread_id
+                )),
+                prefix,
+            )?;
+            swept_skips += 1;
+            continue;
+        }
+        info!(
+            "{}[triage:{}] thread {} answered; bucket label removed",
+            prefix,
+            target.buckets.join(","),
+            target.thread_id
+        );
+        answered += 1;
+    }
+
+    let line = format!(
+        "{}Triage: {} answered threads cleared, {} skipped{}",
+        prefix,
+        answered,
+        swept_skips,
+        if dry_run { " (dry run)" } else { "" }
+    );
+    info!("{}", line);
+    println!("{}", line);
+    Ok(())
+}
+
 /// One thread still carrying a `draft: true` bucket label, and which label that
 /// is: the answered-rule needs the label id to take it back off.
 #[derive(Debug, PartialEq, Eq)]
@@ -1027,8 +1205,10 @@ handling the first {}, {} left for the next run (raise max-threads if this repea
     Ok(targets)
 }
 
-/// The needs-reply refresh: answered threads lose their bucket label, and
-/// unanswered ones without a draft get one.
+/// The reply-draft refresh over `draft: true` buckets: answered threads lose
+/// their bucket label, and unanswered ones without a draft get one. The
+/// `awaits-reply` buckets are swept for answers by `sweep_answered`, which
+/// does not depend on this pass running.
 ///
 /// Nothing here ever SENDS, and nothing modifies or deletes an existing draft:
 /// Scott may have edited it, and his edits are sacred. The cost of that is a
