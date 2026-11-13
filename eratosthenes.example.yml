@@ -182,10 +182,13 @@ state-filters:
 
   # ---- llm/* bucket filters (OPTIONAL, only if `triage:` above is enabled) --
   # One state-filter per bucket, keyed to that bucket's label. These MUST
-  # precede Cull below: Cull matches every INBOX thread on its own TTL
-  # regardless of label, so a bucket filter placed after it never gets a
-  # chance to apply its own (tighter or looser) TTL first. `llm/seen`
-  # deliberately gets no state-filter of its own.
+  # precede Cull below. The first state-filter that matches a thread owns it:
+  # while its TTL runs, no later filter (Cull included) touches the thread, so
+  # a bucket filter's TTL applies whether it is tighter or looser than Cull's.
+  # Exception: once the thread is at or past the filter's destination (e.g.
+  # already in Purgatory), the filter steps aside and Purge ages it on Purge's
+  # own TTL. A bucket filter placed after Cull never sees an INBOX thread.
+  # `llm/seen` deliberately gets no state-filter of its own.
 
   # needs-reply is fully protected until answered. The engine removes
   # llm/needs-reply once a reply goes out, at which point the thread falls

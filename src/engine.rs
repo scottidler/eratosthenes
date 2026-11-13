@@ -1106,9 +1106,9 @@ async fn evaluate_active_threads<C: Clock>(
         }
 
         // The per-thread boundary: the fetch AND the whole filter walk are one
-        // unit. Catching inside `apply_state_action` instead would turn a failed
-        // Move into "not acted", and `evaluate_thread` would go on to try later
-        // filters, a Delete among them.
+        // unit. Catching around the write instead would turn a failed Move into
+        // "not acted", and a caller that kept walking would try later filters, a
+        // Delete among them.
         let outcome: std::result::Result<bool, (&str, eyre::Report)> = async {
             let (label_ids, last_activity, is_read) = match hit {
                 Some(CachedThread {
@@ -1202,52 +1202,154 @@ async fn evaluate_thread<C: Clock>(
         prefix, thread.id, thread_labels, thread.is_read
     );
 
-    for state_filter in state_filters {
-        if !state_filter.matches_labels(&thread_labels) {
+    let verdict = plan_thread(
+        &thread_labels,
+        thread.last_activity,
+        thread.is_read,
+        state_filters,
+        stages,
+        &client.resolver,
+        clock,
+    )?;
+
+    match verdict {
+        ThreadVerdict::Move {
+            filter,
+            dest,
+            planned,
+        } => {
+            debug!(
+                "{}[state:{}] thread {} -> {} (add={:?}, remove={:?}, dry_run={})",
+                prefix, filter.name, thread.id, dest, planned.add, planned.remove, dry_run,
+            );
+            if !dry_run {
+                client
+                    .modify_thread(thread.id, &planned.add, &planned.remove)
+                    .await?;
+            }
+            Ok(true)
+        }
+        ThreadVerdict::Delete { filter } => {
+            debug!(
+                "{}[state:{}] trashing thread {} (dry_run={})",
+                prefix, filter.name, thread.id, dry_run,
+            );
+            if !dry_run {
+                client.trash_thread(thread.id).await?;
+            }
+            Ok(true)
+        }
+        ThreadVerdict::Held { filter } => {
+            // Per-record: once per owned thread every run -> TRACE.
             trace!(
-                "{}[thread:{}] filter '{}' labels don't match, skipping",
-                prefix, thread.id, state_filter.name
+                "{}[thread:{}] owned by '{}', TTL running",
+                prefix, thread.id, filter.name
+            );
+            Ok(false)
+        }
+        ThreadVerdict::Unowned => Ok(false),
+    }
+}
+
+/// What the state-filter walk decided for one thread, as data: the first filter that
+/// owns the thread, and what it does to it now.
+#[derive(Debug, PartialEq)]
+enum ThreadVerdict<'a> {
+    /// The owning filter's TTL has expired and its move changes something.
+    Move {
+        filter: &'a StateFilter,
+        dest: &'a str,
+        planned: PlannedMove,
+    },
+    /// The owning filter's TTL has expired and it trashes the thread.
+    Delete { filter: &'a StateFilter },
+    /// The owning filter is `Keep`, or its TTL is still running: nothing happens and
+    /// no later filter is consulted.
+    Held { filter: &'a StateFilter },
+    /// No filter owns the thread.
+    Unowned,
+}
+
+/// Walk the state filters in declaration order and decide the thread's fate. Pure: no
+/// Gmail calls, so ownership is assertable without a mailbox.
+///
+/// The first filter whose labels match OWNS the thread (D5): while its TTL runs it holds
+/// the thread, and when the TTL expires it acts. Later filters are never consulted. That
+/// is what lets a bucket filter ahead of the catch-all `Cull` apply a looser TTL, and
+/// what keeps an action-less category filter's thread from ever getting a stage label.
+/// Before this, only `Keep` ended the walk, so a read `llm/receipts` thread 4 days old
+/// skipped its 7d bucket filter and `Cull` (read 3d) took it.
+///
+/// One exception, before and after expiry: a `Move` whose plan is already a no-op (the
+/// thread is at or past the destination stage) does not own the thread, and the walk
+/// falls through. A bucket label survives every move by design, so a bucket filter still
+/// matches the thread it parked in Purgatory; if it owned that thread, `Purge` would
+/// never get it on `Purge`'s own TTL.
+fn plan_thread<'a, C: Clock>(
+    thread_labels: &[Label],
+    last_activity: DateTime<Utc>,
+    is_read: bool,
+    state_filters: &'a [StateFilter],
+    stages: &[String],
+    resolver: &LabelResolver,
+    clock: &C,
+) -> Result<ThreadVerdict<'a>> {
+    for state_filter in state_filters {
+        if !state_filter.matches_labels(thread_labels) {
+            trace!(
+                "plan_thread: filter '{}' labels don't match, skipping",
+                state_filter.name
             );
             continue;
         }
 
         // Per-record: once per matched thread every run -> TRACE, not DEBUG.
         trace!(
-            "{}[thread:{}] matched filter '{}': last_activity={}, is_read={}",
-            prefix, thread.id, state_filter.name, thread.last_activity, thread.is_read
+            "plan_thread: matched filter '{}': last_activity={}, is_read={}",
+            state_filter.name, last_activity, is_read
         );
 
-        match state_filter.evaluate_ttl(thread.last_activity, thread.is_read, clock)? {
-            Some(action) => {
-                let acted = apply_state_action(
-                    client,
-                    thread,
-                    &thread_labels,
-                    state_filter,
-                    stages,
-                    &action,
-                    prefix,
-                    dry_run,
-                )
-                .await?;
-                if acted {
-                    return Ok(true);
-                }
-            }
-            None => {
-                if state_filter.ttl == Ttl::Keep {
-                    // Per-record: once per protected thread every run -> TRACE.
-                    trace!(
-                        "{}[thread:{}] protected by '{}'",
-                        prefix, thread.id, state_filter.name
-                    );
-                    return Ok(false);
-                }
-            }
+        if state_filter.ttl == Ttl::Keep {
+            return Ok(ThreadVerdict::Held {
+                filter: state_filter,
+            });
         }
+
+        let planned = match &state_filter.action {
+            StateAction::Move(dest) => {
+                let planned = plan_state_move(thread_labels, stages, dest, resolver);
+                if planned.is_noop() {
+                    debug!(
+                        "plan_thread: filter '{}' move to '{}' is a no-op (thread at or past it); continuing to later filters",
+                        state_filter.name, dest
+                    );
+                    continue;
+                }
+                Some((dest.as_str(), planned))
+            }
+            StateAction::Delete => None,
+        };
+
+        let verdict = match (
+            state_filter.evaluate_ttl(last_activity, is_read, clock)?,
+            planned,
+        ) {
+            (None, _) => ThreadVerdict::Held {
+                filter: state_filter,
+            },
+            (Some(_), Some((dest, planned))) => ThreadVerdict::Move {
+                filter: state_filter,
+                dest,
+                planned,
+            },
+            (Some(_), None) => ThreadVerdict::Delete {
+                filter: state_filter,
+            },
+        };
+        return Ok(verdict);
     }
 
-    Ok(false)
+    Ok(ThreadVerdict::Unowned)
 }
 
 /// One intended `modify_thread(add, remove)` for a state-filter `Move`.
@@ -1351,64 +1453,6 @@ fn current_stage_index(thread_labels: &[Label], stages: &[String]) -> Option<usi
     stages
         .iter()
         .rposition(|s| thread_labels.contains(&Label::new(s)))
-}
-
-async fn apply_state_action(
-    client: &GmailClient,
-    thread: &ThreadState<'_>,
-    thread_labels: &[Label],
-    state_filter: &StateFilter,
-    stages: &[String],
-    action: &StateAction,
-    prefix: &str,
-    dry_run: bool,
-) -> Result<bool> {
-    debug!(
-        "{}apply_state_action: filter={}, thread={}, action={:?}, stages={:?}, dry_run={}",
-        prefix, state_filter.name, thread.id, action, stages, dry_run
-    );
-
-    match action {
-        StateAction::Move(dest) => {
-            let planned = plan_state_move(thread_labels, stages, dest, &client.resolver);
-
-            // The thread is already at `dest`. Report NOT-ACTED so the caller keeps
-            // walking the filter list: a bucket filter like `llm/noise -> Purgatory`
-            // still MATCHES a thread it already moved (the bucket label is a match
-            // criterion and survives by design, Phase 2), and if that counted as
-            // firing, `Purge` (`Purgatory -> Oblivion`) would never be evaluated and
-            // the thread would be rewritten every run, forever.
-            if planned.is_noop() {
-                debug!(
-                    "{}[state:{}] thread {} already at or past '{}', no-op; continuing to later filters",
-                    prefix, state_filter.name, thread.id, dest,
-                );
-                return Ok(false);
-            }
-
-            debug!(
-                "{}[state:{}] thread {} -> {} (add={:?}, remove={:?})",
-                prefix, state_filter.name, thread.id, dest, planned.add, planned.remove,
-            );
-
-            if !dry_run {
-                client
-                    .modify_thread(thread.id, &planned.add, &planned.remove)
-                    .await?;
-            }
-            Ok(true)
-        }
-        StateAction::Delete => {
-            debug!(
-                "{}[state:{}] trashing thread {}",
-                prefix, state_filter.name, thread.id,
-            );
-            if !dry_run {
-                client.trash_thread(thread.id).await?;
-            }
-            Ok(true)
-        }
-    }
 }
 
 fn build_active_threads_query(state_filters: &[StateFilter]) -> String {
@@ -2452,6 +2496,317 @@ mod tests {
             planned.remove,
             vec!["INBOX".to_string(), "Label_8".to_string()]
         );
+    }
+
+    // ---- State filter ownership (D5) -----------------------------------------------
+
+    struct FixedClock(DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_763_000_000, 0).expect("valid timestamp")
+    }
+
+    fn days_ago(days: i64) -> DateTime<Utc> {
+        fixed_now() - chrono::Duration::days(days)
+    }
+
+    fn ttl_days(days: i64) -> Ttl {
+        Ttl::Days(chrono::Duration::days(days))
+    }
+
+    fn ttl_read_unread(read: i64, unread: i64) -> Ttl {
+        Ttl::Detailed {
+            read: chrono::Duration::days(read),
+            unread: chrono::Duration::days(unread),
+        }
+    }
+
+    fn state_filter(name: &str, labels: &[&str], ttl: Ttl, dest: &str) -> StateFilter {
+        StateFilter {
+            name: name.to_string(),
+            labels: labels.iter().map(|l| Label::new(l)).collect(),
+            ttl,
+            action: StateAction::Move(dest.to_string()),
+        }
+    }
+
+    fn keep_filter(name: &str, label: &str) -> StateFilter {
+        StateFilter {
+            name: name.to_string(),
+            labels: vec![Label::new(label)],
+            ttl: Ttl::Keep,
+            action: StateAction::Move(String::new()),
+        }
+    }
+
+    /// The live work ladder's shape (tatari.yml): Keep guards, bucket filters ahead of
+    /// a catch-all `Cull` on INBOX, and `Purge` draining Purgatory to Oblivion.
+    fn work_filters() -> Vec<StateFilter> {
+        vec![
+            keep_filter("Starred", "Starred"),
+            state_filter("age-receipts", &["llm/receipts"], ttl_days(7), "Purgatory"),
+            state_filter("age-noise", &["llm/noise"], ttl_days(1), "Purgatory"),
+            state_filter("Cull", &["INBOX"], ttl_read_unread(3, 21), "Purgatory"),
+            state_filter("Purge", &["Purgatory"], ttl_days(3), "Oblivion"),
+        ]
+    }
+
+    /// The personal starter config's shape (design doc `home.yml`).
+    fn home_filters() -> Vec<StateFilter> {
+        vec![
+            keep_filter("Starred", "Starred"),
+            keep_filter("Important", "Important"),
+            state_filter(
+                "personal",
+                &["CATEGORY_PERSONAL"],
+                ttl_read_unread(7, 30),
+                "",
+            ),
+            state_filter(
+                "promotions",
+                &["CATEGORY_PROMOTIONS"],
+                ttl_days(1),
+                "Purgatory",
+            ),
+            state_filter("social", &["CATEGORY_SOCIAL"], ttl_days(1), "Purgatory"),
+            state_filter("forums", &["CATEGORY_FORUMS"], ttl_days(3), "Purgatory"),
+            state_filter(
+                "updates",
+                &["CATEGORY_UPDATES"],
+                ttl_read_unread(3, 7),
+                "Purgatory",
+            ),
+            state_filter("Cull", &["INBOX"], ttl_read_unread(3, 21), "Purgatory"),
+            state_filter("Purge", &["Purgatory"], ttl_days(3), "Oblivion"),
+        ]
+    }
+
+    fn ownership_resolver() -> LabelResolver {
+        LabelResolver::from_api_labels(vec![
+            custom_label("Label_7", "Purgatory"),
+            custom_label("Label_8", "Oblivion"),
+            custom_label("Label_9", "llm/noise"),
+            custom_label("Label_10", "llm/receipts"),
+        ])
+    }
+
+    fn verdict<'a>(
+        labels: &[Label],
+        age_days: i64,
+        is_read: bool,
+        filters: &'a [StateFilter],
+    ) -> ThreadVerdict<'a> {
+        plan_thread(
+            labels,
+            days_ago(age_days),
+            is_read,
+            filters,
+            &derive_stages(filters),
+            &ownership_resolver(),
+            &FixedClock(fixed_now()),
+        )
+        .expect("plan_thread")
+    }
+
+    /// Apply a planned move to a thread's labels the way Gmail would, mapping the
+    /// plan's wire ids back to names through the resolver.
+    fn apply_move(labels: &[Label], planned: &PlannedMove, resolver: &LabelResolver) -> Vec<Label> {
+        let name = |id: &String| Label::new(resolver.resolve_id(id).unwrap_or(id.as_str()));
+        let removed: Vec<Label> = planned.remove.iter().map(name).collect();
+        let mut out: Vec<Label> = labels
+            .iter()
+            .filter(|l| !removed.contains(l))
+            .cloned()
+            .collect();
+        for added in planned.add.iter().map(name) {
+            if !out.contains(&added) {
+                out.push(added);
+            }
+        }
+        out
+    }
+
+    fn held_by<'a>(v: &ThreadVerdict<'a>) -> Option<&'a str> {
+        match v {
+            ThreadVerdict::Held { filter } => Some(filter.name.as_str()),
+            _ => None,
+        }
+    }
+
+    /// D5, the live-config case: a read `llm/receipts` thread, 4 days old, is owned by
+    /// `age-receipts` (7d) and must not be taken by `Cull` (read 3d) behind it.
+    #[test]
+    fn unexpired_bucket_filter_owns_thread_ahead_of_cull() {
+        let filters = work_filters();
+        let labels = labels_of(&["INBOX", "llm/receipts"]);
+
+        let v = verdict(&labels, 4, true, &filters);
+
+        assert_eq!(
+            held_by(&v),
+            Some("age-receipts"),
+            "the unexpired bucket filter must own the thread, no move: {v:?}"
+        );
+    }
+
+    /// Once the owner's own TTL expires it acts, on its own destination.
+    #[test]
+    fn expired_bucket_filter_moves_its_thread_to_purgatory() {
+        let filters = work_filters();
+        let labels = labels_of(&["INBOX", "llm/receipts"]);
+
+        match verdict(&labels, 8, true, &filters) {
+            ThreadVerdict::Move { filter, dest, .. } => {
+                assert_eq!(filter.name, "age-receipts");
+                assert_eq!(dest, "Purgatory");
+            }
+            other => panic!("expected age-receipts to move the thread, got {other:?}"),
+        }
+    }
+
+    /// A thread no bucket filter matches is still `Cull`'s, on `Cull`'s TTL.
+    #[test]
+    fn unlabeled_inbox_thread_is_still_culled() {
+        let filters = work_filters();
+        match verdict(&labels_of(&["INBOX"]), 4, true, &filters) {
+            ThreadVerdict::Move { filter, .. } => assert_eq!(filter.name, "Cull"),
+            other => panic!("expected Cull to move the thread, got {other:?}"),
+        }
+    }
+
+    /// Keep still owns unconditionally, ahead of everything.
+    #[test]
+    fn keep_filter_still_holds_a_starred_thread() {
+        let filters = work_filters();
+        let v = verdict(
+            &labels_of(&["INBOX", "STARRED", "llm/noise"]),
+            400,
+            true,
+            &filters,
+        );
+        assert_eq!(held_by(&v), Some("Starred"), "{v:?}");
+    }
+
+    /// D5 on the personal account: an action-less `personal` filter owns a read
+    /// Personal-category thread. Run 1 at 4 days: no move. Run 2 at 8 days: INBOX is
+    /// removed and no stage label is added. Before D5 run 1 fell through to `Cull`
+    /// (read 3d) and the thread went to Purgatory, on its way to Oblivion.
+    #[test]
+    fn personal_category_thread_never_gets_a_stage_label() {
+        let filters = home_filters();
+        let resolver = ownership_resolver();
+        let labels = labels_of(&["INBOX", "CATEGORY_PERSONAL"]);
+
+        let run1 = verdict(&labels, 4, true, &filters);
+        assert_eq!(
+            held_by(&run1),
+            Some("personal"),
+            "run 1 must not move: {run1:?}"
+        );
+
+        let run2 = verdict(&labels, 8, true, &filters);
+        let ThreadVerdict::Move {
+            filter, planned, ..
+        } = run2
+        else {
+            panic!("run 2 must move the thread out of the inbox: {run2:?}");
+        };
+        assert_eq!(filter.name, "personal");
+        assert!(
+            planned.add.is_empty(),
+            "no stage label may be added: {planned:?}"
+        );
+        assert_eq!(planned.remove, vec!["INBOX".to_string()]);
+
+        let after = apply_move(&labels, &planned, &resolver);
+        assert_eq!(after, labels_of(&["CATEGORY_PERSONAL"]));
+        for stage in ["Purgatory", "Oblivion"] {
+            assert!(!after.contains(&Label::new(stage)), "{stage} on {after:?}");
+        }
+
+        // A third run over the archived thread: the personal move is now a no-op, it
+        // falls through, and nothing else matches. It stays where it is.
+        let run3 = verdict(&after, 40, true, &filters);
+        assert_eq!(run3, ThreadVerdict::Unowned, "{run3:?}");
+    }
+
+    /// The no-op exception after expiry: a bucket-labeled thread parked in Purgatory,
+    /// past both its bucket TTL and `Purge`'s, still reaches Oblivion. The bucket filter
+    /// still matches (its label survives by design) but its move is already done.
+    #[test]
+    fn noop_move_still_falls_through_to_purge() {
+        let filters = work_filters();
+        let labels = labels_of(&["llm/noise", "Purgatory"]);
+
+        match verdict(&labels, 10, false, &filters) {
+            ThreadVerdict::Move {
+                filter,
+                dest,
+                planned,
+            } => {
+                assert_eq!(filter.name, "Purge");
+                assert_eq!(dest, "Oblivion");
+                assert_eq!(planned.add, vec!["Label_8".to_string()]);
+                assert_eq!(planned.remove, vec!["Label_7".to_string()]);
+            }
+            other => panic!("expected Purge to move the thread to Oblivion, got {other:?}"),
+        }
+    }
+
+    /// The no-op exception before expiry (panel round 2): an unread Updates thread in
+    /// Purgatory, 4 days old. `updates` (unread 7d) has not expired, but its move to
+    /// Purgatory is already done, so it does not hold the thread there: `Purge` (3d)
+    /// takes it to Oblivion.
+    #[test]
+    fn unexpired_filter_does_not_hold_a_thread_already_in_purgatory() {
+        let filters = home_filters();
+        let labels = labels_of(&["UNREAD", "CATEGORY_UPDATES", "Purgatory"]);
+
+        match verdict(&labels, 4, false, &filters) {
+            ThreadVerdict::Move { filter, dest, .. } => {
+                assert_eq!(filter.name, "Purge");
+                assert_eq!(dest, "Oblivion");
+            }
+            other => panic!("expected Purge to move the thread to Oblivion, got {other:?}"),
+        }
+    }
+
+    /// A backward move is a no-op too: a bucket filter never owns a thread already in
+    /// Oblivion, so the walk ends unowned instead of holding or dragging it back.
+    #[test]
+    fn bucket_filter_does_not_own_an_oblivion_thread() {
+        let filters = work_filters();
+        let v = verdict(&labels_of(&["llm/noise", "Oblivion"]), 0, false, &filters);
+        assert_eq!(v, ThreadVerdict::Unowned, "{v:?}");
+    }
+
+    /// An unexpired `Delete` filter owns its thread like any other.
+    #[test]
+    fn unexpired_delete_filter_holds_its_thread() {
+        let filters = vec![
+            StateFilter {
+                name: "trash-noise".to_string(),
+                labels: vec![Label::new("llm/noise")],
+                ttl: ttl_days(5),
+                action: StateAction::Delete,
+            },
+            state_filter("Cull", &["INBOX"], ttl_days(1), "Purgatory"),
+        ];
+        let labels = labels_of(&["INBOX", "llm/noise"]);
+
+        let v = verdict(&labels, 2, true, &filters);
+        assert_eq!(held_by(&v), Some("trash-noise"), "{v:?}");
+
+        match verdict(&labels, 6, true, &filters) {
+            ThreadVerdict::Delete { filter } => assert_eq!(filter.name, "trash-noise"),
+            other => panic!("expected the expired Delete to fire, got {other:?}"),
+        }
     }
 
     /// The real data flow: thread label IDs off the wire resolve to names, the plan is
