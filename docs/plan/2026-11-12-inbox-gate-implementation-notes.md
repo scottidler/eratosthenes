@@ -169,3 +169,51 @@ None.
 - `cargo run -q -- senders --help; echo $?`: exit 0 (PASS; exit 2 on main).
 - Break-to-prove: ranking comparator changed to `a.messages.cmp(&a.messages)` made `senders_is_read_only_and_ranks_the_fixture` fail; restored.
 - `otto ci` exit 0.
+
+## Audit fold-in (implementation audit round 1)
+
+Findings fixed: F1 (must-fix), F2 (cheap-win), F5 (doc fix). Source: review-panel run jxnw01H2, synthesis and probes.
+
+### Findings and fixes
+- **F1: a config that fails to load dropped its account silently.** `discover_accounts` (src/cfg/account.rs) turned any `load_config` error into `warn!("Skipping ...")`, which runs before `logging::setup` and so printed nothing. With Phase 1's `deny_unknown_fields`, a typo in `tatari.yml` made the work account vanish from `config validate`, `run`, `triage`, `digest` and `service install` while `home` kept going (probe 8). With one account it surfaced as the wrong error, `No config files found` (probe 9).
+  - Fix: `discover_accounts` now returns the first load error, wrapped as `Failed to load account config <path>` with the parse error (key, line, column) as the cause. Candidate `*.yml` paths are sorted first, so the file reported is deterministic. Every caller propagates it: `resolve_accounts` (all subcommands, including `config validate`) and `service::install` (`discover_accounts()?`).
+  - `discovered_account_names` (dynamic `--help` text) now returns `Result`. src/main.rs renders ``Discovered accounts: (a config failed to load, see `eratosthenes config validate`): <error>`` instead of the old `(none)`, which would have been a lie.
+  - Observed after the fix, two-account XDG dir with `archvie: true` in tatari.yml: `config validate` exits 1, stderr `Error: Failed to load account config .../eratosthenes/tatari.yml` / `Caused by: Failed to parse YAML: triage: triage bucket 'n': unknown field 'archvie', expected one of ...` (backticks around the key in the real output).
+  - Tests: new `tests/discovery.rs`, which points discovery at a temp dir through `XDG_CONFIG_HOME` with no `--config` (no existing test did this; `xdg_config_dir` honors an absolute `XDG_CONFIG_HOME`). `discovered_account_with_unknown_triage_key_fails_validate` asserts non-zero exit and that stderr names `tatari.yml` and `archvie`. `valid_discovered_accounts_validate` asserts both accounts validate.
+  - Break-to-prove: restored the `match ... Err(e) => { warn!("Skipping ..."); continue; }` arm. `discovered_account_with_unknown_triage_key_fails_validate` FAILED at the non-zero-exit assert (tests/discovery.rs:57); the valid-dir test stayed green. Restored, both pass.
+- **F2: an RFC 5322 comment defeated the owner match.** `parse_address_header` (src/gmail/message.rs; the audit named src/triage/thread.rs, which calls it) kept the comment, so `To: scott.idler@tatari.tv (Scott)` parsed as `scott.idler@tatari.tv (scott)`, failed `is_solely_to`, and row 3 did not protect that human mail.
+  - Fix: new private `strip_comments` runs on the whole header before the `,` split. It drops parenthesized text, nestable, honoring `\` escapes, and leaves quoted strings alone. Stripping before the split also stops a comma inside a comment from splitting an address. An unclosed `(` runs to the end of the header, so the address after it is dropped rather than misread; for row 3 an empty To fails closed to "protect".
+  - Tests: `human_message_to_me_with_address_comment_protects_thread` (src/triage/thread.rs, SoleHuman for a non-automated sender); in src/gmail/message.rs `test_parse_address_header_strips_trailing_comment`, `..._strips_comments_around_angle_addr` (`Scott (work) <scott.idler@tatari.tv> (Scott)`), `..._comment_with_comma_does_not_split` (including a nested comment), `..._keeps_parens_inside_quoted_name`, `..._unclosed_comment_drops_rest`.
+  - Break-to-prove: made `strip_comments` return its input unchanged. Four tests FAILED: the trailing-comment, comma-in-comment and unclosed-comment parser tests, and `human_message_to_me_with_address_comment_protects_thread`. The angle-addr and quoted-name tests stayed green, as expected: the `rfind('<')` branch already handled those forms, so they are regression guards, not proofs of the fix. Restored, all pass. (A first attempt that bypassed the call failed to compile on the crate's `#![deny(dead_code)]`, so the break went into the helper body.)
+- **F5: the `home.yml` starter's relative `creds-path` moves with the file.** Verified in code: `load_config` (src/cfg/config.rs) joins a relative `creds-path` onto `config_path.parent()` and leaves absolute and `~/` paths alone; `AuthConfig.creds_path` goes through `deserialize_tilde_pathbuf`, so `~/` is expanded at load and `gmail/auth.rs` gets an absolute path. `config show` on a scratch copy: `creds-path: home` -> `<scratch dir>/home`; `creds-path: ~/.config/eratosthenes/home` -> `/home/saidler/.config/eratosthenes/home`. `tatari.yml` (dotfiles) uses relative `creds-path: tatari`, read through its symlink at `~/.config/eratosthenes/tatari.yml`, so it resolves to `~/.config/eratosthenes/tatari` (holds `client-secret.json` and `tokencache.json`).
+  - Fix (doc only): the starter now uses `creds-path: ~/.config/eratosthenes/home` with a bullet saying why; Phase 0b places the client secret there and notes where the token lands; Phase 9 notes nothing is copied; Resolved Decisions has the dated `2026-11-12 (implementation audit F5)` line. Status line untouched.
+
+### Design decisions
+- Fail on the first bad file, not after collecting all of them (src/cfg/account.rs:discover_accounts). `?` with a sorted path list is the smallest change that is loud and deterministic; a second bad file shows after the first is fixed.
+- Help text reports the load error rather than `(none)` (src/main.rs:main, src/cfg/account.rs:discovered_account_names). `--help` must still render with a broken config, and `(none)` would say something false.
+- Strip comments on the whole header before splitting (src/gmail/message.rs:strip_comments). It fixes the owner match and the comma-in-comment split in one pass; quoted strings are left intact.
+
+### Deviations
+- F2's fix lives in src/gmail/message.rs, not src/triage/thread.rs as the brief named it: `parse_address_header` is defined there and thread.rs only calls it. Same effect, correct seam. It also changes parsing for the other callers (draft reply-to, `GmailMessage` to/cc/from, `senders`), all toward the bare address.
+- `discovered_account_names` changed signature (`Vec<String>` -> `Result<Vec<String>>`). Not named in the brief; it is a `discover_accounts` caller and had to stop swallowing the error.
+
+### Tradeoffs
+- Hard error on any `*.yml` in the config dir that fails to load vs skipping files with no `auth:` section: the old doc comment said non-eratosthenes yml would be skipped, but a skip cannot tell "not ours" from "ours with a typo". The live dir holds only `tatari.yml` (plus `digest.env` and the `tatari/` creds dir, neither of which is `*.yml`), so nothing there is affected.
+- Hand-rolled comment stripper vs a mail-address parsing crate: the stripper is about 25 lines with tests; a crate would change every caller's parsing at once, which is past the finding's scope.
+
+### Open questions
+- None.
+
+### Accepted, not fixed (panel reasoning)
+- F3 (defer): a message that fails `TriageMessage::from_api` (missing id or internal_date, which Gmail always sends) is dropped with a warn, so protection never sees it and it keeps its own INBOX (it is not in `classified_message_ids`). The parser predates this work and the input is theoretical; if it is ever seen, skip the whole thread instead.
+- F4 (defer): `senders` looks up `From` with exact case while `from_metadata` lowercases, so a sender whose header is named `from` reports address "". Report-only and read-only; Gmail normally returns `From`.
+- README dry-run sample (no change): the "Connecting to Gmail..." block predates the archive column and the new summary format, but it is labeled as a 2026-09-07 capture, so it is historical, not wrong.
+- The panel's five questions, all closed:
+  1. Equivalent: `lib::triage` only builds the client and calls `triage::execute`, which sets metadata headers before `ensure_triage_labels` and the filter pass; no other caller exists.
+  2. Sound, no hole: `classified_message_ids` covers the trimmed snapshot, so a late message keeps INBOX and no `llm/seen`, comes back next run, and is evaluated with the whole thread. A late SENT reply never carries INBOX. Residual, already disclosed: local T0 vs server internalDate skew.
+  3. No behavioral difference: `sweep_answered` runs after classify_and_label (including the nothing-to-classify return) and before refresh_drafts, over INBOX plus the awaits-reply labels only; the draft arm keeps the same `is_answered`. Disclosed: no cap, and a double dry-run print when a bucket sets both draft and awaits-reply.
+  4. Acceptable: no consumer of eratosthenes stdout exists in the repo or dotfiles, systemd captures both streams, and the move to stderr is required for piped `senders` json.
+  5. Does not matter today: the personal account, the only gmail.com one, has no triage block, so rows 2/3 and the sweep never run there, and `senders` does not use `normalize_address`. It becomes a real limitation only if personal triage is turned on.
+
+### CI
+- `otto ci` exit 0 with all three fixes in.

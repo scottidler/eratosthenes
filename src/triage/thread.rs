@@ -808,6 +808,14 @@ pub(crate) mod tests {
         assert_eq!(thread.protection(ME), Some(Protection::SoleHuman));
     }
 
+    /// Implementation audit F2: an RFC 5322 comment on the owner's address
+    /// (`To: me (Me)`) must not defeat the owner match and let human mail archive.
+    #[test]
+    fn human_message_to_me_with_address_comment_protects_thread() {
+        let thread = thread_of(vec![human(&[("To", "scott.idler@tatari.tv (Scott)")])]);
+        assert_eq!(thread.protection(ME), Some(Protection::SoleHuman));
+    }
+
     #[test]
     fn human_message_with_cc_does_not_protect_thread() {
         let thread = thread_of(vec![human(&[("Cc", "boss@tatari.tv")])]);

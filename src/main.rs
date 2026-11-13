@@ -339,11 +339,13 @@ fn cmd_config_show(cli: &Cli, names: Vec<String>) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let discovered = discovered_account_names();
-    let account_help = if discovered.is_empty() {
-        "Discovered accounts: (none)".to_string()
-    } else {
-        format!("Discovered accounts: {}", discovered.join(", "))
+    let account_help = match discovered_account_names() {
+        Ok(discovered) if discovered.is_empty() => "Discovered accounts: (none)".to_string(),
+        Ok(discovered) => format!("Discovered accounts: {}", discovered.join(", ")),
+        Err(e) => format!(
+            "Discovered accounts: (a config failed to load, see `eratosthenes config validate`): {:#}",
+            e
+        ),
     };
 
     let cmd = Cli::command()

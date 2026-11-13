@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use eyre::{Context, Result};
-use log::{debug, warn};
+use log::debug;
 
 use crate::cfg::config::{Config, load_config, xdg_config_dir};
 
@@ -14,8 +14,9 @@ pub struct Account {
 }
 
 /// Discover all accounts by globbing *.yml in the config directory.
-/// Each file is validated as an eratosthenes config (must have an `auth:` section).
-/// Files that fail validation are skipped with a warning.
+/// Each file must load as an eratosthenes config. A file that fails to load is a hard
+/// error naming the file: discovery runs before logging is set up, so a skip-and-warn
+/// would silently drop the account from every run, triage and digest.
 pub fn discover_accounts() -> Result<Vec<Account>> {
     let config_dir = xdg_config_dir()
         .ok_or_else(|| eyre::eyre!("Cannot determine XDG config directory"))?
@@ -25,39 +26,34 @@ pub fn discover_accounts() -> Result<Vec<Account>> {
         return Ok(Vec::new());
     }
 
-    let mut accounts = Vec::new();
-
     let entries = std::fs::read_dir(&config_dir).context(format!(
         "Failed to read config directory: {}",
         config_dir.display()
     ))?;
 
+    let mut paths = Vec::new();
     for entry in entries {
         let entry = entry.context("Failed to read directory entry")?;
         let path = entry.path();
-
-        if !path.is_file() {
-            continue;
+        if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("yml") {
+            paths.push(path);
         }
-        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
-            continue;
-        }
+    }
+    // Sorted so the first failing file reported is deterministic.
+    paths.sort();
 
+    let mut accounts = Vec::new();
+    for path in paths {
         let name = path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or_default()
             .to_string();
 
-        match load_config(&path) {
-            Ok(config) => {
-                debug!("Discovered account '{}' from {}", name, path.display());
-                accounts.push(Account { name, config });
-            }
-            Err(e) => {
-                warn!("Skipping {}: {}", path.display(), e);
-            }
-        }
+        let config = load_config(&path)
+            .wrap_err_with(|| format!("Failed to load account config {}", path.display()))?;
+        debug!("Discovered account '{}' from {}", name, path.display());
+        accounts.push(Account { name, config });
     }
 
     // Sort by name for deterministic ordering
@@ -126,13 +122,10 @@ pub fn validate_accounts(accounts: &[Account]) -> Result<()> {
     Ok(())
 }
 
-/// Return the list of discovered account names (for dynamic help text).
-pub fn discovered_account_names() -> Vec<String> {
-    discover_accounts()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|a| a.name)
-        .collect()
+/// Return the list of discovered account names (for dynamic help text). An error
+/// means a config file failed to load; the caller says so rather than showing none.
+pub fn discovered_account_names() -> Result<Vec<String>> {
+    Ok(discover_accounts()?.into_iter().map(|a| a.name).collect())
 }
 
 /// Resolve config path from CLI --config flag or default locations.

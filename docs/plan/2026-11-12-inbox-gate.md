@@ -228,7 +228,7 @@ Personal account starter config (`home.yml`). The TTL values are Scott's to edit
 
 ```yaml
 auth:
-  creds-path: home
+  creds-path: ~/.config/eratosthenes/home   # absolute: the file moves (Phase 9)
   callback-port: 13132        # must differ from tatari's default 13131
 
 state-filters:
@@ -253,6 +253,7 @@ state-filters:
   - Purge:      { label: Purgatory, ttl: 3d, action: Oblivion }
 ```
 
+- `creds-path` is absolute on purpose. A relative one resolves against the config file's own directory (`load_config`), so the Phase 0b login from outside the config dir and the Phase 9 symlink into it would read two different creds dirs. `tatari.yml`'s relative `creds-path: tatari` is read through its symlink in `~/.config/eratosthenes/`, so it lands on `~/.config/eratosthenes/tatari`; the absolute path names the same layout for `home`.
 - No message filters. Gmail's categories do the sorting; `senders` shows what a filter should be written for.
 - Personal-category mail (family, law firms, title company) is archived and stops there. It never gets a stage label, so a bulk trash of Oblivion cannot take it. This holds only with the D5 ownership change: today a read Personal thread, 4 days old, would fall through to `Cull`.
 - No `triage:` and no `slack:` block, so the single triage and digest timers keep reading `tatari` alone. `home` sorts before `tatari`; with a triage block it would take over the timer schedule (`resolve_triage_schedule`, `src/service.rs:343`).
@@ -306,7 +307,7 @@ pub fn plan_archive(thread: &TriageThread, bucket: &TriageBucket, self_address: 
 #### Phase 0: Spikes, zero code
 **Model:** sonnet
 - 0a: reproduce D2 with throwaway user timers, replaying the `reinstall` sequence (stop, disable, remove units, reload, write, `enable --now`). Test the candidate fix.
-- 0b: personal OAuth. `eratosthenes -c <path outside ~/.config/eratosthenes>/home.yml auth login` with `callback-port: 13132`. Operator step: needs a browser.
+- 0b: personal OAuth. Put the personal OAuth client secret at `~/.config/eratosthenes/home/client-secret.json`, then `eratosthenes -c <path outside ~/.config/eratosthenes>/home.yml auth login` with `callback-port: 13132`. The starter's absolute `creds-path` writes the token to `~/.config/eratosthenes/home/tokencache.json`, the same place it is read from after Phase 9. Operator step: needs a browser.
 - 0c: `eratosthenes -c <same path> run --dry-run` against the starter `home.yml`.
 - **Success criteria:**
   - 0a: the stall appears on the current timer shape and not on the fixed shape
@@ -417,7 +418,7 @@ Follow-up, one unit installed as shape a and then reinstalled as shape d, with t
 
 #### Phase 9: Personal account
 **Model:** sonnet
-- Operator steps: Phase 0b and 0c, then `home.yml` into dotfiles and a symlink into the config dir. The file is live the moment it is in the config dir.
+- Operator steps: Phase 0b and 0c, then `home.yml` into dotfiles and a symlink into the config dir. The file is live the moment it is in the config dir. Its absolute `creds-path` keeps pointing at `~/.config/eratosthenes/home`, where 0b put the token; nothing is copied.
 - **Success criteria:**
   - `eratosthenes config validate` exits 0 with both accounts
   - the first live run's `Done:` line for `[home]` is pasted into the implementation notes with 0 skipped
@@ -461,6 +462,7 @@ Follow-up, one unit installed as shape a and then reinstalled as shape d, with t
 - 2026-11-12 (panel round 2, noted, no change): a reply to a thread already in Oblivion lands in INBOX with both labels. Stage sanitization (`sanitize_stages`, `src/engine.rs:223`) keeps the earliest stage and strips the later one, so the thread ages again from INBOX. Older than this doc; the reply is visible either way.
 - 2026-11-12: a category state filter emits no active-set clause. Reason in Architecture.
 - 2026-11-12: D2 fix is deleting `Persistent=true`, not adding `OnActiveSec=` and not a service start after `enable --now`. It removes the cause; the other two work around it. Measured in Phase 0a. (Panel M7 said the stamp file could not be the cause, citing the manual. The A/B result says it is.)
+- 2026-11-12 (implementation audit F5): the `home.yml` starter uses an absolute `creds-path: ~/.config/eratosthenes/home`. `load_config` resolves a relative `creds-path` against the config file's own directory, so the old `creds-path: home` would authenticate into `<outside path>/home` in Phase 0b and read `~/.config/eratosthenes/home` after the Phase 9 symlink, a directory with no token or client secret. Doc fix only; the resolution rule is unchanged.
 
 ## Alternatives Considered
 

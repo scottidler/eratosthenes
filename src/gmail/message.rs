@@ -108,11 +108,15 @@ impl GmailThread {
     }
 }
 
+/// The addresses in a To/Cc/From header, lowercased. RFC 5322 comments
+/// (`scott@x.com (Scott)`) are stripped first, so the bare address is what gets
+/// compared; a kept comment made `To: me (Me)` miss the owner match.
 pub(crate) fn parse_address_header(value: Option<&String>) -> Vec<String> {
     let Some(raw) = value else {
         return vec![];
     };
-    raw.split(',')
+    strip_comments(raw)
+        .split(',')
         .filter_map(|addr| {
             let addr = addr.trim();
             if let Some(start) = addr.rfind('<') {
@@ -125,6 +129,36 @@ pub(crate) fn parse_address_header(value: Option<&String>) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Remove RFC 5322 comments: parenthesized text, nestable, with `\` escapes,
+/// outside quoted strings. An unclosed comment runs to the end of the header,
+/// which drops the address after it rather than misreading it.
+fn strip_comments(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if depth > 0 || quoted => {
+                let escaped = chars.next();
+                if depth == 0 {
+                    out.push(c);
+                    out.extend(escaped);
+                }
+            }
+            '(' if !quoted => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            '"' if depth == 0 => {
+                quoted = !quoted;
+                out.push(c);
+            }
+            _ if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -151,6 +185,45 @@ mod tests {
         let raw = "alice@a.com, Bob <bob@b.com>, charlie@c.com".to_string();
         let result = parse_address_header(Some(&raw));
         assert_eq!(result, vec!["alice@a.com", "bob@b.com", "charlie@c.com"]);
+    }
+
+    #[test]
+    fn test_parse_address_header_strips_trailing_comment() {
+        let raw = "scott.idler@tatari.tv (Scott)".to_string();
+        assert_eq!(
+            parse_address_header(Some(&raw)),
+            vec!["scott.idler@tatari.tv"]
+        );
+    }
+
+    #[test]
+    fn test_parse_address_header_strips_comments_around_angle_addr() {
+        let raw = "Scott (work) <scott.idler@tatari.tv> (Scott)".to_string();
+        assert_eq!(
+            parse_address_header(Some(&raw)),
+            vec!["scott.idler@tatari.tv"]
+        );
+    }
+
+    #[test]
+    fn test_parse_address_header_comment_with_comma_does_not_split() {
+        let raw = "alice@a.com (Idler, Scott), bob@b.com (nested (x) y)".to_string();
+        assert_eq!(
+            parse_address_header(Some(&raw)),
+            vec!["alice@a.com", "bob@b.com"]
+        );
+    }
+
+    #[test]
+    fn test_parse_address_header_keeps_parens_inside_quoted_name() {
+        let raw = r#""Bob (eng)" <bob@b.com>"#.to_string();
+        assert_eq!(parse_address_header(Some(&raw)), vec!["bob@b.com"]);
+    }
+
+    #[test]
+    fn test_parse_address_header_unclosed_comment_drops_rest() {
+        let raw = "(oops alice@a.com".to_string();
+        assert!(parse_address_header(Some(&raw)).is_empty());
     }
 
     #[test]
