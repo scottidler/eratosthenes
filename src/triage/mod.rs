@@ -12,6 +12,7 @@ pub mod draft;
 pub mod thread;
 
 use std::collections::HashMap;
+use std::fmt;
 
 use chrono::{DateTime, Utc};
 use eyre::{Context, Result};
@@ -19,6 +20,7 @@ use log::{debug, error, info, warn};
 
 use crate::cfg::config::Config;
 use crate::cfg::triage::{TriageBucket, TriageConfig};
+use crate::engine;
 use crate::gmail::client::GmailClient;
 use crate::gmail::label::{LabelResolver, LabelVisibility, create_label_if_missing};
 use crate::skip::SkipLedger;
@@ -36,6 +38,9 @@ pub const SEEN_LABEL: &str = "llm/seen";
 /// The candidate query. Threads with no new messages match nothing, which is
 /// what makes a rerun a no-op.
 pub const CANDIDATE_QUERY: &str = "in:inbox -label:llm/seen";
+
+/// Gmail's system inbox label id. Archiving is removing it, nothing more.
+pub const INBOX_LABEL: &str = "INBOX";
 
 /// The bucket whose threads become the digest's Needs Reply section. Matched by
 /// bucket NAME so the Gmail label itself stays config: an account that renames
@@ -142,6 +147,10 @@ pub struct ThreadWrite {
     /// on these and no others, which is what makes a mid-pass arrival resurface
     /// on the next run instead of vanishing.
     pub classified_message_ids: Vec<String>,
+    /// Whether `classified_message_ids` also lose INBOX. Never applied by this
+    /// thread-level write: INBOX removal rides the message-level seen batch,
+    /// for the same mid-pass-arrival reason as the marker.
+    pub archive: ArchiveDecision,
 }
 
 /// Build the add/remove sets for one classified thread: add the new bucket,
@@ -160,6 +169,7 @@ pub fn plan_write(
     buckets: &[TriageBucket],
     resolver: &LabelResolver,
     seen_label: &str,
+    archive: ArchiveDecision,
 ) -> Result<ThreadWrite> {
     let bucket_id = resolver
         .resolve_name(&bucket.label)
@@ -184,6 +194,7 @@ pub fn plan_write(
         add: vec![bucket_id],
         remove,
         classified_message_ids: thread.messages.iter().map(|m| m.id.clone()).collect(),
+        archive,
     })
 }
 
@@ -200,6 +211,33 @@ pub enum ArchiveDecision {
     Stay,
     /// Rows 1 to 3: the thread is protected whatever the bucket says.
     StayProtected(Protection),
+}
+
+impl ArchiveDecision {
+    /// Whether the thread's classified messages lose INBOX.
+    pub fn archives(self) -> bool {
+        matches!(
+            self,
+            ArchiveDecision::Archive | ArchiveDecision::ArchiveAutomated
+        )
+    }
+}
+
+/// The dry-run column: `archive` | `archive (automated)` | `stay` |
+/// `stay (pinned|no-inbound|sole-human)`. Padded through `Formatter::pad`, so
+/// `{:<22}` lines the column up.
+impl fmt::Display for ArchiveDecision {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let column = match self {
+            ArchiveDecision::Archive => "archive",
+            ArchiveDecision::ArchiveAutomated => "archive (automated)",
+            ArchiveDecision::Stay => "stay",
+            ArchiveDecision::StayProtected(Protection::Pinned) => "stay (pinned)",
+            ArchiveDecision::StayProtected(Protection::NoInbound) => "stay (no-inbound)",
+            ArchiveDecision::StayProtected(Protection::SoleHuman) => "stay (sole-human)",
+        };
+        f.pad(column)
+    }
 }
 
 /// The archive decision table, first match wins. Pure: headers and labels in,
@@ -273,27 +311,29 @@ pub fn plan_labels(
         .collect()
 }
 
-/// Every thread mutation this run will perform. Same rule as `plan_labels`: a
-/// dry run plans nothing, so it mutates nothing.
-pub fn plan_writes(
-    threads: &[TriageThread],
-    classification: &classify::Classification,
-    triage: &TriageConfig,
-    resolver: &LabelResolver,
-    dry_run: bool,
-) -> Result<Vec<ThreadWrite>> {
-    if dry_run {
-        return Ok(Vec::new());
-    }
+/// One classified thread, the bucket the model put it in, and what the archive
+/// decision says about its INBOX label.
+#[derive(Debug)]
+pub struct Assignment<'a> {
+    pub thread: &'a TriageThread,
+    pub bucket: &'a TriageBucket,
+    pub archive: ArchiveDecision,
+}
 
-    let by_name: HashMap<&str, &TriageBucket> = triage
-        .buckets
-        .iter()
-        .map(|b| (b.name.as_str(), b))
-        .collect();
+/// Pair each classification with its fetched thread and bucket, and decide
+/// archive for each. The one place `plan_archive` runs: the dry-run column and
+/// the live write path both read these, so they cannot disagree.
+pub fn plan_assignments<'a>(
+    threads: &'a [TriageThread],
+    classification: &classify::Classification,
+    buckets: &'a [TriageBucket],
+    self_address: &str,
+) -> Vec<Assignment<'a>> {
+    let by_name: HashMap<&str, &TriageBucket> =
+        buckets.iter().map(|b| (b.name.as_str(), b)).collect();
     let by_id: HashMap<&str, &TriageThread> = threads.iter().map(|t| (t.id.as_str(), t)).collect();
 
-    let mut writes = Vec::new();
+    let mut assignments = Vec::new();
     for (thread_id, bucket_name) in &classification.assignments {
         let (Some(bucket), Some(thread)) = (
             by_name.get(bucket_name.as_str()),
@@ -305,15 +345,86 @@ pub fn plan_writes(
             );
             continue;
         };
-        writes.push(plan_write(
+        assignments.push(Assignment {
             thread,
             bucket,
-            &triage.buckets,
-            resolver,
-            SEEN_LABEL,
-        )?);
+            archive: plan_archive(thread, bucket, self_address),
+        });
     }
-    Ok(writes)
+    debug!(
+        "plan_assignments: classified={}, assigned={}",
+        classification.assignments.len(),
+        assignments.len()
+    );
+    assignments
+}
+
+/// Every thread mutation this run will perform. Same rule as `plan_labels`: a
+/// dry run plans nothing, so it mutates nothing.
+pub fn plan_writes(
+    assignments: &[Assignment],
+    buckets: &[TriageBucket],
+    resolver: &LabelResolver,
+    dry_run: bool,
+) -> Result<Vec<ThreadWrite>> {
+    if dry_run {
+        return Ok(Vec::new());
+    }
+    assignments
+        .iter()
+        .map(|a| plan_write(a.thread, a.bucket, buckets, resolver, SEEN_LABEL, a.archive))
+        .collect()
+}
+
+/// The seen-marker write, split by the archive decision. Both sets get
+/// `llm/seen`; the archive set also loses INBOX. Message-level, over the
+/// classified ids only: a message that arrived after the fetch is in neither.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SeenBatches {
+    pub stay: Vec<String>,
+    pub archive: Vec<String>,
+}
+
+/// Split the landed writes' classified message ids into the stay set and the
+/// archive set. Callers pass only writes whose bucket label landed, so a
+/// thread is archived only together with its bucket and its seen marker.
+pub fn plan_seen_batches<'a>(landed: impl IntoIterator<Item = &'a ThreadWrite>) -> SeenBatches {
+    let mut batches = SeenBatches::default();
+    for write in landed {
+        let target = if write.archive.archives() {
+            &mut batches.archive
+        } else {
+            &mut batches.stay
+        };
+        target.extend(write.classified_message_ids.iter().cloned());
+    }
+    batches
+}
+
+/// Candidates that existed when the filter pass started. A message dated at or
+/// after `filter_pass_start` may have landed after the filter queries ran, so
+/// no Star or Flag filter has judged it; the next run takes it.
+pub fn candidates_before(
+    candidates: Vec<CandidateMessage>,
+    filter_pass_start: DateTime<Utc>,
+) -> Vec<CandidateMessage> {
+    candidates
+        .into_iter()
+        .filter(|c| c.internal_date < filter_pass_start)
+        .collect()
+}
+
+/// Drop the messages of a fetched thread dated at or after `filter_pass_start`,
+/// returning how many went. Same reason as `candidates_before`, one level down:
+/// a candidate thread's snapshot can hold a reply that landed during the pass.
+/// A dropped message is never classified, marked seen, or archived, so it is
+/// still a candidate next run.
+pub fn drop_messages_from(thread: &mut TriageThread, filter_pass_start: DateTime<Utc>) -> usize {
+    let before = thread.messages.len();
+    thread
+        .messages
+        .retain(|m| m.internal_date < filter_pass_start);
+    before - thread.messages.len()
 }
 
 /// Classify and label one account's new inbox threads.
@@ -348,18 +459,42 @@ pub async fn execute(
         );
     }
 
+    // The filter pass below matches on header guards (`List-Id: []`), and an
+    // unfetched header reads as absent.
+    client.set_metadata_headers(engine::metadata_headers(&config.message_filters));
+
     ensure_triage_labels(client, triage, prefix, dry_run).await?;
+
+    // Triage is its own invocation (`eratosthenes triage`), not a phase of
+    // `run`, so it owns its ledger, shared by the filter pass and the classify
+    // pass. The ceiling is the same per-account `max-skipped-threads` the
+    // engine uses.
+    let mut skipped = SkipLedger::new(config.max_skipped_threads);
+
+    let filter_pass_start = if dry_run {
+        // No filter pass: `ensure_labels` creates labels and the filters write.
+        // A fresh mail a Star filter would catch can read `archive` here and
+        // `stay (pinned)` live.
+        Utc::now()
+    } else {
+        run_message_filters(client, config, &mut skipped, prefix).await?
+    };
 
     let self_address = client
         .profile_email()
         .await
         .context("resolving the account's own address")?;
 
-    // Triage is its own invocation (`eratosthenes triage`), not a phase of
-    // `run`, so it owns its ledger. The ceiling is the same per-account
-    // `max-skipped-threads` the engine uses.
-    let mut skipped = SkipLedger::new(config.max_skipped_threads);
-    classify_and_label(client, triage, &self_address, prefix, dry_run, &mut skipped).await?;
+    classify_and_label(
+        client,
+        triage,
+        &self_address,
+        prefix,
+        dry_run,
+        filter_pass_start,
+        &mut skipped,
+    )
+    .await?;
 
     // Runs on EVERY invocation, including one that classified nothing: the
     // refresh is what retries a thread whose previous run died between the
@@ -368,23 +503,75 @@ pub async fn execute(
     refresh_drafts(client, triage, &self_address, prefix, dry_run, &skipped).await
 }
 
+/// The account's message filters, the same pass `run` does, ahead of
+/// classification: a Star or Flag filter must see every mail the archive
+/// decision reads, or a mail it would pin is archived first. Returns the
+/// moment the pass started; discovery classifies only mail older than that.
+async fn run_message_filters(
+    client: &mut GmailClient,
+    config: &Config,
+    skipped: &mut SkipLedger,
+    prefix: &str,
+) -> Result<DateTime<Utc>> {
+    // Filter destinations and the marker must be in the resolver, or Gmail
+    // gets a label name where it wants an id.
+    engine::ensure_labels(client, config)
+        .await
+        .context("ensuring message-filter labels before the triage filter pass")?;
+    let filter_pass_start = Utc::now();
+    debug!(
+        "{}run_message_filters: filters={}, filter_pass_start={}",
+        prefix,
+        config.message_filters.len(),
+        filter_pass_start
+    );
+    let matched = engine::execute_message_filters(
+        client,
+        &config.message_filters,
+        &config.marker_label,
+        skipped,
+        prefix,
+        false,
+        false,
+    )
+    .await
+    .context("running message filters ahead of triage")?;
+    info!(
+        "{}triage filter pass: {} messages matched message filters",
+        prefix, matched
+    );
+    Ok(filter_pass_start)
+}
+
+/// Every count the triage summary line carries.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Tally {
+    classified: usize,
+    labeled: usize,
+    archived: usize,
+    protected: usize,
+    skipped: usize,
+}
+
 /// The classify pass: new inbox messages -> buckets -> one `threads.modify`
-/// each.
+/// each -> the seen marker, with INBOX removed from the archive set.
 async fn classify_and_label(
     client: &GmailClient,
     triage: &TriageConfig,
     self_address: &str,
     prefix: &str,
     dry_run: bool,
+    filter_pass_start: DateTime<Utc>,
     skipped: &mut SkipLedger,
 ) -> Result<()> {
     debug!(
-        "{}classify_and_label: dry_run={}, skip_ceiling_already_used={}",
+        "{}classify_and_label: dry_run={}, filter_pass_start={}, skip_ceiling_already_used={}",
         prefix,
         dry_run,
+        filter_pass_start,
         skipped.len()
     );
-    let selection = discover_candidates(client, triage, prefix).await?;
+    let selection = discover_candidates(client, triage, filter_pass_start, prefix).await?;
     if selection.thread_ids.is_empty() {
         info!("{}no new inbox messages to classify", prefix);
         println!("{}Triage: nothing to classify", prefix);
@@ -393,6 +580,13 @@ async fn classify_and_label(
 
     let mut threads: Vec<TriageThread> = Vec::new();
     for id in &selection.thread_ids {
+        if skipped.contains_thread(id) {
+            info!(
+                "{}thread {} was skipped by the filter pass; not classified this run",
+                prefix, id
+            );
+            continue;
+        }
         let raw = match client.get_thread_full(id).await {
             Ok(raw) => raw,
             Err(e) => {
@@ -407,35 +601,71 @@ async fn classify_and_label(
                 continue;
             }
         };
-        match TriageThread::from_api(raw) {
-            Ok(thread) => threads.push(thread),
-            Err(e) => warn!("{}skipping unreadable thread {}: {:#}", prefix, id, e),
+        let mut thread = match TriageThread::from_api(raw) {
+            Ok(thread) => thread,
+            Err(e) => {
+                warn!("{}skipping unreadable thread {}: {:#}", prefix, id, e);
+                continue;
+            }
+        };
+        // Same rule the draft pass follows: a message the filter pass could
+        // not judge leaves its whole thread for the next run.
+        if let Some(message) = thread
+            .messages
+            .iter()
+            .find(|m| skipped.contains_message(&m.id))
+        {
+            info!(
+                "{}thread {}: message {} was skipped by the filter pass; not classified this run",
+                prefix, id, message.id
+            );
+            continue;
         }
+        let deferred = drop_messages_from(&mut thread, filter_pass_start);
+        if deferred > 0 {
+            info!(
+                "{}thread {}: {} message(s) dated after the filter pass started; left for the next run",
+                prefix, id, deferred
+            );
+        }
+        if thread.messages.is_empty() {
+            continue;
+        }
+        threads.push(thread);
     }
     if threads.is_empty() {
         warn!(
-            "{}every candidate thread was unreadable; nothing to classify",
+            "{}no candidate thread was classifiable; nothing to classify",
             prefix
         );
-        print_summary(prefix, 0, 0, skipped.len(), dry_run);
+        print_summary(
+            prefix,
+            &Tally {
+                skipped: skipped.len(),
+                ..Tally::default()
+            },
+            dry_run,
+        );
         return Ok(());
     }
 
     let classification = classify_threads(triage, &threads, self_address, prefix).await?;
+    let assignments = plan_assignments(&threads, &classification, &triage.buckets, self_address);
 
     if dry_run {
-        let by_id: HashMap<&str, &TriageThread> =
-            threads.iter().map(|t| (t.id.as_str(), t)).collect();
-        for (thread_id, bucket_name) in &classification.assignments {
-            let subject = by_id.get(thread_id.as_str()).map_or("", |t| t.subject());
+        for assignment in &assignments {
             println!(
-                "{}{:<20} {:<14} {}",
-                prefix, thread_id, bucket_name, subject
+                "{}{:<20} {:<14} {:<22} {}",
+                prefix,
+                assignment.thread.id,
+                assignment.bucket.name,
+                assignment.archive,
+                assignment.thread.subject()
             );
         }
     }
 
-    let writes = plan_writes(&threads, &classification, triage, &client.resolver, dry_run)?;
+    let writes = plan_writes(&assignments, &triage.buckets, &client.resolver, dry_run)?;
 
     // ORDER IS A CORRECTNESS CONSTRAINT, not a preference (audit MF4).
     //
@@ -449,15 +679,14 @@ async fn classify_and_label(
     // write, leaves every message marked seen with no bucket label, and
     // `-label:llm/seen` means the thread can never resurface. That is permanent
     // loss, strictly worse than the bug this fixes.
-    let mut applied = 0usize;
-    let mut to_mark: Vec<String> = Vec::new();
+    let mut landed: Vec<&ThreadWrite> = Vec::new();
     for write in &writes {
         if let Err(e) = client
             .modify_thread(&write.thread_id, &write.add, &write.remove)
             .await
         {
-            // Skipped BEFORE `to_mark` is extended below, so a thread whose
-            // bucket did not land never earns a seen marker and resurfaces.
+            // Skipped BEFORE it joins `landed`, so a thread whose bucket did
+            // not land never earns a seen marker or loses INBOX, and resurfaces.
             skipped.skip_thread(
                 &write.thread_id,
                 "threads.modify",
@@ -470,88 +699,96 @@ async fn classify_and_label(
             continue;
         }
         info!(
-            "{}[triage:{}] thread {} labeled ({} removed)",
+            "{}[triage:{}] thread {} labeled ({} removed), {}",
             prefix,
             write.bucket,
             write.thread_id,
-            write.remove.len()
+            write.remove.len(),
+            write.archive
         );
-        applied += 1;
-        // Only writes that actually landed earn a marker.
-        to_mark.extend(write.classified_message_ids.iter().cloned());
+        landed.push(write);
     }
 
-    // ONE call for the whole pass, not one per thread: `batch_modify` chunks at
-    // 1000 ids for 50 quota units, so 50 threads cost 50 units total rather
-    // than 50 per thread. It also makes the marker write all-or-nothing across
-    // the run instead of leaving per-thread partial states, and structurally
-    // enforces the ordering above by being last.
-    if !to_mark.is_empty() {
+    // The seen marker, message-level, in two batches: the archive set also
+    // loses INBOX. INBOX removal rides this write and not the thread-level
+    // bucket write above, because `threads.modify` would archive a reply that
+    // landed after the fetch, unclassified, and `in:inbox` would never find it
+    // again. Over the classified ids only, so a message is archived only
+    // together with its seen marker. One call per set for the whole pass:
+    // `batch_modify` chunks at 1000 ids for 50 quota units. UNREAD is never
+    // touched: `Ttl::Detailed` keys on read state.
+    let batches = plan_seen_batches(landed.iter().copied());
+    if !batches.stay.is_empty() || !batches.archive.is_empty() {
         let seen_id = client
             .resolver
             .resolve_name(SEEN_LABEL)
             .ok_or_else(|| eyre::eyre!("label '{}' is not in the resolver", SEEN_LABEL))?
             .to_string();
         client
-            .batch_modify(&to_mark, std::slice::from_ref(&seen_id), &[])
+            .batch_modify(&batches.stay, std::slice::from_ref(&seen_id), &[])
             .await
             .with_context(|| {
                 format!(
                     "marking {} classified messages as seen (buckets are already written; \
 the next run will reclassify these threads)",
-                    to_mark.len()
+                    batches.stay.len()
+                )
+            })?;
+        client
+            .batch_modify(
+                &batches.archive,
+                std::slice::from_ref(&seen_id),
+                &[INBOX_LABEL.to_string()],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "marking {} classified messages as seen and archiving them (buckets are \
+already written; the next run will reclassify these threads)",
+                    batches.archive.len()
                 )
             })?;
         debug!(
-            "{}marked {} classified messages seen in one batch",
+            "{}marked {} classified messages seen, {} of them archived",
             prefix,
-            to_mark.len()
+            batches.stay.len() + batches.archive.len(),
+            batches.archive.len()
         );
     }
 
-    let skipped =
-        classification.unknown_buckets.len() + classification.missing_ids.len() + skipped.len();
-    info!(
-        "{}Triage done: {} classified, {} labeled, {} skipped{}",
-        prefix,
-        classification.assignments.len(),
-        applied,
-        skipped,
-        if dry_run { " (dry run)" } else { "" }
-    );
-    print_summary(
-        prefix,
-        classification.assignments.len(),
-        applied,
-        skipped,
-        dry_run,
-    );
+    let tally = Tally {
+        classified: classification.assignments.len(),
+        labeled: landed.len(),
+        archived: landed.iter().filter(|w| w.archive.archives()).count(),
+        protected: landed
+            .iter()
+            .filter(|w| matches!(w.archive, ArchiveDecision::StayProtected(_)))
+            .count(),
+        skipped: classification.unknown_buckets.len()
+            + classification.missing_ids.len()
+            + skipped.len(),
+    };
+    info!("{}", summary_line(prefix, &tally, dry_run));
+    print_summary(prefix, &tally, dry_run);
 
     Ok(())
 }
 
-fn summary_line(
-    prefix: &str,
-    classified: usize,
-    labeled: usize,
-    skipped: usize,
-    dry_run: bool,
-) -> String {
+fn summary_line(prefix: &str, tally: &Tally, dry_run: bool) -> String {
     format!(
-        "{}Triage: {} threads classified, {} labeled, {} skipped{}",
+        "{}Triage: {} threads classified, {} labeled, {} archived, {} protected, {} skipped{}",
         prefix,
-        classified,
-        labeled,
-        skipped,
+        tally.classified,
+        tally.labeled,
+        tally.archived,
+        tally.protected,
+        tally.skipped,
         if dry_run { " (dry run)" } else { "" }
     )
 }
 
-fn print_summary(prefix: &str, classified: usize, labeled: usize, skipped: usize, dry_run: bool) {
-    println!(
-        "{}",
-        summary_line(prefix, classified, labeled, skipped, dry_run)
-    );
+fn print_summary(prefix: &str, tally: &Tally, dry_run: bool) {
+    println!("{}", summary_line(prefix, tally, dry_run));
 }
 
 /// Create the bucket labels and the seen marker if they are missing. Idempotent
@@ -600,6 +837,7 @@ async fn ensure_triage_labels(
 async fn discover_candidates(
     client: &GmailClient,
     triage: &TriageConfig,
+    filter_pass_start: DateTime<Utc>,
     prefix: &str,
 ) -> Result<Selection> {
     let refs = client
@@ -624,6 +862,16 @@ async fn discover_candidates(
                 prefix, reference.id, e
             ),
         }
+    }
+
+    let listed = candidates.len();
+    let candidates = candidates_before(candidates, filter_pass_start);
+    if candidates.len() < listed {
+        info!(
+            "{}{} candidate message(s) dated at or after the filter pass start; left for the next run",
+            prefix,
+            listed - candidates.len()
+        );
     }
 
     let cap = triage.max_threads as usize;

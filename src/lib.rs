@@ -100,20 +100,7 @@ pub async fn run(
 
     let mut client = build_gmail_client(config, &prefix).await?;
 
-    // A header-based filter guard only works if the header is actually fetched.
-    // Request the standard parsing headers plus every header any filter references.
-    let mut metadata_headers: Vec<String> = ["To", "Cc", "From", "Subject"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    for filter in &config.message_filters {
-        for header_name in filter.headers.keys() {
-            if !metadata_headers.contains(header_name) {
-                metadata_headers.push(header_name.clone());
-            }
-        }
-    }
-    client.set_metadata_headers(metadata_headers);
+    client.set_metadata_headers(engine::metadata_headers(&config.message_filters));
 
     match thread_cache_path(account) {
         Some(cache_path) => execute_with_cache(

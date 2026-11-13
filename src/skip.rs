@@ -53,6 +53,14 @@ impl SkipLedger {
         self.ids.contains(&(Skipped::Thread, thread_id.to_string()))
     }
 
+    /// Was this message skipped earlier this run? Triage reads it to leave a
+    /// whole thread unclassified when a filter pass could not judge one of its
+    /// messages.
+    pub(crate) fn contains_message(&self, message_id: &str) -> bool {
+        self.ids
+            .contains(&(Skipped::Message, message_id.to_string()))
+    }
+
     /// The per-thread boundary: a `Thread`-scope failure is logged, recorded,
     /// and swallowed (`Ok`), unless it pushes the run over the ceiling; any
     /// `Account`-scope failure comes back unchanged so it fails the run.
@@ -203,6 +211,23 @@ mod tests {
             .unwrap();
         assert_eq!(ledger.len(), 2, "a thread and a message are distinct skips");
         assert!(ledger.contains_thread("19f0"));
+    }
+
+    #[test]
+    fn test_contains_message_sees_message_skips_only() {
+        let mut ledger = SkipLedger::new(10);
+        ledger
+            .skip_message("m1", "messages.get", failed_precondition(), "")
+            .unwrap();
+        ledger
+            .skip_thread("t1", "threads.get", failed_precondition(), "")
+            .unwrap();
+        assert!(ledger.contains_message("m1"));
+        assert!(
+            !ledger.contains_message("t1"),
+            "a thread skip is not a message skip"
+        );
+        assert!(!ledger.contains_message("m2"));
     }
 
     #[test]

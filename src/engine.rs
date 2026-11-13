@@ -142,7 +142,32 @@ pub async fn execute(
     })
 }
 
-async fn ensure_labels(client: &mut GmailClient, config: &Config) -> Result<()> {
+/// The message headers a metadata fetch must request: the standard parsing set
+/// plus every header any message filter guards on. A header guard only works
+/// if the header is actually fetched; an unfetched `List-Id` reads as absent,
+/// so a `List-Id`-guarded Star filter would pass on list mail. `run` and
+/// `triage` both build their client's header list here.
+pub(crate) fn metadata_headers(filters: &[MessageFilter]) -> Vec<String> {
+    let mut headers: Vec<String> = ["To", "Cc", "From", "Subject"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    for filter in filters {
+        for header_name in filter.headers.keys() {
+            if !headers.contains(header_name) {
+                headers.push(header_name.clone());
+            }
+        }
+    }
+    debug!(
+        "metadata_headers: filters={}, headers={:?}",
+        filters.len(),
+        headers
+    );
+    headers
+}
+
+pub(crate) async fn ensure_labels(client: &mut GmailClient, config: &Config) -> Result<()> {
     let mut needed: Vec<String> = Vec::new();
 
     for filter in &config.message_filters {
@@ -307,7 +332,7 @@ struct FilterCandidates<'a> {
 /// Each filter's candidate scope is its OWN query; message FETCHES are deduped across
 /// filters, scope is not. Filters are then evaluated in declaration order and the first
 /// matching filter claims the message - it is excluded from further filters.
-async fn execute_message_filters(
+pub(crate) async fn execute_message_filters(
     client: &GmailClient,
     filters: &[MessageFilter],
     marker: &str,
@@ -1532,6 +1557,30 @@ mod tests {
 
     fn unread(id: &str, from: &str) -> GmailMessage {
         message(id, from, &["INBOX", "UNREAD"])
+    }
+
+    #[test]
+    fn metadata_headers_adds_every_guarded_header_once_after_the_standard_set() {
+        let mut leadership = from_filter("leadership", &["ceo@x.com"]);
+        leadership.headers.insert("List-Id".to_string(), vec![]);
+        let mut only_me = from_filter("only-me", &["*"]);
+        only_me.headers.insert("List-Id".to_string(), vec![]);
+        only_me
+            .headers
+            .insert("To".to_string(), vec!["me@x.com".to_string()]);
+        assert_eq!(
+            metadata_headers(&[leadership, only_me]),
+            vec!["To", "Cc", "From", "Subject", "List-Id"]
+        );
+    }
+
+    #[test]
+    fn metadata_headers_without_header_guards_is_the_standard_set() {
+        assert_eq!(
+            metadata_headers(&[from_filter("plain", &["a@x.com"])]),
+            vec!["To", "Cc", "From", "Subject"]
+        );
+        assert_eq!(metadata_headers(&[]), vec!["To", "Cc", "From", "Subject"]);
     }
 
     fn message_map(msgs: Vec<GmailMessage>) -> HashMap<String, GmailMessage> {

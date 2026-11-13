@@ -21,7 +21,14 @@ const BATCH_MODIFY: &str = "/gmail/v1/users/me/messages/batchModify";
 const THREADS: &str = "/gmail/v1/users/me/threads";
 const NOISE_ID: &str = "Label_N";
 const SEEN_ID: &str = "Label_S";
-const LABELS: &[(&str, &str)] = &[(NOISE_ID, "llm/noise"), (SEEN_ID, "llm/seen")];
+const MARKER_ID: &str = "Label_T";
+/// `Triaged` is the default message-filter marker: live triage runs the filter
+/// pass first, and `ensure_labels` would otherwise create it.
+const LABELS: &[(&str, &str)] = &[
+    (NOISE_ID, "llm/noise"),
+    (SEEN_ID, "llm/seen"),
+    (MARKER_ID, "Triaged"),
+];
 
 /// A stub `claude`: `--version` answers, any other call records its stdin
 /// payload and classifies t1 and t3 into `noise` in the real envelope shape.
@@ -364,7 +371,11 @@ async fn skipped_thread_gets_no_draft_refresh_write() {
     mount_skipped_then_healthy_draft_thread(&server).await;
     let mut client = client_with_labels(
         &server,
-        &[(RELABEL_ID, "llm/needs-reply"), (SEEN_ID, "llm/seen")],
+        &[
+            (RELABEL_ID, "llm/needs-reply"),
+            (SEEN_ID, "llm/seen"),
+            (MARKER_ID, "Triaged"),
+        ],
     )
     .await;
 

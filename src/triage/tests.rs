@@ -146,7 +146,15 @@ fn test_plan_write_adds_the_bucket_and_not_the_seen_marker() {
     let thread = thread_with_labels("t1", &["INBOX"]);
     let bucket = &config.buckets[0];
 
-    let write = plan_write(&thread, bucket, &config.buckets, &resolver, SEEN_LABEL).unwrap();
+    let write = plan_write(
+        &thread,
+        bucket,
+        &config.buckets,
+        &resolver,
+        SEEN_LABEL,
+        ArchiveDecision::Stay,
+    )
+    .unwrap();
     assert_eq!(write.thread_id, "t1");
     assert_eq!(write.bucket, "needs-reply");
     assert_eq!(
@@ -172,7 +180,15 @@ fn test_plan_write_records_the_classified_message_ids() {
     let thread = thread_with_labels("t1", &["INBOX"]);
     let bucket = &config.buckets[0];
 
-    let write = plan_write(&thread, bucket, &config.buckets, &resolver, SEEN_LABEL).unwrap();
+    let write = plan_write(
+        &thread,
+        bucket,
+        &config.buckets,
+        &resolver,
+        SEEN_LABEL,
+        ArchiveDecision::Stay,
+    )
+    .unwrap();
     assert_eq!(
         write.classified_message_ids,
         vec!["m1".to_string()],
@@ -196,6 +212,7 @@ fn test_plan_write_fails_when_the_seen_label_is_unresolvable() {
         &config.buckets,
         &resolver,
         "llm/never-created",
+        ArchiveDecision::Stay,
     )
     .expect_err("an unresolvable marker must not plan a write");
     assert!(format!("{err:#}").contains("llm/never-created"), "{err:#}");
@@ -210,7 +227,15 @@ fn test_plan_write_removes_the_previous_bucket_label() {
     let thread = thread_with_labels("t1", &["INBOX", "Label_2"]);
     let bucket = &config.buckets[0];
 
-    let write = plan_write(&thread, bucket, &config.buckets, &resolver, SEEN_LABEL).unwrap();
+    let write = plan_write(
+        &thread,
+        bucket,
+        &config.buckets,
+        &resolver,
+        SEEN_LABEL,
+        ArchiveDecision::Stay,
+    )
+    .unwrap();
     assert_eq!(write.remove, vec!["Label_2".to_string()]);
 }
 
@@ -228,6 +253,7 @@ fn test_plan_write_leaves_non_bucket_labels_alone() {
         &config.buckets,
         &resolver,
         SEEN_LABEL,
+        ArchiveDecision::Stay,
     )
     .unwrap();
     assert!(write.remove.is_empty(), "remove={:?}", write.remove);
@@ -247,6 +273,7 @@ fn test_plan_write_does_not_remove_the_bucket_it_is_applying() {
         &config.buckets,
         &resolver,
         SEEN_LABEL,
+        ArchiveDecision::Stay,
     )
     .unwrap();
     assert!(write.remove.is_empty());
@@ -267,6 +294,7 @@ fn test_plan_write_fails_loudly_when_a_label_is_unresolved() {
         &config.buckets,
         &resolver,
         SEEN_LABEL,
+        ArchiveDecision::Stay,
     )
     .expect_err("an unresolved label must fail");
     assert!(
@@ -328,10 +356,12 @@ fn test_dry_run_plans_zero_thread_writes() {
         ..Default::default()
     };
 
-    let wet = plan_writes(&threads, &classification, &config, &resolver, false).unwrap();
+    let assignments = plan_assignments(&threads, &classification, &config.buckets, ME);
+
+    let wet = plan_writes(&assignments, &config.buckets, &resolver, false).unwrap();
     assert_eq!(wet.len(), 1, "precondition: a real run would write");
 
-    let dry = plan_writes(&threads, &classification, &config, &resolver, true).unwrap();
+    let dry = plan_writes(&assignments, &config.buckets, &resolver, true).unwrap();
     assert!(dry.is_empty(), "a dry run must plan zero thread writes");
 }
 
@@ -351,7 +381,8 @@ fn test_plan_writes_covers_every_assignment() {
         ..Default::default()
     };
 
-    let writes = plan_writes(&threads, &classification, &config, &resolver, false).unwrap();
+    let assignments = plan_assignments(&threads, &classification, &config.buckets, ME);
+    let writes = plan_writes(&assignments, &config.buckets, &resolver, false).unwrap();
     let planned: Vec<(&str, &str)> = writes
         .iter()
         .map(|w| (w.thread_id.as_str(), w.bucket.as_str()))
@@ -371,7 +402,8 @@ fn test_plan_writes_skips_an_assignment_whose_thread_was_not_fetched() {
         ..Default::default()
     };
 
-    let writes = plan_writes(&threads, &classification, &config, &resolver, false).unwrap();
+    let assignments = plan_assignments(&threads, &classification, &config.buckets, ME);
+    let writes = plan_writes(&assignments, &config.buckets, &resolver, false).unwrap();
     assert!(writes.is_empty());
 }
 
@@ -433,13 +465,32 @@ fn test_plan_draft_targets_on_an_empty_mailbox_plans_nothing() {
 
 #[test]
 fn test_summary_line_reports_skips_when_nothing_was_classified() {
+    let skipped_only = Tally {
+        skipped: 1,
+        ..Tally::default()
+    };
     assert_eq!(
-        summary_line("[a] ", 0, 0, 1, false),
-        "[a] Triage: 0 threads classified, 0 labeled, 1 skipped"
+        summary_line("[a] ", &skipped_only, false),
+        "[a] Triage: 0 threads classified, 0 labeled, 0 archived, 0 protected, 1 skipped"
+    );
+}
+
+#[test]
+fn test_summary_line_reports_archived_and_protected_counts() {
+    let tally = Tally {
+        classified: 76,
+        labeled: 76,
+        archived: 61,
+        protected: 4,
+        skipped: 0,
+    };
+    assert_eq!(
+        summary_line("", &tally, false),
+        "Triage: 76 threads classified, 76 labeled, 61 archived, 4 protected, 0 skipped"
     );
     assert_eq!(
-        summary_line("", 2, 2, 0, true),
-        "Triage: 2 threads classified, 2 labeled, 0 skipped (dry run)"
+        summary_line("", &tally, true),
+        "Triage: 76 threads classified, 76 labeled, 61 archived, 4 protected, 0 skipped (dry run)"
     );
 }
 
@@ -566,5 +617,187 @@ fn plan_archive_row_6() {
     assert_eq!(
         plan_archive(&thread, &bucket(true, false), ME),
         ArchiveDecision::Archive
+    );
+}
+
+// ---- the archive write path (Phase 4) ---------------------------------------
+
+#[test]
+fn archive_decision_column_names_every_variant() {
+    let columns: Vec<String> = [
+        ArchiveDecision::Archive,
+        ArchiveDecision::ArchiveAutomated,
+        ArchiveDecision::Stay,
+        ArchiveDecision::StayProtected(Protection::Pinned),
+        ArchiveDecision::StayProtected(Protection::NoInbound),
+        ArchiveDecision::StayProtected(Protection::SoleHuman),
+    ]
+    .iter()
+    .map(|d| d.to_string())
+    .collect();
+    assert_eq!(
+        columns,
+        vec![
+            "archive",
+            "archive (automated)",
+            "stay",
+            "stay (pinned)",
+            "stay (no-inbound)",
+            "stay (sole-human)",
+        ]
+    );
+}
+
+#[test]
+fn archive_decision_column_pads_for_alignment() {
+    assert_eq!(format!("{:<9}|", ArchiveDecision::Stay), "stay     |");
+}
+
+#[test]
+fn only_archive_variants_archive() {
+    assert!(ArchiveDecision::Archive.archives());
+    assert!(ArchiveDecision::ArchiveAutomated.archives());
+    assert!(!ArchiveDecision::Stay.archives());
+    assert!(!ArchiveDecision::StayProtected(Protection::SoleHuman).archives());
+}
+
+fn landed_write(thread_id: &str, ids: &[&str], archive: ArchiveDecision) -> ThreadWrite {
+    ThreadWrite {
+        thread_id: thread_id.to_string(),
+        bucket: "noise".to_string(),
+        add: vec!["Label_2".to_string()],
+        remove: Vec::new(),
+        classified_message_ids: ids.iter().map(|s| s.to_string()).collect(),
+        archive,
+    }
+}
+
+#[test]
+fn plan_seen_batches_splits_classified_ids_by_the_archive_decision() {
+    let writes = [
+        landed_write("t1", &["t1-m1", "t1-m2"], ArchiveDecision::Archive),
+        landed_write(
+            "t2",
+            &["t2-m1"],
+            ArchiveDecision::StayProtected(Protection::SoleHuman),
+        ),
+        landed_write("t3", &["t3-m1"], ArchiveDecision::ArchiveAutomated),
+        landed_write("t4", &["t4-m1"], ArchiveDecision::Stay),
+    ];
+    assert_eq!(
+        plan_seen_batches(writes.iter()),
+        SeenBatches {
+            stay: vec!["t2-m1".to_string(), "t4-m1".to_string()],
+            archive: vec![
+                "t1-m1".to_string(),
+                "t1-m2".to_string(),
+                "t3-m1".to_string()
+            ],
+        }
+    );
+}
+
+#[test]
+fn plan_seen_batches_of_nothing_is_empty() {
+    assert_eq!(plan_seen_batches([].iter()), SeenBatches::default());
+}
+
+#[test]
+fn candidates_before_drops_a_message_dated_at_or_after_the_cutoff() {
+    let cutoff = DateTime::from_timestamp_millis(5_000).unwrap();
+    let kept = candidates_before(
+        vec![
+            candidate("old", 4_999),
+            candidate("at", 5_000),
+            candidate("after", 9_000),
+        ],
+        cutoff,
+    );
+    assert_eq!(kept, vec![candidate("old", 4_999)]);
+}
+
+#[test]
+fn drop_messages_from_trims_a_reply_that_landed_during_the_pass() {
+    let mut thread = archive_thread(vec![
+        ("m1", vec![("From", "bob@x.com")], &["INBOX"]),
+        ("m2", vec![("From", "bob@x.com")], &["INBOX"]),
+    ]);
+    // archive_thread dates m1 at 1000 ms and m2 at 2000 ms.
+    let dropped = drop_messages_from(&mut thread, DateTime::from_timestamp_millis(2_000).unwrap());
+    assert_eq!(dropped, 1);
+    let ids: Vec<&str> = thread.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["m1"]);
+}
+
+#[test]
+fn drop_messages_from_keeps_a_thread_that_predates_the_pass() {
+    let mut thread = archive_thread(vec![("m1", vec![("From", "bob@x.com")], &["INBOX"])]);
+    assert_eq!(
+        drop_messages_from(
+            &mut thread,
+            DateTime::from_timestamp_millis(10_000).unwrap()
+        ),
+        0
+    );
+    assert_eq!(thread.messages.len(), 1);
+}
+
+#[test]
+fn plan_assignments_decides_archive_once_per_assigned_thread() {
+    let yaml = r#"
+schedule: "Mon..Fri 06:30:00"
+buckets:
+  - name: noise
+    label: llm/noise
+    description: everything else
+    archive: true
+"#;
+    let config: TriageConfig = serde_yaml::from_str(yaml).unwrap();
+    let bot = archive_thread(vec![("m1", BOT_TO_LIST.to_vec(), &["INBOX"])]);
+    let classification = Classification {
+        assignments: vec![
+            ("t1".to_string(), "noise".to_string()),
+            ("ghost".to_string(), "noise".to_string()),
+        ],
+        ..Default::default()
+    };
+    let threads = [bot];
+    let assignments = plan_assignments(&threads, &classification, &config.buckets, ME);
+    assert_eq!(
+        assignments.len(),
+        1,
+        "an unfetched thread gets no assignment"
+    );
+    assert_eq!(assignments[0].thread.id, "t1");
+    assert_eq!(assignments[0].archive, ArchiveDecision::Archive);
+}
+
+#[test]
+fn plan_writes_carries_the_archive_decision_but_never_removes_inbox() {
+    let yaml = r#"
+schedule: "Mon..Fri 06:30:00"
+buckets:
+  - name: noise
+    label: llm/noise
+    description: everything else
+    archive: true
+"#;
+    let config: TriageConfig = serde_yaml::from_str(yaml).unwrap();
+    let resolver = resolver_with_llm_labels();
+    let threads = [archive_thread(vec![(
+        "m1",
+        BOT_TO_LIST.to_vec(),
+        &["INBOX"],
+    )])];
+    let classification = Classification {
+        assignments: vec![("t1".to_string(), "noise".to_string())],
+        ..Default::default()
+    };
+    let assignments = plan_assignments(&threads, &classification, &config.buckets, ME);
+    let writes = plan_writes(&assignments, &config.buckets, &resolver, false).unwrap();
+    assert_eq!(writes[0].archive, ArchiveDecision::Archive);
+    assert!(
+        !writes[0].remove.iter().any(|id| id == INBOX_LABEL),
+        "INBOX removal rides the seen batch, never the thread-level write"
     );
 }
