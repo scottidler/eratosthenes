@@ -8,7 +8,7 @@ use serde_yaml::{Value, from_value};
 /// label. Buckets are config, not code, so adding one is a YAML edit (design doc,
 /// Data Model): the `description` is folded directly into the classifier prompt.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TriageBucket {
     pub name: String,
     pub label: String,
@@ -16,13 +16,21 @@ pub struct TriageBucket {
     /// Whether this bucket gets a reply draft (Phase 7). Most buckets don't.
     #[serde(default)]
     pub draft: bool,
+    /// Whether a thread classified into this bucket leaves INBOX at label time
+    /// (subject to the code-level archive guard). Default: stays.
+    #[serde(default)]
+    pub archive: bool,
+    /// A human is waiting on me in this bucket: a bot is archived anyway, and my
+    /// reply clears the label.
+    #[serde(default)]
+    pub awaits_reply: bool,
 }
 
 /// Optional per-account `triage:` block: the LLM classification pass in front of
 /// the deterministic aging engine (design doc, Data Model). Absent -> `triage` is
 /// a no-op and no triage timer is generated.
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct TriageConfig {
     /// Path to the `claude` binary. Unset -> resolved on PATH at call time
     /// (Phase 4/5); Phase 1 only carries the config value.
@@ -89,6 +97,22 @@ complete message",
                 crate::triage::body::MIN_MARKED_FRAGMENT_CHARS
             );
         }
+        for bucket in &self.buckets {
+            if bucket.archive && bucket.draft {
+                eyre::bail!(
+                    "triage bucket '{}': archive: true with draft: true -- the draft pass lists \
+INBOX + the bucket label, so an archived bucket could never get a draft",
+                    bucket.name
+                );
+            }
+            if bucket.awaits_reply && bucket.archive {
+                eyre::bail!(
+                    "triage bucket '{}': awaits-reply: true with archive: true -- an archived \
+bucket is not waiting on a reply, so neither consequence of awaits-reply applies",
+                    bucket.name
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -116,30 +140,40 @@ fn default_buckets() -> Vec<TriageBucket> {
             label: "llm/needs-reply".to_string(),
             description: "a real human wrote to Scott and expects a reply or action".to_string(),
             draft: true,
+            archive: false,
+            awaits_reply: false,
         },
         TriageBucket {
             name: "fyi-work".to_string(),
             label: "llm/fyi-work".to_string(),
             description: "work-relevant notifications -- AWS, security, CI, vendors".to_string(),
             draft: false,
+            archive: false,
+            awaits_reply: false,
         },
         TriageBucket {
             name: "recruiting".to_string(),
             label: "llm/recruiting".to_string(),
             description: "LinkedIn, recruiters, job alerts".to_string(),
             draft: false,
+            archive: false,
+            awaits_reply: false,
         },
         TriageBucket {
             name: "receipts".to_string(),
             label: "llm/receipts".to_string(),
             description: "invoices, payments, renewals, order confirmations".to_string(),
             draft: false,
+            archive: false,
+            awaits_reply: false,
         },
         TriageBucket {
             name: "noise".to_string(),
             label: "llm/noise".to_string(),
             description: "everything else -- marketing, newsletters, social".to_string(),
             draft: false,
+            archive: false,
+            awaits_reply: false,
         },
     ]
 }
@@ -312,6 +346,59 @@ buckets:
             serde_yaml::from_str("schedule: 'Mon 07:00:00'\n").expect("parses");
         assert_eq!(config.body_chars, 4000);
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_archive_and_awaits_reply_default_false() {
+        let config: TriageConfig =
+            serde_yaml::from_str("schedule: 'Mon 07:00:00'\n").expect("parses");
+        assert!(config.buckets.iter().all(|b| !b.archive && !b.awaits_reply));
+    }
+
+    #[test]
+    fn test_archive_and_awaits_reply_parse_kebab_case() {
+        let yaml = r#"
+schedule: "Mon 07:00:00"
+buckets:
+  - { name: a, label: llm/a, description: d, archive: true }
+  - { name: b, label: llm/b, description: d, awaits-reply: true }
+"#;
+        let config: TriageConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.buckets[0].archive && !config.buckets[0].awaits_reply);
+        assert!(config.buckets[1].awaits_reply && !config.buckets[1].archive);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_archive_with_draft() {
+        let yaml = r#"
+schedule: "Mon 07:00:00"
+buckets:
+  - { name: a, label: llm/a, description: d, archive: true, draft: true }
+"#;
+        let config: TriageConfig = serde_yaml::from_str(yaml).unwrap();
+        let text = format!("{:#}", config.validate().unwrap_err());
+        assert!(text.contains("'a'"), "{}", text);
+    }
+
+    #[test]
+    fn test_validate_rejects_awaits_reply_with_archive() {
+        let yaml = r#"
+schedule: "Mon 07:00:00"
+buckets:
+  - { name: a, label: llm/a, description: d, archive: true, awaits-reply: true }
+"#;
+        let config: TriageConfig = serde_yaml::from_str(yaml).unwrap();
+        let text = format!("{:#}", config.validate().unwrap_err());
+        assert!(text.contains("'a'"), "{}", text);
+    }
+
+    #[test]
+    fn test_unknown_triage_keys_are_rejected() {
+        let bucket = "schedule: 'Mon 07:00:00'\nbuckets:\n  - { name: a, label: llm/a, description: d, archvie: true }\n";
+        assert!(serde_yaml::from_str::<TriageConfig>(bucket).is_err());
+        let top = "schedule: 'Mon 07:00:00'\nmax-thread: 5\n";
+        assert!(serde_yaml::from_str::<TriageConfig>(top).is_err());
     }
 
     #[test]

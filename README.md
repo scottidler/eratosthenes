@@ -15,8 +15,8 @@ Starred and Important threads with `ttl: Keep` so they stay put.
   bucket labels with one LLM call (see [Triage](#triage) below).
   - `--dry-run` - full classify pass, prints the thread -> bucket table, zero
     Gmail mutations. Stricter than `run --dry-run`.
-- `eratosthenes digest [accounts...]` - post the pinned-inbox (Needs Reply +
-  Starred + Important) digest to Slack.
+- `eratosthenes digest [accounts...]` - post the pinned-inbox (Starred +
+  Important) digest to Slack.
 - `eratosthenes auth login|logout|status` - manage OAuth2 tokens.
 - `eratosthenes config validate|show` - inspect resolved config.
 - `eratosthenes service install|uninstall|reinstall|status|start|stop` - manage
@@ -92,6 +92,67 @@ triage:
 - Hitting `max-threads` logs loudly and never truncates silently; the
   remainder is classified on the next run.
 
+#### Bucket keys: `archive` and `awaits-reply`
+
+Two optional bool keys per bucket, both default `false`, so a config that has
+not opted in behaves as before:
+
+```yaml
+buckets:
+  - name: needs-reply
+    label: llm/needs-reply
+    archive: false        # stays in INBOX
+    awaits-reply: true    # a bot is archived anyway; my reply clears the label
+  - name: noise
+    label: llm/noise
+    archive: true         # leaves INBOX at label time
+```
+
+- `archive: true` removes INBOX from the classified messages of a thread at
+  label time. The thread keeps its bucket label and ages to Purgatory ->
+  Oblivion on the bucket's state-filter TTL. Archive does not remove `UNREAD`.
+- `awaits-reply: true` means a human is waiting on me. A bot cannot be waiting
+  (row 4 below), and once I reply nobody is (the label is cleared).
+- Config errors, each naming the bucket: `archive: true` with `draft: true`
+  (the draft pass lists INBOX + the label, so an archived bucket never gets a
+  draft); `awaits-reply: true` with `archive: true`.
+- Unknown keys in a `triage:` block or a bucket are a config error, so a typo
+  like `archvie: true` cannot silently do nothing.
+
+The archive decision is pure code over headers and labels; the model picks the
+bucket and nothing else. First match wins:
+
+| # | Condition | Result |
+|---|-----------|--------|
+| 1 | any message carries `STARRED` or `IMPORTANT` | stay (`pinned`) |
+| 2 | the thread has no inbound message (every message is from me) | stay (`no-inbound`) |
+| 3 | any inbound message is from a non-automated sender and is solely to me, or has no parseable To | stay (`sole-human`) |
+| 4 | bucket is `awaits-reply` and the newest inbound sender is automated | archive (`automated`) |
+| 5 | bucket has `archive: false` | stay |
+| 6 | otherwise | archive |
+
+An automated sender is decided from headers alone: `List-Id`,
+`List-Unsubscribe`, `Auto-Submitted` other than `no`, `Precedence` of
+`bulk`/`list`/`junk`, or a `noreply`/`donotreply`/`mailer-daemon` local part.
+"Stay" means the thread keeps its label, stays in INBOX, and ages on the bucket
+TTL.
+
+#### State filter ownership
+
+A state filter that matches a thread owns it while its TTL runs: evaluation
+ends there and later filters (such as a catch-all `Cull`) do not apply. One
+exception: when the filter's planned move is already satisfied (the thread is
+at or past the destination stage), the filter does not own the thread and
+evaluation falls through, so a bucket-labeled thread in Purgatory still reaches
+Oblivion on `Purge`'s own TTL.
+
+#### Accepted behavior: message-filter destination plus bucket label
+
+A thread holding both a message-filter destination (for example `Bots`) and an
+`llm/*` label ages on the bucket TTL, because bucket state filters match on the
+label alone. Filters move messages; triage labels threads. This is accepted,
+not a defect.
+
 `eratosthenes triage --dry-run` runs the full classify pass with **zero Gmail
 mutations** (no labels created, no `llm/seen` written) - stricter than `run
 --dry-run`, which may still create missing labels. Actually run against the
@@ -141,14 +202,13 @@ slack:
 - The token is never stored in YAML; the config names an env var. A user token
   (`xoxp`) is used because the destination is your self-DM, which only your own
   token can post into. It needs the `chat:write` scope.
-- `eratosthenes digest` posts one message: three grouped sections (Needs Reply,
-  Starred, Important) with per-item date / sender / subject, the subject
+- `eratosthenes digest` posts one message: two grouped sections (Starred,
+  Important) with per-item date / sender / subject, the subject
   deep-linked to the Gmail thread. An empty pinned set posts a positive
   `Inbox clear` line.
-- A thread appears exactly ONCE, in its highest section: Needs Reply beats
-  Starred beats Important. Needs Reply is the `triage:` block's `needs-reply`
-  bucket label intersected with the inbox, so the section only exists for an
-  account that has a `triage:` block.
+- A thread appears exactly ONCE, in its highest section: Starred beats
+  Important. The digest reads Starred + Important and nothing else; a
+  model-picked section is deliberately not part of it.
 - Querying is at the thread level, so each thread is exactly one line even if it
   has several starred replies.
 
@@ -166,7 +226,7 @@ triage uses, on the `triage:` block's `classify-model`. Nothing is cached.
 - Bullets are capped at 80 characters each, in the prompt and again in Rust.
 - Over the readability budget the digest sheds bullets before it sheds threads,
   never drops an ask, and only then drops trailing threads least-actionable
-  first (Important, then Starred, then Needs Reply).
+  first (Important, then Starred).
 - Any `claude` failure still posts the digest, subjects and deep links intact,
   with a `bullets unavailable: <cause>` line naming the failure class. An
   account with NO `triage:` block posts an un-enriched digest with no such line;

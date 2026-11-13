@@ -27,6 +27,9 @@ impl Label {
             "TRASH" => Label::Trash,
             "SPAM" => Label::Spam,
             "UNREAD" => Label::Unread,
+            // Gmail's category system labels are uppercase ids; lowercase in config
+            // would never match and ensure_labels would create a user label.
+            _ if up.starts_with("CATEGORY_") => Label::Custom(up),
             _ => Label::Custom(trimmed.to_string()),
         }
     }
@@ -101,6 +104,22 @@ mod tests {
         assert_eq!(
             Label::new("work/projects"),
             Label::Custom("work/projects".to_string())
+        );
+    }
+
+    #[test]
+    fn test_label_category_is_uppercased() {
+        assert_eq!(
+            Label::new("category_promotions"),
+            Label::Custom("CATEGORY_PROMOTIONS".to_string())
+        );
+        assert_eq!(
+            Label::new("CATEGORY_PERSONAL").to_gmail_id(),
+            "CATEGORY_PERSONAL"
+        );
+        assert_eq!(
+            Label::new("categoryfoo"),
+            Label::Custom("categoryfoo".to_string())
         );
     }
 

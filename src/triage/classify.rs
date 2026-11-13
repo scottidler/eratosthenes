@@ -269,12 +269,16 @@ mod tests {
                 label: "llm/needs-reply".to_string(),
                 description: "a real human expects a reply".to_string(),
                 draft: true,
+                archive: false,
+                awaits_reply: false,
             },
             TriageBucket {
                 name: "noise".to_string(),
                 label: "llm/noise".to_string(),
                 description: "everything else".to_string(),
                 draft: false,
+                archive: false,
+                awaits_reply: false,
             },
         ]
     }

@@ -121,3 +121,98 @@ triage:
         stderr
     );
 }
+
+#[test]
+fn archive_with_draft_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("account.yml");
+    std::fs::write(
+        &config_path,
+        r#"
+auth:
+  creds-path: /tmp/creds
+triage:
+  schedule: "Mon..Fri 06:30:00"
+  buckets:
+    - name: gated
+      label: llm/gated
+      description: x
+      archive: true
+      draft: true
+"#,
+    )
+    .unwrap();
+
+    let output = run_config_validate(&config_path);
+    assert!(!output.status.success(), "must exit nonzero");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gated"),
+        "error must name the bucket, got:\n{}",
+        stderr
+    );
+    assert!(stderr.contains("draft"), "got:\n{}", stderr);
+}
+
+#[test]
+fn awaits_reply_with_archive_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("account.yml");
+    std::fs::write(
+        &config_path,
+        r#"
+auth:
+  creds-path: /tmp/creds
+triage:
+  schedule: "Mon..Fri 06:30:00"
+  buckets:
+    - name: gated
+      label: llm/gated
+      description: x
+      archive: true
+      awaits-reply: true
+"#,
+    )
+    .unwrap();
+
+    let output = run_config_validate(&config_path);
+    assert!(!output.status.success(), "must exit nonzero");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gated"),
+        "error must name the bucket, got:\n{}",
+        stderr
+    );
+    assert!(stderr.contains("awaits-reply"), "got:\n{}", stderr);
+}
+
+#[test]
+fn unknown_bucket_key_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = dir.path().join("account.yml");
+    std::fs::write(
+        &config_path,
+        r#"
+auth:
+  creds-path: /tmp/creds
+triage:
+  schedule: "Mon..Fri 06:30:00"
+  buckets:
+    - name: gated
+      label: llm/gated
+      description: x
+      archvie: true
+"#,
+    )
+    .unwrap();
+
+    let output = run_config_validate(&config_path);
+    assert!(!output.status.success(), "must exit nonzero");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gated"),
+        "error must name the bucket, got:\n{}",
+        stderr
+    );
+    assert!(stderr.contains("archvie"), "got:\n{}", stderr);
+}
