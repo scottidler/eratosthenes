@@ -82,7 +82,8 @@ impl GmailClient {
     pub async fn new(hub: Hub, prefix: &str) -> Result<Self> {
         let limiter = RateLimiter::new();
 
-        println!("{}Connecting to Gmail...", prefix);
+        // stderr: `senders` prints a report on stdout that must stay parseable.
+        eprintln!("{}Connecting to Gmail...", prefix);
         let label_list = with_retry(&limiter, "labels.list", || async {
             limiter.acquire(1).await;
             hub.users()

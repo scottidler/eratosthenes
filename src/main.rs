@@ -10,8 +10,9 @@ mod cli;
 mod logging;
 mod service;
 
-use cli::{AuthCommand, Cli, Command, ConfigCommand, ServiceCommand};
+use cli::{AuthCommand, Cli, Command, ConfigCommand, Format, ServiceCommand};
 use eratosthenes::cfg::account::{Account, discovered_account_names, resolve_accounts};
+use std::io::IsTerminal;
 
 const ENV_LOG_LEVEL: &str = "ERATOSTHENES_LOG_LEVEL";
 
@@ -128,6 +129,55 @@ async fn cmd_triage(cli: &Cli, names: Vec<String>, dry_run: bool) -> Result<()> 
             errors.push(format!("{}: {:#}", name, e));
         }
     }
+
+    if !errors.is_empty() {
+        eyre::bail!(
+            "{} account(s) failed:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        );
+    }
+    Ok(())
+}
+
+async fn cmd_senders(
+    cli: &Cli,
+    names: Vec<String>,
+    days: u32,
+    limit: usize,
+    format: Option<Format>,
+) -> Result<()> {
+    let accounts = resolve_accounts(cli.config.as_ref(), &names)?;
+    let level = log_level_from_accounts(cli.log_level.as_deref(), &accounts);
+    let account_names: Vec<&str> = accounts.iter().map(|a| a.name.as_str()).collect();
+    logging::setup(&level, &account_names)?;
+
+    // Sequential and independent per account, like cmd_digest: one account's
+    // failure is reported and the rest still print. One document at the end.
+    let mut reports = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    for account in accounts {
+        let name = account.name;
+        let config = account.config;
+        let result = logging::ACCOUNT
+            .scope(name.clone(), async {
+                eratosthenes::senders(&name, &config, days, limit).await
+            })
+            .await;
+        match result {
+            Ok(report) => reports.push(report),
+            Err(e) => {
+                eprintln!("[{}] FAILED: {:#}", name, e);
+                errors.push(format!("{}: {:#}", name, e));
+            }
+        }
+    }
+
+    let format = Format::resolve(format, std::io::stdout().is_terminal());
+    println!(
+        "{}",
+        eratosthenes::senders::render(&reports, format == Format::Json)?
+    );
 
     if !errors.is_empty() {
         eyre::bail!(
@@ -300,6 +350,7 @@ async fn main() -> Result<()> {
         .mut_subcommand("run", |cmd| cmd.after_help(&account_help))
         .mut_subcommand("triage", |cmd| cmd.after_help(&account_help))
         .mut_subcommand("digest", |cmd| cmd.after_help(&account_help))
+        .mut_subcommand("senders", |cmd| cmd.after_help(&account_help))
         .mut_subcommand("auth", |cmd| {
             cmd.mut_subcommand("login", |cmd| cmd.after_help(&account_help))
                 .mut_subcommand("logout", |cmd| cmd.after_help(&account_help))
@@ -326,6 +377,12 @@ async fn main() -> Result<()> {
         Some(Command::Triage { accounts, dry_run }) => {
             cmd_triage(&cli, accounts.clone(), *dry_run).await
         }
+        Some(Command::Senders {
+            accounts,
+            days,
+            limit,
+            format,
+        }) => cmd_senders(&cli, accounts.clone(), *days, *limit, *format).await,
         Some(Command::Digest { accounts }) => cmd_digest(&cli, accounts.clone()).await,
         Some(Command::Auth(opts)) => match &opts.command {
             AuthCommand::Login { account } => cmd_auth_login(&cli, account.clone()).await,

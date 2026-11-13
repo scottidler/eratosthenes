@@ -127,6 +127,28 @@ impl TriageMessage {
         })
     }
 
+    /// A body-less `TriageMessage` from a metadata fetch, so a caller that never
+    /// reads bodies (`senders`) asks the guard's own `is_automated` instead of
+    /// keeping a second copy of the predicate.
+    pub fn from_metadata(msg: &crate::gmail::message::GmailMessage) -> Self {
+        let wanted: Vec<String> = TRIAGE_HEADERS.iter().map(|h| h.to_lowercase()).collect();
+        let headers = msg
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = name.to_lowercase();
+                wanted.contains(&name).then(|| (name, value.clone()))
+            })
+            .collect();
+        Self {
+            id: msg.id.clone(),
+            label_ids: msg.label_ids.clone(),
+            internal_date: msg.internal_date,
+            headers,
+            body: String::new(),
+        }
+    }
+
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(&name.to_lowercase()).map(|s| s.as_str())
     }

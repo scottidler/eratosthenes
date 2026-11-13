@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -76,6 +76,25 @@ pub enum Command {
         accounts: Vec<String>,
     },
 
+    /// List who still reaches the inbox: top senders over the last N days (read-only)
+    Senders {
+        /// Account(s) to report on (default: all discovered)
+        #[arg(num_args = 0..)]
+        accounts: Vec<String>,
+
+        /// Look back this many days
+        #[arg(long, default_value_t = 7)]
+        days: u32,
+
+        /// Show the top N senders
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+
+        /// Output format (default: yaml on a terminal, json when piped)
+        #[arg(long, value_enum, ignore_case = true)]
+        format: Option<Format>,
+    },
+
     /// Manage OAuth2 authentication
     Auth(AuthOpts),
 
@@ -84,6 +103,24 @@ pub enum Command {
 
     /// Config utilities
     Config(ConfigOpts),
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+#[clap(rename_all = "kebab-case")]
+pub enum Format {
+    Yaml,
+    Json,
+}
+
+impl Format {
+    /// The explicit choice, else yaml for a human at a terminal and json for a pipe.
+    pub fn resolve(explicit: Option<Format>, stdout_is_terminal: bool) -> Format {
+        explicit.unwrap_or(if stdout_is_terminal {
+            Format::Yaml
+        } else {
+            Format::Json
+        })
+    }
 }
 
 #[derive(Args)]
@@ -163,4 +200,25 @@ pub enum ConfigCommand {
         #[arg(num_args = 0..)]
         accounts: Vec<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_defaults_by_terminal_and_explicit_wins() {
+        assert_eq!(Format::resolve(None, true), Format::Yaml);
+        assert_eq!(Format::resolve(None, false), Format::Json);
+        assert_eq!(Format::resolve(Some(Format::Json), true), Format::Json);
+        assert_eq!(Format::resolve(Some(Format::Yaml), false), Format::Yaml);
+    }
+
+    #[test]
+    fn senders_format_is_case_insensitive_and_rejects_unknown() {
+        let ok = Cli::try_parse_from(["eratosthenes", "senders", "--format", "JSON"]);
+        assert!(ok.is_ok());
+        let bad = Cli::try_parse_from(["eratosthenes", "senders", "--format", "xml"]);
+        assert!(bad.is_err());
+    }
 }

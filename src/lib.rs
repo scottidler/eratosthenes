@@ -7,6 +7,7 @@ pub mod cfg;
 pub mod digest;
 pub mod engine;
 pub mod gmail;
+pub mod senders;
 mod skip;
 pub mod slack;
 pub mod triage;
@@ -422,6 +423,28 @@ pub async fn triage(account: &str, config: &Config, dry_run: bool, multi: bool) 
 
     let mut client = build_gmail_client(config, &prefix).await?;
     triage::execute(&mut client, config, &prefix, dry_run).await
+}
+
+/// Rank one account's inbox senders over the last `days` days. Read-only.
+pub async fn senders(
+    account: &str,
+    config: &Config,
+    days: u32,
+    limit: usize,
+) -> Result<senders::AccountSenders> {
+    debug!(
+        "senders: account={}, days={}, limit={}",
+        account, days, limit
+    );
+    // The account prefix stays empty: stdout carries only the report, so piped
+    // json stays parseable.
+    let mut client = build_gmail_client(config, "").await?;
+    let rows = senders::collect(&mut client, config, days, limit).await?;
+    Ok(senders::AccountSenders {
+        account: account.to_string(),
+        days,
+        senders: rows,
+    })
 }
 
 #[cfg(test)]

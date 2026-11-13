@@ -146,3 +146,26 @@ None.
 - Put `Persistent=true` back after `OnUnitActiveSec={interval}`: `cargo test service` failed `service::tests::test_generate_timer` (`assertion failed: output.contains("[Timer]\nOnBootSec=2min\nOnUnitActiveSec=5min\n\n[Install]")`).
 - Replaced the category skip condition with `if false`: `cargo test engine` failed `test_build_active_threads_query_skips_category_labels`; the query was `in:inbox OR label:category_promotions`.
 - `otto ci` exit 0 after restoring both.
+
+## Phase 7: senders
+### Design decisions
+- `eratosthenes senders [accounts...] [--days N] [--limit N] [--format yaml|json]` (src/cli.rs:Command::Senders, src/main.rs:cmd_senders). Same per-account pattern as digest/triage: sequential, failures aggregated, non-zero exit at the end.
+- Format: `Format` ValueEnum with `ignore_case = true`. `Format::resolve(explicit, stdout_is_terminal)` is pure and unit-tested (yaml on a TTY, json when piped). One document for all accounts: a list of `{account, days, senders}`.
+- Aggregation is the pure `senders::aggregate` (src/senders.rs): messages desc, threads desc, address asc, then truncate. `senders::collect` does the I/O: one `messages.list` (`in:inbox newer_than:<days>d`) plus one metadata `messages.get` per hit. GETs only.
+- `automated` reuses the guard's predicate: new `TriageMessage::from_metadata(&GmailMessage)` (src/triage/thread.rs) builds a body-less TriageMessage so `is_automated` is called, not copied. A sender is automated when ANY of its messages in the window is.
+- Fetch headers are `TRIAGE_HEADERS`, a superset of what `is_automated` reads.
+- `unread` counts messages carrying UNREAD. `threads` is distinct thread ids per sender. Bucket split counts each of a sender's threads once per config bucket name whose label any of that sender's messages in the window carries. Empty without a triage block.
+- Sender address is the first From address, lowercased only. Not `normalize_address`: dot/plus folding answers "is this me" and would merge distinct gmail senders here.
+### Deviations
+- `GmailClient::new` prints "Connecting to Gmail..." with `eprintln!` instead of `println!` (src/gmail/client.rs). Same effect, correct seam: piped `senders` json has to be the only thing on stdout. It moves for every subcommand; no test or doc asserts it on stdout.
+### Tradeoffs
+- Thread bucket labels come from the messages inside the window, vs a `threads.get` per thread: the doc's Performance section budgets one `messages.get` per inbox message and nothing more. A reply that arrived after the bucket write carries no label, but earlier messages of its thread in the window usually do.
+- `any` automated vs `all`: the guard fires on any one automated message, so the report shows the same fact.
+### Open questions
+- None.
+
+### Success criteria
+- wiremock `tests/senders.rs`: zero non-GET requests and the ranking (Greenhouse 3 msgs / 3 threads / 2 unread / automated / noise 2; Nick 2 msgs / 1 thread / 1 unread / not automated; `Nick@x.com` and `nick@x.com` fold to one sender): PASS.
+- `cargo run -q -- senders --help; echo $?`: exit 0 (PASS; exit 2 on main).
+- Break-to-prove: ranking comparator changed to `a.messages.cmp(&a.messages)` made `senders_is_read_only_and_ranks_the_fixture` fail; restored.
+- `otto ci` exit 0.

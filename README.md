@@ -15,6 +15,14 @@ Starred and Important threads with `ttl: Keep` so they stay put.
   bucket labels with one LLM call (see [Triage](#triage) below).
   - `--dry-run` - full classify pass, prints the thread -> bucket table, zero
     Gmail mutations. Stricter than `run --dry-run`.
+- `eratosthenes senders [accounts...]` - read-only report of who still reaches
+  the inbox: top senders of INBOX mail, each with messages, threads, unread,
+  `automated` (the archive guard's own header test), and a per-bucket thread
+  count (empty without a `triage:` block). One metadata `messages.get` per
+  inbox message in the window.
+  - `--days <N>` - look back N days (default 7).
+  - `--limit <N>` - top N senders (default 25).
+  - `--format yaml|json` - default yaml on a terminal, json when piped; any case.
 - `eratosthenes digest [accounts...]` - post the pinned-inbox (Starred +
   Important) digest to Slack.
 - `eratosthenes auth login|logout|status` - manage OAuth2 tokens.
