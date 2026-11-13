@@ -331,6 +331,41 @@ mod tests {
         );
     }
 
+    /// The automated-sender headers are kept for the archive guard and never
+    /// ride the prompt.
+    #[test]
+    fn test_build_payload_omits_the_automated_sender_headers() {
+        let t = thread(
+            "t1",
+            vec![api_message(
+                "m1",
+                "t1",
+                1_000,
+                vec![
+                    ("From", "Bob <bob@x.com>"),
+                    ("Subject", "hi"),
+                    ("List-Id", "<marker-list-id>"),
+                    ("List-Unsubscribe", "<mailto:marker-unsubscribe@x.com>"),
+                    ("Auto-Submitted", "marker-auto-submitted"),
+                    ("Precedence", "marker-precedence"),
+                ],
+                "please review",
+                &["INBOX"],
+            )],
+        );
+        assert!(t.messages[0].header("List-Id").is_some(), "header kept");
+
+        let json = build_payload(&[t], 4000, "scott.idler@tatari.tv").unwrap();
+        assert!(!json.contains("marker-"), "header leaked: {json}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&String> = parsed["threads"][0]["messages"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .collect();
+        assert_eq!(keys, vec!["body", "date", "from", "from_account_owner"]);
+    }
+
     #[test]
     fn test_build_payload_marks_the_owners_own_messages() {
         let t = thread(

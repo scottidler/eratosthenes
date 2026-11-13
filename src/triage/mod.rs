@@ -24,7 +24,7 @@ use crate::gmail::label::{LabelResolver, LabelVisibility, create_label_if_missin
 use crate::skip::SkipLedger;
 use crate::triage::claude::{ClaudeCli, TRIAGE_TIMEOUT};
 use crate::triage::draft::RefreshPlan;
-use crate::triage::thread::TriageThread;
+use crate::triage::thread::{Protection, TriageThread};
 
 /// Message-level idempotency marker. Message-level, deliberately: Gmail labels
 /// attach to messages and new messages never inherit them, so
@@ -185,6 +185,61 @@ pub fn plan_write(
         remove,
         classified_message_ids: thread.messages.iter().map(|m| m.id.clone()).collect(),
     })
+}
+
+/// What happens to a classified thread's INBOX label. "Stay" is today's
+/// behavior: the thread keeps its bucket label, stays in INBOX, and ages on the
+/// bucket TTL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveDecision {
+    /// Row 6: the bucket archives and nothing protects the thread.
+    Archive,
+    /// Row 4: an `awaits-reply` bucket whose newest inbound sender is a bot.
+    ArchiveAutomated,
+    /// Row 5: the bucket has `archive: false`.
+    Stay,
+    /// Rows 1 to 3: the thread is protected whatever the bucket says.
+    StayProtected(Protection),
+}
+
+/// The archive decision table, first match wins. Pure: headers and labels in,
+/// a decision out. The model picks the bucket and nothing else.
+///
+/// | # | Condition                                                   | Result               |
+/// |---|-------------------------------------------------------------|----------------------|
+/// | 1 | a message carries `STARRED` or `IMPORTANT`                  | stay (pinned)        |
+/// | 2 | no inbound message                                          | stay (no-inbound)    |
+/// | 3 | an inbound non-automated message solely to me, or no To     | stay (sole-human)    |
+/// | 4 | `awaits-reply` bucket, newest inbound sender automated      | archive (automated)  |
+/// | 5 | `archive: false`                                            | stay                 |
+/// | 6 | otherwise                                                   | archive              |
+///
+/// Row 4 sits ahead of row 5 on purpose: it is the only way a bot loses its
+/// place in an `archive: false` bucket.
+pub fn plan_archive(
+    thread: &TriageThread,
+    bucket: &TriageBucket,
+    self_address: &str,
+) -> ArchiveDecision {
+    let decision = if let Some(protection) = thread.protection(self_address) {
+        ArchiveDecision::StayProtected(protection)
+    } else if bucket.awaits_reply
+        && thread
+            .inbound(self_address)
+            .last()
+            .is_some_and(|m| m.is_automated())
+    {
+        ArchiveDecision::ArchiveAutomated
+    } else if !bucket.archive {
+        ArchiveDecision::Stay
+    } else {
+        ArchiveDecision::Archive
+    };
+    debug!(
+        "plan_archive: thread={}, bucket={}, decision={:?}",
+        thread.id, bucket.name, decision
+    );
+    decision
 }
 
 /// Every label this run needs that the mailbox does not already have.

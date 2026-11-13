@@ -442,3 +442,129 @@ fn test_summary_line_reports_skips_when_nothing_was_classified() {
         "Triage: 2 threads classified, 2 labeled, 0 skipped (dry run)"
     );
 }
+
+// ---- plan_archive: one test per row of the archive decision table ----------
+
+const ME: &str = "scott.idler@tatari.tv";
+
+fn bucket(archive: bool, awaits_reply: bool) -> TriageBucket {
+    TriageBucket {
+        name: "b".to_string(),
+        label: "llm/b".to_string(),
+        description: "d".to_string(),
+        draft: false,
+        archive,
+        awaits_reply,
+    }
+}
+
+/// One fixture message: id, headers, label ids. Dated in list order.
+type FixtureMessage<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a [&'a str]);
+
+fn archive_thread(messages: Vec<FixtureMessage>) -> TriageThread {
+    TriageThread::from_api(google_gmail1::api::Thread {
+        id: Some("t1".to_string()),
+        messages: Some(
+            messages
+                .into_iter()
+                .enumerate()
+                .map(|(i, (id, headers, labels))| {
+                    api_message(id, "t1", (i as i64 + 1) * 1_000, headers, "b", labels)
+                })
+                .collect(),
+        ),
+        ..Default::default()
+    })
+    .expect("test thread parses")
+}
+
+const BOT_TO_LIST: &[(&str, &str)] = &[
+    ("From", "Greenhouse <no-reply@greenhouse.io>"),
+    ("To", "eng@tatari.tv"),
+    ("List-Id", "<eng.tatari.tv>"),
+];
+
+#[test]
+fn plan_archive_row_1() {
+    let thread = archive_thread(vec![("m1", BOT_TO_LIST.to_vec(), &["INBOX", "STARRED"])]);
+    assert_eq!(
+        plan_archive(&thread, &bucket(true, false), ME),
+        ArchiveDecision::StayProtected(Protection::Pinned)
+    );
+}
+
+#[test]
+fn plan_archive_row_2() {
+    let thread = archive_thread(vec![(
+        "m1",
+        vec![("From", ME), ("To", "bob@x.com")],
+        &["INBOX", "SENT"],
+    )]);
+    assert_eq!(
+        plan_archive(&thread, &bucket(true, false), ME),
+        ArchiveDecision::StayProtected(Protection::NoInbound)
+    );
+}
+
+/// The model filed a human mail to me alone as noise. Code keeps it.
+#[test]
+fn plan_archive_row_3() {
+    let thread = archive_thread(vec![(
+        "m1",
+        vec![
+            ("From", "Nick Andolina <nick.andolina@tatari.tv>"),
+            ("To", ME),
+        ],
+        &["INBOX"],
+    )]);
+    assert_eq!(
+        plan_archive(&thread, &bucket(true, false), ME),
+        ArchiveDecision::StayProtected(Protection::SoleHuman)
+    );
+}
+
+/// A bot in an `awaits-reply` bucket is archived even though the bucket has
+/// `archive: false`: row 4 is ahead of row 5.
+#[test]
+fn plan_archive_row_4() {
+    let thread = archive_thread(vec![(
+        "m1",
+        vec![("From", "Greenhouse <no-reply@greenhouse.io>"), ("To", ME)],
+        &["INBOX"],
+    )]);
+    assert_eq!(
+        plan_archive(&thread, &bucket(false, true), ME),
+        ArchiveDecision::ArchiveAutomated
+    );
+}
+
+/// A human with a Cc in an `awaits-reply`, `archive: false` bucket: row 3 does
+/// not hold it (not solely to me), row 4 does not take it (not automated).
+#[test]
+fn plan_archive_row_5() {
+    let thread = archive_thread(vec![(
+        "m1",
+        vec![
+            ("From", "Nick Andolina <nick.andolina@tatari.tv>"),
+            ("To", ME),
+            ("Cc", "boss@tatari.tv"),
+        ],
+        &["INBOX"],
+    )]);
+    assert_eq!(
+        plan_archive(&thread, &bucket(false, true), ME),
+        ArchiveDecision::Stay
+    );
+}
+
+#[test]
+fn plan_archive_row_6() {
+    let thread = archive_thread(vec![
+        ("m1", vec![("From", ME), ("To", "eng@tatari.tv")], &["SENT"]),
+        ("m2", BOT_TO_LIST.to_vec(), &["INBOX", "UNREAD"]),
+    ]);
+    assert_eq!(
+        plan_archive(&thread, &bucket(true, false), ME),
+        ArchiveDecision::Archive
+    );
+}
