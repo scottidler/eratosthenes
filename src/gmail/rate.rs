@@ -2,8 +2,39 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::time::{Duration, Instant, sleep, timeout};
 
-const MAX_TOKENS: u32 = 15000;
-const REFILL_PER_SEC: u32 = 250;
+/// Gmail's per-user limit, in quota units per minute, for a project created on
+/// or after 2026-05-01. A project that used the API before then keeps a higher
+/// limit, so this is the floor every account's project is guaranteed.
+/// Source: developers.google.com/workspace/gmail/api/reference/quota
+const QUOTA_PER_MINUTE: u32 = 6000;
+/// The bucket's capacity. A full bucket plus a minute of refill is the most
+/// one minute can spend, so capacity and refill are sized to sum to the quota.
+const MAX_TOKENS: u32 = 600;
+const REFILL_PER_SEC: u32 = (QUOTA_PER_MINUTE - MAX_TOKENS) / 60;
+
+// A full bucket plus sixty seconds of refill is the most one minute can spend.
+// Over the quota means 403 `rateLimitExceeded` on a backlog run.
+const _: () = assert!(MAX_TOKENS + 60 * REFILL_PER_SEC <= QUOTA_PER_MINUTE);
+// A cost above the bucket's capacity would make `acquire` wait forever.
+const _: () = assert!(cost::THREADS_GET_FULL <= MAX_TOKENS);
+
+/// Quota units per Gmail call, from the same page as `QUOTA_PER_MINUTE`.
+/// `threads.get` and `messages.get` cost 3x at `format=full`.
+pub mod cost {
+    pub const PROFILE_GET: u32 = 1;
+    pub const LABELS_LIST: u32 = 1;
+    pub const LABELS_CREATE: u32 = 5;
+    pub const MESSAGES_LIST: u32 = 5;
+    pub const MESSAGES_GET_METADATA: u32 = 20;
+    pub const MESSAGES_MODIFY: u32 = 5;
+    pub const MESSAGES_BATCH_MODIFY: u32 = 50;
+    pub const THREADS_LIST: u32 = 10;
+    pub const THREADS_GET_METADATA: u32 = 40;
+    pub const THREADS_GET_FULL: u32 = 120;
+    pub const THREADS_MODIFY: u32 = 10;
+    pub const THREADS_TRASH: u32 = 20;
+    pub const DRAFTS_CREATE: u32 = 10;
+}
 const MAX_BACKOFF_SECS: u64 = 60;
 
 pub struct RateLimiter {
@@ -208,8 +239,8 @@ where
         // elapsed time into a marked error is the whole point.
         //
         // The limiter's `acquire` sits inside `f` and so inside this bound. It
-        // is a local token bucket sized 15000 at 250/s against costs of at most
-        // 50, so its wait is sub-second next to `REQUEST_TIMEOUT`.
+        // is a local token bucket whose longest wait is one `THREADS_GET_FULL`
+        // refill, under two seconds, because calls are sequential per account.
         let outcome = match timeout(REQUEST_TIMEOUT, f()).await {
             Ok(result) => result,
             Err(_) => Err(eyre::eyre!(

@@ -1,4 +1,4 @@
-use crate::gmail::rate::{RateLimiter, with_retry};
+use crate::gmail::rate::{RateLimiter, cost, with_retry};
 use eyre::{Context, Result};
 use std::collections::HashMap;
 
@@ -110,7 +110,7 @@ pub async fn create_label_if_missing(
     // The `Label` is built inside the closure, not hoisted: `with_retry` calls
     // this once per attempt and the request builder consumes the value.
     let attempt = with_retry(limiter, "labels.create", || async {
-        limiter.acquire(5).await;
+        limiter.acquire(cost::LABELS_CREATE).await;
         let label = google_gmail1::api::Label {
             name: Some(name.to_string()),
             label_list_visibility: Some(visibility.label_list().to_string()),
@@ -185,7 +185,7 @@ async fn lookup_label_id(
     name: &str,
 ) -> Result<Option<String>> {
     let list = with_retry(limiter, "labels.list (post-create recheck)", || async {
-        limiter.acquire(1).await;
+        limiter.acquire(cost::LABELS_LIST).await;
         hub.users()
             .labels_list("me")
             .add_scope(crate::gmail::auth::GMAIL_SCOPE)

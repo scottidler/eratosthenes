@@ -23,7 +23,7 @@ use mime::Mime;
 use crate::gmail::auth::GMAIL_SCOPE;
 use crate::gmail::label::LabelResolver;
 use crate::gmail::message::{GmailMessage, GmailThread};
-use crate::gmail::rate::{RateLimiter, with_retry};
+use crate::gmail::rate::{RateLimiter, cost, with_retry};
 
 type Hub = Gmail<hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>>;
 
@@ -85,7 +85,7 @@ impl GmailClient {
         // stderr: `senders` prints a report on stdout that must stay parseable.
         eprintln!("{}Connecting to Gmail...", prefix);
         let label_list = with_retry(&limiter, "labels.list", || async {
-            limiter.acquire(1).await;
+            limiter.acquire(cost::LABELS_LIST).await;
             hub.users()
                 .labels_list("me")
                 .add_scope(GMAIL_SCOPE)
@@ -135,7 +135,7 @@ impl GmailClient {
 
         loop {
             let result = with_retry(&self.limiter, "messages.list", || async {
-                self.limiter.acquire(5).await;
+                self.limiter.acquire(cost::MESSAGES_LIST).await;
                 let mut call = self
                     .hub
                     .users()
@@ -181,7 +181,7 @@ impl GmailClient {
     pub async fn profile_email(&self) -> Result<String> {
         debug!("profile_email");
         let profile = with_retry(&self.limiter, "users.getProfile", || async {
-            self.limiter.acquire(1).await;
+            self.limiter.acquire(cost::PROFILE_GET).await;
             self.hub
                 .users()
                 .get_profile("me")
@@ -202,7 +202,7 @@ impl GmailClient {
     pub async fn get_message(&self, id: &str) -> Result<GmailMessage> {
         log::trace!("get_message: id={}", id);
         let msg = with_retry(&self.limiter, "messages.get", || async {
-            self.limiter.acquire(5).await;
+            self.limiter.acquire(cost::MESSAGES_GET_METADATA).await;
             let mut call = self
                 .hub
                 .users()
@@ -229,7 +229,7 @@ impl GmailClient {
 
         loop {
             let result = with_retry(&self.limiter, "threads.list", || async {
-                self.limiter.acquire(10).await;
+                self.limiter.acquire(cost::THREADS_LIST).await;
                 let mut call = self
                     .hub
                     .users()
@@ -275,7 +275,7 @@ impl GmailClient {
 
         loop {
             let result = with_retry(&self.limiter, "threads.list (by label IDs)", || async {
-                self.limiter.acquire(10).await;
+                self.limiter.acquire(cost::THREADS_LIST).await;
                 let mut call = self.hub.users().threads_list("me").add_scope(GMAIL_SCOPE);
                 for &id in label_ids {
                     call = call.add_label_ids(id);
@@ -326,7 +326,7 @@ impl GmailClient {
 
         loop {
             let result = with_retry(&self.limiter, "threads.list", || async {
-                self.limiter.acquire(10).await;
+                self.limiter.acquire(cost::THREADS_LIST).await;
                 let mut call = self
                     .hub
                     .users()
@@ -378,7 +378,7 @@ impl GmailClient {
     pub async fn get_thread(&self, id: &str) -> Result<GmailThread> {
         log::trace!("get_thread: id={}", id);
         let thread = with_retry(&self.limiter, "threads.get", || async {
-            self.limiter.acquire(10).await;
+            self.limiter.acquire(cost::THREADS_GET_METADATA).await;
             let mut call = self
                 .hub
                 .users()
@@ -428,7 +428,7 @@ impl GmailClient {
     pub async fn get_thread_full(&self, id: &str) -> Result<google_gmail1::api::Thread> {
         log::trace!("get_thread_full: id={}", id);
         with_retry(&self.limiter, "threads.get (full)", || async {
-            self.limiter.acquire(10).await;
+            self.limiter.acquire(cost::THREADS_GET_FULL).await;
             self.hub
                 .users()
                 .threads_get("me", id)
@@ -454,7 +454,7 @@ impl GmailClient {
     ) -> Result<google_gmail1::api::Thread> {
         log::trace!("get_thread_metadata: id={}, headers={:?}", id, headers);
         with_retry(&self.limiter, "threads.get (metadata)", || async {
-            self.limiter.acquire(10).await;
+            self.limiter.acquire(cost::THREADS_GET_METADATA).await;
             let mut call = self
                 .hub
                 .users()
@@ -478,7 +478,7 @@ impl GmailClient {
             id, add, remove
         );
         with_retry(&self.limiter, "messages.modify", || async {
-            self.limiter.acquire(5).await;
+            self.limiter.acquire(cost::MESSAGES_MODIFY).await;
             let req = ModifyMessageRequest {
                 add_label_ids: if add.is_empty() {
                     None
@@ -521,7 +521,7 @@ impl GmailClient {
 
         for chunk in ids.chunks(1000) {
             with_retry(&self.limiter, "messages.batchModify", || async {
-                self.limiter.acquire(50).await;
+                self.limiter.acquire(cost::MESSAGES_BATCH_MODIFY).await;
                 let req = BatchModifyMessagesRequest {
                     add_label_ids: if add.is_empty() {
                         None
@@ -556,7 +556,7 @@ impl GmailClient {
             id, add, remove
         );
         with_retry(&self.limiter, "threads.modify", || async {
-            self.limiter.acquire(10).await;
+            self.limiter.acquire(cost::THREADS_MODIFY).await;
             let req = ModifyThreadRequest {
                 add_label_ids: if add.is_empty() {
                     None
@@ -604,7 +604,7 @@ impl GmailClient {
         );
 
         let draft = with_retry(&self.limiter, "drafts.create", || async {
-            self.limiter.acquire(10).await;
+            self.limiter.acquire(cost::DRAFTS_CREATE).await;
             let req = Draft {
                 id: None,
                 message: Some(Message {
@@ -639,7 +639,7 @@ impl GmailClient {
     pub async fn trash_thread(&self, id: &str) -> Result<()> {
         debug!("trash_thread: id={}", id);
         with_retry(&self.limiter, "threads.trash", || async {
-            self.limiter.acquire(10).await;
+            self.limiter.acquire(cost::THREADS_TRASH).await;
             self.hub
                 .users()
                 .threads_trash("me", id)
